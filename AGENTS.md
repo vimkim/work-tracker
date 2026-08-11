@@ -1,0 +1,40 @@
+# Work Tracker Agent Guide
+
+## Purpose
+
+Work Tracker preserves the current status and context of long-running work across human and agent sessions. Use the terms defined in `CONTEXT.md` in code, commands, and documentation.
+
+## Architecture
+
+- `src/domain.rs` owns Work Item, Status, and History Entry types.
+- `src/db.rs` owns SQLite schema, transactions, queries, and retention.
+- `src/cli.rs` owns the command-line contract and database path resolution.
+- `src/output.rs` owns human-readable and JSON presentation.
+- `src/web.rs` owns the read-only HTML dashboard.
+- `src/main.rs` wires commands to the domain and persistence layers.
+
+## Invariants
+
+- SQLite is the single source of truth. Do not add a second writable store.
+- Every effective mutation and standalone note appends a History Entry in the same transaction.
+- Repeating an already-applied status is idempotent and does not append history.
+- Deleted Work Items are immutable, readable for 60 days, and then purged with their history.
+- The Daily View uses the server's local day and includes every Actionable Work Item.
+- Keep the HTML interface read-only. Mutations belong in the CLI.
+- Preserve stable JSON field names and nonzero error exits for agent callers.
+
+## Verification
+
+- Run `just check` before handing off code changes.
+- Add database tests for lifecycle, history, retention, or concurrency changes.
+- Exercise both human-readable and `--json` output when changing commands.
+- Smoke-test `/` and `/items/{id}` when changing the dashboard.
+
+## Repository workflows
+
+- `just build` — build a debug binary.
+- `just test` — run tests.
+- `just check` — run formatting, Clippy, and tests.
+- `just release` — build an optimized binary.
+- `just install` / `just uninstall` — manage the current-user installation.
+- `just serve` — run the localhost dashboard with the default database.

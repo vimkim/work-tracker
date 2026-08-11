@@ -1,0 +1,128 @@
+# Work Tracker
+
+Work Tracker is a small, agent-friendly status ledger for parallel and long-running work. A Rust CLI and read-only HTML dashboard share one SQLite database, so a human or agent can recover the current state and the context that led there.
+
+## What it provides
+
+- Transaction-safe updates from concurrent agents using SQLite WAL mode.
+- Stable human-readable commands and machine-readable `--json` output.
+- Immutable creation, note, update, status-transition, and deletion history.
+- A Daily View containing everything updated today and every actionable item.
+- Soft deletion with a 60-day readable retention window and automatic purge.
+- A localhost-only, read-only dashboard suitable for SSH tunneling.
+
+## Build and install
+
+Rust and [`just`](https://github.com/casey/just) are required.
+
+```bash
+just build
+just test
+just install
+```
+
+`just install` installs `work-tracker` through Cargo for the current user. Other workflows:
+
+```bash
+just                 # list workflows
+just check           # format check, Clippy, and tests
+just release         # optimized binary in target/release/
+just uninstall
+```
+
+## Quick start
+
+The database is created automatically at `$XDG_DATA_HOME/work-tracker/work-tracker.db`, or at `~/.local/share/work-tracker/work-tracker.db` when `XDG_DATA_HOME` is unset.
+
+```bash
+work-tracker add "Watch company CI" \
+  --description "SQL and medium suites are queued" \
+  --status waiting \
+  --actor codex-ci \
+  --note "submitted at PR head abc123"
+
+work-tracker today
+work-tracker show 1
+work-tracker note 1 "Runner assigned; results expected in 30 minutes" --actor codex-ci
+work-tracker status 1 active --actor codex-ci --note "analyzing failures"
+work-tracker history 1
+work-tracker status 1 done --actor codex-ci --note "all required checks passed"
+```
+
+Use `WORK_TRACKER_ACTOR` to avoid repeating `--actor`:
+
+```bash
+export WORK_TRACKER_ACTOR=codex-ci
+work-tracker status 1 waiting --note "queued behind 12 builds"
+```
+
+If neither is set, the CLI uses the current `USER`, then `unknown` as a last resort.
+
+## Commands
+
+| Command | Purpose |
+|---|---|
+| `add` | Create a Work Item, initially `pending` unless selected otherwise |
+| `show ID` | Show one item, including a soft-deleted item |
+| `list` | List recent items; filter with `--status` |
+| `today` | Show items updated today plus all actionable items |
+| `update ID` | Change title or description |
+| `status ID STATUS` | Apply an idempotent status transition |
+| `note ID MESSAGE` | Preserve context without changing status |
+| `delete ID` | Soft-delete an item for 60 days |
+| `history ID` | Show the complete immutable history |
+| `path` | Show the SQLite database path |
+| `serve` | Host the read-only dashboard |
+
+The statuses are `pending`, `active`, `waiting`, `blocked`, `done`, `cancelled`, and `deleted`. The first four are actionable and therefore remain in the Daily View even when they were not updated today.
+
+Run `work-tracker COMMAND --help` for all options.
+
+## Agent and script usage
+
+Every command accepts global options before or after the subcommand:
+
+```bash
+work-tracker --json today
+work-tracker show 1 --json
+work-tracker --database /srv/work-tracker/team.db list --json
+```
+
+`WORK_TRACKER_DB` selects the shared database without repeating `--database`. Successful commands exit with status 0. Command validation uses exit status 2; runtime and lookup errors use exit status 1 and emit `{"error":"..."}` to standard error when `--json` is enabled.
+
+For multiple agents, point every process at the same database file on the same Linux host. SQLite serializes writes, waits up to five seconds for a busy writer, and keeps reads responsive through WAL mode. Do not put the database on a filesystem that does not support SQLite locking semantics.
+
+## Deletion and retention
+
+`delete` changes the status to `deleted`, records the actor and reason, and sets `purge_after` to exactly 60 days after deletion. Deleted items remain available through `show`, `history`, `list --include-deleted`, or `list --status deleted`. They cannot be changed. Opening the tracker lazily purges items whose retention window has expired, including their history.
+
+## HTML dashboard
+
+Start the read-only server on the Linux host:
+
+```bash
+work-tracker serve
+# or: just serve
+```
+
+It binds to `127.0.0.1:8787` by default. From your PC, create an SSH tunnel and open <http://127.0.0.1:8787>:
+
+```bash
+ssh -L 8787:127.0.0.1:8787 your-linux-server
+```
+
+A different socket can be selected explicitly with `work-tracker serve --bind 127.0.0.1:9000`. Binding to a non-loopback address exposes an unauthenticated dashboard and should only be done behind appropriate network controls.
+
+## Agent skill
+
+The `track-work` skill is maintained in the `my-cubrid-skills` collection. Once published, it can be installed for Claude Code and Codex with:
+
+```bash
+npx skills add vimkim/my-cubrid-skills -y -g --agent claude-code --agent codex
+```
+
+The skill teaches agents to create a Work Item before long-running work, record meaningful notes and transitions, inspect the Daily View, and preserve the final outcome.
+
+## Development
+
+See `AGENTS.md` for architecture and invariants. `CLAUDE.md` is a symlink to the same guidance so both agent environments receive one canonical instruction file.
