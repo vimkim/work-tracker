@@ -34,6 +34,6 @@ install:
 uninstall:
     cargo uninstall work-tracker
 
-# Run the read-only dashboard; pass options after `--`, if needed
-serve *args:
-    cargo run -- serve {{args}}
+# Run the read-only dashboard on all network interfaces
+serve bind="0.0.0.0:8787":
+    cargo run -- serve --bind {{bind}}

@@ -115,7 +115,7 @@ A different socket can be selected explicitly with `work-tracker serve --bind 12
 
 ## Agent skill
 
-The `track-work` skill is maintained in the `my-cubrid-skills` collection. Once published, it can be installed for Claude Code and Codex with:
+The `track-work` skill is maintained in the `my-cubrid-skills` collection. Install it for Claude Code and Codex with:
 
 ```bash
 npx skills add vimkim/my-cubrid-skills -y -g --agent claude-code --agent codex
