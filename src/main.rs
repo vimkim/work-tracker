@@ -4,8 +4,8 @@ use anyhow::Result;
 use clap::Parser;
 use serde_json::json;
 use work_tracker::{
-    cli::{self, Cli, Command},
-    db::Tracker,
+    cli::{self, Cli, Command, ListArgs},
+    db::{ListFilter, Tracker},
     domain::Status,
     output, web,
 };
@@ -57,9 +57,17 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Show(args) => show_item(&tracker.get(args.id)?, cli.json),
         Command::List(args) => {
-            let include_deleted = args.include_deleted || args.status == Some(Status::Deleted);
-            let items = tracker.list(args.status, include_deleted, args.limit)?;
-            show_items(&items, cli.json)
+            let filter = list_filter(&args);
+            let items = tracker.list(filter, args.include_deleted, args.limit)?;
+            if cli.json {
+                output::print_json(&items)
+            } else if filter == ListFilter::Actionable {
+                output::print_actionable_items(&items);
+                Ok(())
+            } else {
+                output::print_items(&items);
+                Ok(())
+            }
         }
         Command::Today(args) => {
             let items = tracker.daily_view(args.include_deleted)?;
@@ -117,6 +125,14 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Path | Command::Serve(_) => unreachable!(),
+    }
+}
+
+fn list_filter(args: &ListArgs) -> ListFilter {
+    match (args.all, args.status) {
+        (_, Some(status)) => ListFilter::Status(status),
+        (true, None) => ListFilter::All,
+        (false, None) => ListFilter::Actionable,
     }
 }
 

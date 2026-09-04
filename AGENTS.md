@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Work Tracker preserves the current status and context of long-running work across human and agent sessions. Use the terms defined in `CONTEXT.md` in code, commands, and documentation.
+Work Tracker preserves the current status and context of long-running work across human and agent sessions. Use the terms defined in `CONTEXT.md` in code, commands, and documentation. Record hard-to-reverse decisions in `docs/adr/`.
 
 ## Architecture
 
@@ -20,6 +20,7 @@ Work Tracker preserves the current status and context of long-running work acros
 - Repeating an already-applied status is idempotent and does not append history.
 - Deleted Work Items are immutable, readable for 60 days, and then purged with their history.
 - The Daily View uses the server's local day and includes every Actionable Work Item.
+- `list` shows only Actionable Work Items unless `--all` or `--status` widens it; see `docs/adr/0001-list-shows-actionable-work-by-default.md`.
 - Keep the HTML interface read-only. Mutations belong in the CLI.
 - Preserve stable JSON field names and nonzero error exits for agent callers.
 

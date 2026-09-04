@@ -33,7 +33,7 @@ pub enum Command {
     Add(AddArgs),
     /// Show one work item, including a soft-deleted item.
     Show(IdArgs),
-    /// List work items.
+    /// List actionable work items, or every work item with --all.
     List(ListArgs),
     /// Show items updated today plus every actionable item.
     Today(TodayArgs),
@@ -98,7 +98,11 @@ pub struct IdArgs {
 
 #[derive(Debug, Args)]
 pub struct ListArgs {
-    /// Filter by exact status.
+    /// Show every status, including done and cancelled work items.
+    #[arg(long, conflicts_with = "status")]
+    pub all: bool,
+
+    /// Show only this exact status instead of the actionable default.
     #[arg(long, value_enum)]
     pub status: Option<Status>,
 
@@ -214,6 +218,25 @@ pub fn prepare_database_path(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn list_defaults_to_the_actionable_scope() -> Result<()> {
+        let cli = Cli::try_parse_from(["work-tracker", "list"])?;
+        let Command::List(args) = cli.command else {
+            anyhow::bail!("expected the list command");
+        };
+        assert!(!args.all);
+        assert!(args.status.is_none());
+        assert!(!args.include_deleted);
+        Ok(())
+    }
+
+    #[test]
+    fn list_all_conflicts_with_a_status_filter() {
+        let error = Cli::try_parse_from(["work-tracker", "list", "--all", "--status", "done"])
+            .expect_err("--all and --status must not combine");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
 
     #[test]
     fn relative_database_filename_needs_no_parent_directory() -> Result<()> {

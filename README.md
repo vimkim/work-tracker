@@ -7,6 +7,7 @@ Work Tracker is a small, agent-friendly status ledger for parallel and long-runn
 - Transaction-safe updates from concurrent agents using SQLite WAL mode.
 - Stable human-readable commands and machine-readable `--json` output.
 - Immutable creation, note, update, status-transition, and deletion history.
+- A default `list` that shows only actionable work, with `--all` for the full ledger.
 - A Daily View containing everything updated today and every actionable item.
 - Soft deletion with a 60-day readable retention window and automatic purge.
 - A localhost-only, read-only dashboard suitable for SSH tunneling.
@@ -41,6 +42,7 @@ work-tracker add "Watch company CI" \
   --actor codex-ci \
   --note "submitted at PR head abc123"
 
+work-tracker list
 work-tracker today
 work-tracker show 1
 work-tracker note 1 "Runner assigned; results expected in 30 minutes" --actor codex-ci
@@ -64,7 +66,7 @@ If neither is set, the CLI uses the current `USER`, then `unknown` as a last res
 |---|---|
 | `add` | Create a Work Item, initially `pending` unless selected otherwise |
 | `show ID` | Show one item, including a soft-deleted item |
-| `list` | List recent items; filter with `--status` |
+| `list` | List actionable items; `--all` adds done and cancelled, `--status` selects one status |
 | `today` | Show items updated today plus all actionable items |
 | `update ID` | Change title or description |
 | `status ID STATUS` | Apply an idempotent status transition |
@@ -74,9 +76,22 @@ If neither is set, the CLI uses the current `USER`, then `unknown` as a last res
 | `path` | Show the SQLite database path |
 | `serve` | Host the read-only dashboard |
 
-The statuses are `pending`, `active`, `waiting`, `blocked`, `done`, `cancelled`, and `deleted`. The first four are actionable and therefore remain in the Daily View even when they were not updated today.
+The statuses are `pending`, `active`, `waiting`, `blocked`, `done`, `cancelled`, and `deleted`. The first four are actionable: they are what `list` shows by default, and they remain in the Daily View even when they were not updated today.
 
 Run `work-tracker COMMAND --help` for all options.
+
+## Listing work
+
+`list` answers "what is still open" and `today` answers "what happened today":
+
+```bash
+work-tracker list                 # actionable items only
+work-tracker list --all           # every item, including done and cancelled
+work-tracker list --status done   # exactly one status
+work-tracker today                # actionable items plus anything updated today
+```
+
+Both views order work by attention first: blocked, active, waiting, pending, then finished work, most recently updated first within each group. `--all` and `--status` cannot be combined. The human-readable `list` output ends with a footer that names `--all` whenever finished items are hidden; `--json` output is always a plain array. Deleted items stay hidden from every list unless you pass `--include-deleted` or `--status deleted`.
 
 ## Agent and script usage
 
@@ -121,8 +136,8 @@ The `track-work` skill is maintained in the `my-cubrid-skills` collection. Insta
 npx skills add vimkim/my-cubrid-skills -y -g --agent claude-code --agent codex
 ```
 
-The skill teaches agents to create a Work Item before long-running work, record meaningful notes and transitions, inspect the Daily View, and preserve the final outcome.
+The skill teaches agents to create a Work Item before long-running work, record meaningful notes and transitions, inspect the Daily View and the actionable list, and preserve the final outcome.
 
 ## Development
 
-See `AGENTS.md` for architecture and invariants. `CLAUDE.md` is a symlink to the same guidance so both agent environments receive one canonical instruction file.
+See `AGENTS.md` for architecture and invariants, and `docs/adr/` for recorded decisions. `CLAUDE.md` is a symlink to the same guidance so both agent environments receive one canonical instruction file.

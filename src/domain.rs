@@ -42,7 +42,7 @@ impl Status {
 
 impl fmt::Display for Status {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        f.pad(self.as_str())
     }
 }
 
@@ -84,4 +84,15 @@ pub struct HistoryEntry {
     pub note: Option<String>,
     pub occurred_at: DateTime<Utc>,
     pub changes: Value,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_display_honours_column_width() {
+        assert_eq!(format!("{:<10}|", Status::Done), "done      |");
+        assert_eq!(format!("{}", Status::Cancelled), "cancelled");
+    }
 }

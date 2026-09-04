@@ -11,6 +11,33 @@ use crate::domain::{HistoryEntry, Status, WorkItem};
 
 const RETENTION_DAYS: i64 = 60;
 
+/// SQL list of the statuses that make a Work Item actionable. Keep in sync with
+/// `Status::is_actionable`.
+const ACTIONABLE_STATUSES: &str = "('pending', 'active', 'waiting', 'blocked')";
+
+/// Shared ordering for every multi-item view: work that needs attention first,
+/// then finished work, most recently updated first within each group.
+const STATUS_PRIORITY_ORDER: &str = "CASE status
+                 WHEN 'blocked' THEN 0
+                 WHEN 'active' THEN 1
+                 WHEN 'waiting' THEN 2
+                 WHEN 'pending' THEN 3
+                 ELSE 4
+               END,
+               updated_at DESC,
+               id DESC";
+
+/// Which Work Items `Tracker::list` returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListFilter {
+    /// Only Actionable Work Items: pending, active, waiting, or blocked.
+    Actionable,
+    /// Every status, including done and cancelled.
+    All,
+    /// Exactly one status.
+    Status(Status),
+}
+
 pub struct Tracker {
     connection: Connection,
 }
@@ -118,44 +145,43 @@ impl Tracker {
 
     pub fn list(
         &self,
-        status: Option<Status>,
+        filter: ListFilter,
         include_deleted: bool,
         limit: usize,
     ) -> Result<Vec<WorkItem>> {
-        let mut statement = self.connection.prepare(
+        let (status, actionable_only) = match filter {
+            ListFilter::Actionable => (None, true),
+            ListFilter::All => (None, false),
+            ListFilter::Status(status) => (Some(status.as_str()), false),
+        };
+        let include_deleted = include_deleted || filter == ListFilter::Status(Status::Deleted);
+        let mut statement = self.connection.prepare(&format!(
             "SELECT id, title, description, status, created_at, updated_at, deleted_at, purge_after
              FROM work_items
              WHERE (?1 IS NULL OR status = ?1)
-               AND (?2 OR status != 'deleted')
-             ORDER BY updated_at DESC, id DESC
-             LIMIT ?3",
+               AND (NOT ?2 OR status IN {ACTIONABLE_STATUSES})
+               AND (?3 OR status != 'deleted')
+             ORDER BY {STATUS_PRIORITY_ORDER}
+             LIMIT ?4"
+        ))?;
+        let rows = statement.query_map(
+            params![status, actionable_only, include_deleted, limit as i64],
+            row_to_item,
         )?;
-        let status = status.map(Status::as_str);
-        let rows =
-            statement.query_map(params![status, include_deleted, limit as i64], row_to_item)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
 
     pub fn daily_view(&self, include_deleted: bool) -> Result<Vec<WorkItem>> {
         let (start, end) = local_day_bounds(Utc::now())?;
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare(&format!(
             "SELECT id, title, description, status, created_at, updated_at, deleted_at, purge_after
              FROM work_items
              WHERE (updated_at >= ?1 AND updated_at < ?2
-                    OR status IN ('pending', 'active', 'waiting', 'blocked'))
+                    OR status IN {ACTIONABLE_STATUSES})
                AND (?3 OR status != 'deleted')
-             ORDER BY
-               CASE status
-                 WHEN 'blocked' THEN 0
-                 WHEN 'active' THEN 1
-                 WHEN 'waiting' THEN 2
-                 WHEN 'pending' THEN 3
-                 ELSE 4
-               END,
-               updated_at DESC,
-               id DESC",
-        )?;
+             ORDER BY {STATUS_PRIORITY_ORDER}"
+        ))?;
         let rows = statement.query_map(
             params![timestamp(start), timestamp(end), include_deleted],
             row_to_item,
@@ -508,8 +534,8 @@ mod tests {
         assert_eq!(deleted.status, Status::Deleted);
         assert_eq!(tracker.history(item.id)?.len(), 3);
         assert!(deleted.purge_after.is_some());
-        assert!(tracker.list(None, false, 100)?.is_empty());
-        assert_eq!(tracker.list(None, true, 100)?.len(), 1);
+        assert!(tracker.list(ListFilter::All, false, 100)?.is_empty());
+        assert_eq!(tracker.list(ListFilter::All, true, 100)?.len(), 1);
         Ok(())
     }
 
@@ -594,6 +620,92 @@ mod tests {
     }
 
     #[test]
+    fn list_shows_actionable_items_by_default_and_everything_with_all() -> Result<()> {
+        let mut tracker = Tracker::open_in_memory()?;
+        for status in [
+            Status::Pending,
+            Status::Active,
+            Status::Waiting,
+            Status::Blocked,
+            Status::Done,
+            Status::Cancelled,
+        ] {
+            tracker.create(&format!("{status} work"), None, status, "agent", None)?;
+        }
+        let removed = tracker.create("Removed work", None, Status::Pending, "agent", None)?;
+        tracker.set_status(removed.id, Status::Deleted, "agent", None)?;
+
+        let actionable = tracker.list(ListFilter::Actionable, false, 100)?;
+        assert_eq!(actionable.len(), 4);
+        assert!(actionable.iter().all(|item| item.status.is_actionable()));
+
+        assert_eq!(tracker.list(ListFilter::All, false, 100)?.len(), 6);
+        assert_eq!(tracker.list(ListFilter::All, true, 100)?.len(), 7);
+
+        let done = tracker.list(ListFilter::Status(Status::Done), false, 100)?;
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].status, Status::Done);
+
+        let deleted = tracker.list(ListFilter::Status(Status::Deleted), false, 100)?;
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].id, removed.id);
+        Ok(())
+    }
+
+    #[test]
+    fn list_orders_by_status_priority_then_recency() -> Result<()> {
+        let mut tracker = Tracker::open_in_memory()?;
+        let done = tracker.create("Finished", None, Status::Done, "agent", None)?;
+        let older_pending =
+            tracker.create("Older pending", None, Status::Pending, "agent", None)?;
+        let newer_pending =
+            tracker.create("Newer pending", None, Status::Pending, "agent", None)?;
+        let waiting = tracker.create("Waiting", None, Status::Waiting, "agent", None)?;
+        let active = tracker.create("Active", None, Status::Active, "agent", None)?;
+        let blocked = tracker.create("Blocked", None, Status::Blocked, "agent", None)?;
+        let cancelled = tracker.create("Abandoned", None, Status::Cancelled, "agent", None)?;
+        for (item, day) in [
+            (&blocked, 1),
+            (&active, 2),
+            (&waiting, 3),
+            (&older_pending, 4),
+            (&newer_pending, 5),
+            (&cancelled, 7),
+            (&done, 8),
+        ] {
+            tracker.connection.execute(
+                "UPDATE work_items SET updated_at = ?1 WHERE id = ?2",
+                params![format!("2026-01-0{day}T00:00:00.000Z"), item.id],
+            )?;
+        }
+
+        let ids = |items: Vec<WorkItem>| items.into_iter().map(|item| item.id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(tracker.list(ListFilter::All, false, 100)?),
+            vec![
+                blocked.id,
+                active.id,
+                waiting.id,
+                newer_pending.id,
+                older_pending.id,
+                done.id,
+                cancelled.id
+            ]
+        );
+        assert_eq!(
+            ids(tracker.list(ListFilter::Actionable, false, 100)?),
+            vec![
+                blocked.id,
+                active.id,
+                waiting.id,
+                newer_pending.id,
+                older_pending.id
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn concurrent_connections_do_not_lose_creations() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("tracker.db");
@@ -620,7 +732,7 @@ mod tests {
         }
 
         let tracker = Tracker::open(&path)?;
-        assert_eq!(tracker.list(None, false, 100)?.len(), 16);
+        assert_eq!(tracker.list(ListFilter::All, false, 100)?.len(), 16);
         Ok(())
     }
 
