@@ -84,24 +84,31 @@ pub fn print_error(error: &Error, json_output: bool) {
 }
 
 fn github_error_code(kind: GitHubErrorKind) -> &'static str {
+    if let Some(read_error_kind) = kind.read_health_error_kind() {
+        return read_health_error_code(read_error_kind);
+    }
     match kind {
         GitHubErrorKind::CliMissing => "github_cli_missing",
         GitHubErrorKind::Unauthenticated => "github_unauthenticated",
         GitHubErrorKind::PermissionDenied => "github_permission_denied",
         GitHubErrorKind::NotFound => "github_not_found",
         GitHubErrorKind::ApiFailure => "github_api_failure",
-        GitHubErrorKind::IncompatibleMetadata => "github_incompatible_metadata",
-        GitHubErrorKind::MetadataCollision => "github_metadata_collision",
         GitHubErrorKind::InvalidVisibility => "github_invalid_visibility",
         GitHubErrorKind::IncompatibleRepository => "github_incompatible_repository",
+        GitHubErrorKind::LedgerIntegrity
+        | GitHubErrorKind::UnknownEventSchema
+        | GitHubErrorKind::IncompatibleMetadata
+        | GitHubErrorKind::MetadataCollision => unreachable!("handled as a read-health error kind"),
     }
 }
 
 fn read_health_error_code(kind: ReadHealthErrorKind) -> &'static str {
     match kind {
         ReadHealthErrorKind::CacheUnavailable => "cache_unavailable",
+        ReadHealthErrorKind::LedgerIntegrity => "github_ledger_integrity",
         ReadHealthErrorKind::MetadataCollision => "github_metadata_collision",
         ReadHealthErrorKind::IncompatibleMetadata => "github_incompatible_metadata",
+        ReadHealthErrorKind::UnknownEventSchema => "github_unknown_event_schema",
     }
 }
 
@@ -178,6 +185,11 @@ pub fn print_history(entries: &[HistoryEntry]) {
         return;
     }
     for entry in entries {
+        let attribution = entry
+            .github_actor
+            .as_deref()
+            .map(|github_actor| format!("{} (GitHub: {github_actor})", entry.actor))
+            .unwrap_or_else(|| entry.actor.clone());
         println!(
             "{}  {:<14} by {}",
             entry
@@ -185,13 +197,22 @@ pub fn print_history(entries: &[HistoryEntry]) {
                 .with_timezone(&Local)
                 .format("%Y-%m-%d %H:%M:%S %:z"),
             entry.kind,
-            entry.actor
+            attribution
         );
+        if let Some(event_id) = &entry.event_id {
+            println!("  Event: {event_id}");
+        }
         if let Some(note) = &entry.note {
             println!("  Note: {note}");
         }
         if entry.changes != serde_json::json!({}) {
             println!("  Changes: {}", entry.changes);
+        }
+        if let Some(state_revision) = entry.state_revision {
+            println!("  State revision: {state_revision}");
+        }
+        if let Some(history_hash) = &entry.history_hash {
+            println!("  History hash: {history_hash}");
         }
     }
 }

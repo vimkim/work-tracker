@@ -4,7 +4,9 @@ use std::fs;
 
 use anyhow::{Context, Result, ensure};
 use rusqlite::Connection;
+use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use support::{CliHarness, FakeGh, assert_success, stderr};
 
 fn configure_github(cli: &CliHarness) -> Result<()> {
@@ -20,19 +22,55 @@ fn configure_github(cli: &CliHarness) -> Result<()> {
     Ok(())
 }
 
-fn projection_body() -> String {
-    format!(
+#[derive(Serialize)]
+struct CanonicalGenesis<'a> {
+    schema_version: u32,
+    event_id: &'a str,
+    kind: &'a str,
+    actor: &'a str,
+    github_actor: &'a str,
+    note: &'a str,
+    changes: Value,
+}
+
+fn projection_body() -> Result<String> {
+    let event_id = "11111111-1111-4111-8111-111111111111";
+    let comment_id = 9001_i64;
+    let canonical = serde_json::to_vec(&CanonicalGenesis {
+        schema_version: 1,
+        event_id,
+        kind: "created",
+        actor: "agent-a",
+        github_actor: "octocat",
+        note: "created remotely",
+        changes: json!({
+            "title": "Cached item",
+            "description": "Cached description",
+            "status": "active"
+        }),
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"work-tracker-history-v1");
+    for part in [&[][..], canonical.as_slice(), &comment_id.to_be_bytes()] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    let history_hash = format!("{:x}", hasher.finalize());
+    Ok(format!(
         "Cached description\n\n<!-- work-tracker:projection\n{}\n-->",
         json!({
             "schema_version": 1,
             "kind": "work_item",
-            "event_id": "11111111-1111-4111-8111-111111111111",
+            "event_id": event_id,
             "creation_fingerprint": "fingerprint-41",
             "pending_genesis_event_id": null,
-            "genesis_comment_id": 9001,
-            "state_revision": 1
+            "genesis_comment_id": comment_id,
+            "state_revision": 1,
+            "head_event_id": event_id,
+            "head_comment_id": comment_id,
+            "history_hash": history_hash
         })
-    )
+    ))
 }
 
 fn genesis_body() -> String {
@@ -62,7 +100,7 @@ fn populate_cache(cli: &CliHarness) -> Result<()> {
         0,
         &json!([[{
             "number": 41,
-            "body": projection_body(),
+            "body": projection_body()?,
             "labels": [
                 {"name": "work-tracker:item"},
                 {"name": "work-tracker:status:active"}
