@@ -1514,16 +1514,29 @@ impl GitHubLedger {
                 .map(observed_integrity_evidence)
                 .into_iter()
                 .collect::<Vec<_>>();
-            let mut untrusted_comment_ids = cached[index..]
+            let mut untrusted_variants = cached[index..]
                 .iter()
-                .map(|evidence| evidence.comment_id)
+                .map(|evidence| {
+                    (
+                        evidence.comment_id,
+                        evidence.github_actor.clone(),
+                        evidence.body.clone(),
+                    )
+                })
                 .collect::<HashSet<_>>();
-            untrusted_comment_ids.extend(structured.iter().skip(index).map(|comment| comment.id));
-            untrusted_comment_ids.extend(
-                observed_evidence
+            untrusted_variants.extend(
+                structured
                     .iter()
-                    .map(|evidence| evidence.github_comment_id),
+                    .skip(index)
+                    .map(|comment| (comment.id, comment.user.login.clone(), comment.body.clone())),
             );
+            untrusted_variants.extend(observed_evidence.iter().map(|evidence| {
+                (
+                    evidence.github_comment_id,
+                    evidence.github_actor.clone(),
+                    evidence.body.clone(),
+                )
+            }));
             let report = IntegrityDoctorReport {
                 work_item_id: issue.number,
                 integrity_health: IntegrityHealth::LedgerIntegrityError,
@@ -1545,7 +1558,7 @@ impl GitHubLedger {
                     detail,
                 }),
                 trusted_event_count: index,
-                untrusted_event_count: untrusted_comment_ids.len(),
+                untrusted_event_count: untrusted_variants.len(),
                 timeline_evidence,
                 eligible_repair_modes: if exact_copy_verified {
                     vec![RepairMode::RestoreExactCopy, RepairMode::Rebaseline]
@@ -1593,54 +1606,25 @@ impl GitHubLedger {
         report: &IntegrityDoctorReport,
         observed_history: Option<&[HistoryEntry]>,
     ) -> Result<()> {
-        if self.cache.get(issue.number).is_err() {
-            let status = issue
-                .labels
-                .iter()
-                .find_map(|label| {
-                    label
-                        .name
-                        .strip_prefix("work-tracker:status:")
-                        .and_then(|status| Status::from_str(status).ok())
-                })
-                .unwrap_or(Status::Pending);
-            let observed_at = comments
-                .iter()
-                .map(|comment| comment.created_at)
-                .min()
-                .or(issue.updated_at)
-                .unwrap_or_else(Utc::now);
-            let updated_at = issue.updated_at.unwrap_or(observed_at);
-            let visible = projection_visible_text(&issue.body).unwrap_or_default();
-            let description =
-                (!matches!(visible, "" | "_No description provided._")).then(|| visible.to_owned());
+        let snapshot = if self.cache.get(issue.number).is_err() {
+            let mut item = reviewed_item_from_issue(issue, comments)?;
+            item.ledger_integrity_error = true;
             let mut history = observed_history.unwrap_or_default().to_vec();
             for entry in &mut history {
                 entry.trust = EvidenceTrust::Untrusted;
             }
             let evidence = event_evidence(comments, &history);
-            self.cache.replace_github_item(&GithubCacheItem {
-                item: WorkItem {
-                    id: issue.number,
-                    title: issue
-                        .title
-                        .clone()
-                        .unwrap_or_else(|| format!("GitHub issue #{}", issue.number)),
-                    description,
-                    status,
-                    created_at: observed_at,
-                    updated_at,
-                    archived_at: (status == Status::Archived).then_some(updated_at),
-                    deleted_at: (status == Status::Archived).then_some(updated_at),
-                    purge_after: None,
-                    ledger_integrity_error: true,
-                },
+            Some(GithubCacheItem {
+                item,
                 history,
                 rejected: Vec::new(),
                 evidence,
-            })?;
-        }
-        self.cache.record_github_integrity(report)
+            })
+        } else {
+            None
+        };
+        self.cache
+            .preserve_github_integrity(snapshot.as_ref(), report)
     }
 
     fn correlated_deletion(
@@ -1861,6 +1845,39 @@ impl GitHubLedger {
             &format!("repos/{}/issues/{}/lock", self.repository, issue.number),
             &[],
         )
+    }
+
+    fn verify_recovery_lock_state(&self, issue_number: i64, status: Status) -> Result<()> {
+        if status == Status::Archived {
+            self.github
+                .api_empty(
+                    "PUT",
+                    &format!("repos/{}/issues/{issue_number}/lock", self.repository),
+                    &[],
+                )
+                .map_err(|error| {
+                    recovery_validation_failed(
+                        issue_number,
+                        format!(
+                            "the archived lock could not be restored after projection: {error:#}"
+                        ),
+                    )
+                })?;
+        }
+        let (verified, _) = self.load_work_item_issue(issue_number).map_err(|error| {
+            recovery_validation_failed(
+                issue_number,
+                format!("the lock state could not be verified after projection: {error:#}"),
+            )
+        })?;
+        if verified.locked != (status == Status::Archived) {
+            return Err(recovery_validation_failed(
+                issue_number,
+                "the authoritative lock state changed during recovery projection",
+            )
+            .into());
+        }
+        Ok(())
     }
 
     fn load_prepared_mutation(&self, issue_number: i64) -> Result<PreparedMutation> {
@@ -2428,11 +2445,11 @@ impl GitHubLedger {
         after: &[ObservedIntegrityEvidence],
         additional: &[ObservedIntegrityEvidence],
     ) -> Result<()> {
-        self.preserve_integrity_snapshot(issue, comments, diagnosis, None)?;
         let mut latched = self
             .cache
             .github_integrity_report(diagnosis.work_item_id)?
             .unwrap_or_else(|| diagnosis.clone());
+        let mut newly_latched = 0;
         for observed in after {
             let was_already_observed = before.iter().any(|previous| {
                 previous.github_comment_id == observed.github_comment_id
@@ -2446,6 +2463,7 @@ impl GitHubLedger {
             });
             if !was_already_observed && !is_already_latched {
                 latched.observed_evidence.push(observed.clone());
+                newly_latched += 1;
             }
         }
         for observed in additional {
@@ -2456,12 +2474,11 @@ impl GitHubLedger {
             });
             if !is_already_latched {
                 latched.observed_evidence.push(observed.clone());
+                newly_latched += 1;
             }
         }
-        latched.untrusted_event_count = latched
-            .untrusted_event_count
-            .max(latched.observed_evidence.len());
-        self.cache.record_github_integrity(&latched)
+        latched.untrusted_event_count += newly_latched;
+        self.preserve_integrity_snapshot(issue, comments, &latched, None)
     }
 
     fn load_rebaseline_validation_snapshot(
@@ -2550,6 +2567,33 @@ impl GitHubLedger {
             .into());
         }
         self.preserve_integrity_snapshot(&issue, &comments, &diagnosis, None)?;
+        let guarded_comments = self.load_comments(issue_number)?;
+        let initially_observed = comments.iter().find(|comment| comment.id == comment_id);
+        let guarded_observed = guarded_comments
+            .iter()
+            .find(|comment| comment.id == comment_id);
+        let target_is_unchanged =
+            initially_observed
+                .zip(guarded_observed)
+                .is_some_and(|(before, after)| {
+                    before.user.login == after.user.login && before.body == after.body
+                });
+        if !target_is_unchanged {
+            let before = initially_observed
+                .map(observed_integrity_evidence)
+                .into_iter()
+                .collect::<Vec<_>>();
+            let after = guarded_observed
+                .map(observed_integrity_evidence)
+                .into_iter()
+                .collect::<Vec<_>>();
+            self.latch_recovery_race(&issue, &guarded_comments, &diagnosis, &before, &after, &[])?;
+            return Err(recovery_validation_failed(
+                issue_number,
+                "the damaged event changed again immediately before exact restoration; recovery remains blocked",
+            )
+            .into());
+        }
         self.github.api_empty(
             "PATCH",
             &format!("repos/{}/issues/comments/{comment_id}", self.repository),
@@ -2599,6 +2643,7 @@ impl GitHubLedger {
             )
         })?;
         self.project_history_head(&reloaded_issue, metadata, &replayed.accepted)?;
+        self.verify_recovery_lock_state(issue_number, item.status)?;
         let evidence = event_evidence(&reloaded_comments, &replayed.accepted);
         let trusted_event_count = replayed.accepted.len();
         self.cache.complete_github_recovery(&GithubCacheItem {
@@ -2838,6 +2883,14 @@ impl GitHubLedger {
                 body: body.clone(),
                 observed_at: published_anchor.created_at,
             };
+            self.latch_recovery_race(
+                &issue,
+                &comments,
+                &diagnosis,
+                &initial_evidence,
+                &initial_evidence,
+                std::slice::from_ref(&published_anchor_evidence),
+            )?;
 
             let reloaded = self.load_rebaseline_validation_snapshot(
                 issue_number,
@@ -2968,6 +3021,7 @@ impl GitHubLedger {
                 projected_metadata,
                 &replayed.accepted,
             )?;
+            self.verify_recovery_lock_state(issue_number, item.status)?;
             Ok((item, replayed, final_snapshot.comments))
         })();
         let (item, replayed, comments) = recovery?;

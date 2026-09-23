@@ -36,15 +36,22 @@ fn exact_recovery_restores_verified_copy_revalidates_and_rebuilds_projection() -
         &json!([[remote_comment(&scenario.edited_comment)]]).to_string(),
         "",
     )?;
-    gh.respond(7, 0, "", "")?;
-    gh.respond(8, 0, &scenario.healthy_issue.to_string(), "")?;
     gh.respond(
-        9,
+        7,
+        0,
+        &json!([[remote_comment(&scenario.edited_comment)]]).to_string(),
+        "",
+    )?;
+    gh.respond(8, 0, "", "")?;
+    gh.respond(9, 0, &scenario.healthy_issue.to_string(), "")?;
+    gh.respond(
+        10,
         0,
         &json!([[remote_comment(&scenario.original_comment)]]).to_string(),
         "",
     )?;
-    gh.respond(10, 0, "", "")?;
+    gh.respond(11, 0, "", "")?;
+    gh.respond(12, 0, &scenario.healthy_issue.to_string(), "")?;
     let recovered = cli.run_with_fake_gh(
         &gh,
         ["--json", "recover", "41", "--mode", "restore-exact-copy"],
@@ -81,10 +88,16 @@ fn exact_recovery_failure_stays_latched_and_reports_failed_validation() -> Resul
         &json!([[remote_comment(&scenario.edited_comment)]]).to_string(),
         "",
     )?;
-    gh.respond(7, 0, "", "")?;
-    gh.respond(8, 0, &scenario.corrupt_issue.to_string(), "")?;
     gh.respond(
-        9,
+        7,
+        0,
+        &json!([[remote_comment(&scenario.edited_comment)]]).to_string(),
+        "",
+    )?;
+    gh.respond(8, 0, "", "")?;
+    gh.respond(9, 0, &scenario.corrupt_issue.to_string(), "")?;
+    gh.respond(
+        10,
         0,
         &json!([[remote_comment(&scenario.edited_comment)]]).to_string(),
         "",
@@ -155,16 +168,20 @@ fn exact_recovery_refuses_a_lock_added_after_the_comment_restore() -> Result<()>
         &json!([[remote_comment(&scenario.edited_comment)]]).to_string(),
         "",
     )?;
-    gh.respond(7, 0, "", "")?;
-    gh.respond(8, 0, &locked_issue.to_string(), "")?;
     gh.respond(
-        9,
+        7,
+        0,
+        &json!([[remote_comment(&scenario.edited_comment)]]).to_string(),
+        "",
+    )?;
+    gh.respond(8, 0, "", "")?;
+    gh.respond(9, 0, &locked_issue.to_string(), "")?;
+    gh.respond(
+        10,
         0,
         &json!([[remote_comment(&scenario.original_comment)]]).to_string(),
         "",
     )?;
-    gh.respond(10, 0, "", "")?;
-    gh.respond(11, 0, "", "")?;
 
     let recovered = cli.run_with_fake_gh(
         &gh,
@@ -205,10 +222,16 @@ fn exact_recovery_latches_before_restoring_and_blocks_mutation_after_validation_
         &json!([[remote_comment(&edited_comment)]]).to_string(),
         "",
     )?;
-    gh.respond(5, 0, "", "")?;
-    gh.respond(6, 0, &locked_issue.to_string(), "")?;
     gh.respond(
-        7,
+        5,
+        0,
+        &json!([[remote_comment(&edited_comment)]]).to_string(),
+        "",
+    )?;
+    gh.respond(6, 0, "", "")?;
+    gh.respond(7, 0, &locked_issue.to_string(), "")?;
+    gh.respond(
+        8,
         0,
         &json!([[remote_comment(&original_comment)]]).to_string(),
         "",
@@ -242,6 +265,67 @@ fn exact_recovery_latches_before_restoring_and_blocks_mutation_after_validation_
 }
 
 #[test]
+fn exact_recovery_rereads_and_latches_a_new_variant_before_overwriting() -> Result<()> {
+    let cli = CliHarness::new()?;
+    configure_github(&cli)?;
+    let gh = FakeGh::new()?;
+    let original_event = event("Original title");
+    let edited_a = event("Edited variant A");
+    let edited_b = event("Edited variant B");
+    let original_comment = comment(&original_event)?;
+    let edited_a_comment = comment(&edited_a)?;
+    let edited_b_comment = comment(&edited_b)?;
+    let projection = projection(&hash(&original_event, 9001)?);
+    let healthy_issue = issue(&projection, "2026-09-23T01:02:04Z", false);
+    let corrupt_issue = issue(&projection, "2026-09-23T02:02:04Z", false);
+
+    respond_sync(&gh, 1, &healthy_issue, &remote_comment(&original_comment))?;
+    assert_success(&cli.run_with_fake_gh(&gh, ["--json", "show", "41"])?)?;
+    gh.respond(3, 0, &corrupt_issue.to_string(), "")?;
+    gh.respond(
+        4,
+        0,
+        &json!([[remote_comment(&edited_a_comment)]]).to_string(),
+        "",
+    )?;
+    gh.respond(
+        5,
+        0,
+        &json!([[remote_comment(&edited_b_comment)]]).to_string(),
+        "",
+    )?;
+
+    let recovered = cli.run_with_fake_gh(
+        &gh,
+        ["--json", "recover", "41", "--mode", "restore-exact-copy"],
+    )?;
+    ensure!(!recovered.status.success());
+    let calls = gh.calls()?;
+    ensure!(!calls.contains("\tPATCH\trepos/octocat/work-tracker-data/issues/comments/9001"));
+    let connection = Connection::open(cli.github_cache_path("octocat", "work-tracker-data"))?;
+    let report: String = connection.query_row(
+        "SELECT report_json FROM github_integrity_errors WHERE work_item_id = 41",
+        [],
+        |row| row.get(0),
+    )?;
+    let report: Value = serde_json::from_str(&report)?;
+    let observed = report["observed_evidence"]
+        .as_array()
+        .context("observed evidence should be an array")?;
+    assert!(
+        observed
+            .iter()
+            .any(|entry| entry["body"] == edited_a_comment)
+    );
+    assert!(
+        observed
+            .iter()
+            .any(|entry| entry["body"] == edited_b_comment)
+    );
+    Ok(())
+}
+
+#[test]
 fn doctor_counts_a_cached_event_whose_live_marker_was_removed_as_untrusted() -> Result<()> {
     let cli = CliHarness::new()?;
     configure_github(&cli)?;
@@ -263,7 +347,7 @@ fn doctor_counts_a_cached_event_whose_live_marker_was_removed_as_untrusted() -> 
     let report: Value = serde_json::from_slice(&diagnosed.stdout)?;
     assert_eq!(report["first_break"]["kind"], "edited_event");
     assert_eq!(report["trusted_event_count"], 0);
-    assert_eq!(report["untrusted_event_count"], 1);
+    assert_eq!(report["untrusted_event_count"], 2);
     assert_eq!(
         report["observed_evidence"].as_array().map(Vec::len),
         Some(1)
@@ -965,6 +1049,111 @@ fn rebaseline_rejects_a_lock_change_after_its_first_authoritative_reload() -> Re
 }
 
 #[test]
+fn cacheless_recovery_latch_derives_archived_status_from_the_live_lock() -> Result<()> {
+    let cli = CliHarness::new()?;
+    configure_github(&cli)?;
+    let gh = FakeGh::new()?;
+    let original_comment = comment(&event("Original title"))?;
+    let invalid_projection = projection("disconnected-projection-head");
+    let mut locked_issue = issue(&invalid_projection, "2026-09-23T01:02:04Z", true);
+    locked_issue["labels"] = json!([
+        {"name": "work-tracker:item"},
+        {"name": "work-tracker:status:active"}
+    ]);
+    let raced_body = "new markerless evidence";
+    respond_rebaseline_attempt(
+        &gh,
+        1,
+        &locked_issue,
+        &[remote_comment(&original_comment)],
+        &json!([]),
+        9100,
+        "2026-09-23T04:02:03Z",
+        &locked_issue,
+        &[
+            remote_comment(&original_comment),
+            remote_comment_with_id(9050, raced_body),
+        ],
+    )?;
+    let recovered = cli.run_with_fake_gh(
+        &gh,
+        [
+            "--json",
+            "recover",
+            "41",
+            "--mode",
+            "rebaseline",
+            "--actor",
+            "reviewer-a",
+            "--reason",
+            "reviewed locked state",
+        ],
+    )?;
+    ensure!(!recovered.status.success());
+    let connection = Connection::open(cli.github_cache_path("octocat", "work-tracker-data"))?;
+    let status: String =
+        connection.query_row("SELECT status FROM work_items WHERE id = 41", [], |row| {
+            row.get(0)
+        })?;
+    assert_eq!(status, "archived");
+    Ok(())
+}
+
+#[test]
+fn archived_rebaseline_verifies_the_lock_after_projection_before_unlatching() -> Result<()> {
+    let cli = CliHarness::new()?;
+    configure_github(&cli)?;
+    let gh = FakeGh::new()?;
+    let original_comment = comment(&event("Original title"))?;
+    let invalid_projection = projection("disconnected-projection-head");
+    let mut locked_issue = issue(&invalid_projection, "2026-09-23T01:02:04Z", true);
+    locked_issue["labels"] = json!([
+        {"name": "work-tracker:item"},
+        {"name": "work-tracker:status:archived"}
+    ]);
+    let mut raced_unlocked_issue = locked_issue.clone();
+    raced_unlocked_issue["locked"] = json!(false);
+    respond_rebaseline_attempt_with_final(
+        &gh,
+        1,
+        &locked_issue,
+        &[remote_comment(&original_comment)],
+        &json!([]),
+        9100,
+        "2026-09-23T04:02:03Z",
+        &locked_issue,
+        &[remote_comment(&original_comment)],
+        &locked_issue,
+        &[remote_comment(&original_comment)],
+    )?;
+    gh.respond(11, 0, "", "")?;
+    gh.respond(12, 0, &raced_unlocked_issue.to_string(), "")?;
+    let recovered = cli.run_with_fake_gh(
+        &gh,
+        [
+            "--json",
+            "recover",
+            "41",
+            "--mode",
+            "rebaseline",
+            "--actor",
+            "reviewer-a",
+            "--reason",
+            "reviewed archived state",
+        ],
+    )?;
+    ensure!(!recovered.status.success());
+    let connection = Connection::open(cli.github_cache_path("octocat", "work-tracker-data"))?;
+    let latch_count: i64 = connection.query_row(
+        "SELECT count(*) FROM github_integrity_errors WHERE work_item_id = 41",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(latch_count, 1);
+    Ok(())
+}
+
+#[test]
 fn rebaseline_retry_retains_an_uncached_interior_body_that_lost_its_marker() -> Result<()> {
     let cli = CliHarness::new()?;
     configure_github(&cli)?;
@@ -1213,6 +1402,80 @@ fn rebaseline_retry_retains_the_locally_known_body_of_a_deleted_anchor() -> Resu
     Ok(())
 }
 
+#[test]
+fn rebaseline_latches_the_published_anchor_before_its_first_reload() -> Result<()> {
+    let cli = CliHarness::new()?;
+    configure_github(&cli)?;
+    let gh = FakeGh::new()?;
+    let original_event = event("Original title");
+    let original_comment = comment(&original_event)?;
+    let invalid_projection = projection("disconnected-projection-head");
+    let corrupt_issue = issue(&invalid_projection, "2026-09-23T02:02:04Z", false);
+    let original_comments = vec![remote_comment(&original_comment)];
+
+    gh.respond(1, 0, &corrupt_issue.to_string(), "")?;
+    gh.respond(2, 0, &json!([original_comments]).to_string(), "")?;
+    gh.respond(3, 0, "[[]]", "")?;
+    gh.respond(4, 0, r#"{"login":"octocat"}"#, "")?;
+    gh.respond(
+        5,
+        0,
+        &json!({
+            "id": 9100,
+            "created_at": "2026-09-23T04:02:03Z",
+            "user": {"login": "octocat"}
+        })
+        .to_string(),
+        "",
+    )?;
+    gh.respond(6, 1, "", "authoritative reload unavailable")?;
+    let raced = cli.run_with_fake_gh(
+        &gh,
+        [
+            "--json",
+            "recover",
+            "41",
+            "--mode",
+            "rebaseline",
+            "--actor",
+            "reviewer-a",
+            "--reason",
+            "first review",
+        ],
+    )?;
+    ensure!(!raced.status.success());
+    let first_anchor_body = last_published_rebaseline_body(&gh.calls()?)?;
+
+    respond_rebaseline_attempt(
+        &gh,
+        7,
+        &corrupt_issue,
+        &original_comments,
+        &json!([]),
+        9200,
+        "2026-09-23T04:03:03Z",
+        &corrupt_issue,
+        &original_comments,
+    )?;
+    let recovered = cli.run_with_fake_gh(
+        &gh,
+        [
+            "--json",
+            "recover",
+            "41",
+            "--mode",
+            "rebaseline",
+            "--actor",
+            "reviewer-a",
+            "--reason",
+            "reviewed after reload failure",
+        ],
+    )?;
+    assert_success(&recovered)?;
+    assert!(cached_retained_bodies(&cli)?.contains(&first_anchor_body));
+    Ok(())
+}
+
 #[derive(Clone, Serialize)]
 struct Event<'a> {
     schema_version: u32,
@@ -1440,6 +1703,9 @@ fn respond_rebaseline_attempt_with_final(
         "",
     )?;
     gh.respond(start + 9, 0, "", "")?;
+    if !final_issue["locked"].as_bool().unwrap_or(false) {
+        gh.respond(start + 10, 0, &final_issue.to_string(), "")?;
+    }
     Ok(())
 }
 
@@ -2433,6 +2699,8 @@ fn archived_rebaseline_stays_locked_and_remains_immutable() -> Result<()> {
         }]),
         "2026-09-23T06:02:03Z",
     )?;
+    gh.respond(15, 0, "", "")?;
+    gh.respond(16, 0, &damaged_archived_issue.to_string(), "")?;
     let recovered = cli.run_with_fake_gh(
         &gh,
         [
@@ -2451,7 +2719,8 @@ fn archived_rebaseline_stays_locked_and_remains_immutable() -> Result<()> {
     ensure!(human.contains("Recovery:    rebaseline"));
     ensure!(human.contains("Archived:    true"));
     let calls = gh.calls()?;
-    ensure!(!calls.contains("\trepos/octocat/work-tracker-data/issues/41/lock"));
+    ensure!(calls.contains("\tPUT\trepos/octocat/work-tracker-data/issues/41/lock"));
+    ensure!(!calls.contains("\tDELETE\trepos/octocat/work-tracker-data/issues/41/lock"));
 
     let shown = cli.run_with_fake_gh(&gh, ["--offline", "--json", "show", "41"])?;
     assert_success(&shown)?;

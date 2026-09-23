@@ -334,13 +334,28 @@ impl SqliteLedger {
             .transpose()
     }
 
-    pub(crate) fn record_github_integrity(&self, report: &IntegrityDoctorReport) -> Result<()> {
-        self.connection.execute(
+    pub(crate) fn record_github_integrity(&mut self, report: &IntegrityDoctorReport) -> Result<()> {
+        self.preserve_github_integrity(None, report)
+    }
+
+    pub(crate) fn preserve_github_integrity(
+        &mut self,
+        snapshot: Option<&GithubCacheItem>,
+        report: &IntegrityDoctorReport,
+    ) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(snapshot) = snapshot {
+            replace_github_item_in_transaction(&transaction, snapshot)?;
+        }
+        transaction.execute(
             "INSERT INTO github_integrity_errors (work_item_id, report_json)
              VALUES (?1, ?2)
              ON CONFLICT(work_item_id) DO UPDATE SET report_json = excluded.report_json",
             params![report.work_item_id, serde_json::to_string(report)?],
         )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -1557,6 +1572,50 @@ mod tests {
 
         assert_eq!(tracker.history(41)?.len(), 1);
         assert_eq!(tracker.history(42)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn integrity_snapshot_and_latch_roll_back_together() -> Result<()> {
+        let mut tracker = SqliteLedger::open_in_memory()?;
+        tracker.connection.execute_batch(
+            "CREATE TRIGGER reject_integrity_latch
+             BEFORE INSERT ON github_integrity_errors
+             BEGIN
+               SELECT RAISE(ABORT, 'simulated latch interruption');
+             END;",
+        )?;
+        let report = IntegrityDoctorReport {
+            work_item_id: 41,
+            integrity_health: crate::domain::IntegrityHealth::LedgerIntegrityError,
+            archived: false,
+            first_break: None,
+            trusted_event_count: 0,
+            untrusted_event_count: 1,
+            timeline_evidence: Vec::new(),
+            eligible_repair_modes: Vec::new(),
+            observed_evidence: Vec::new(),
+        };
+
+        assert!(
+            tracker
+                .preserve_github_integrity(Some(&github_cache_item(41, -9001)), &report)
+                .is_err()
+        );
+        assert!(tracker.get(41).is_err());
+        assert!(tracker.github_integrity_report(41)?.is_none());
+
+        tracker
+            .connection
+            .execute_batch("DROP TRIGGER reject_integrity_latch;")?;
+        tracker.preserve_github_integrity(Some(&github_cache_item(41, -9001)), &report)?;
+        assert_eq!(tracker.get(41)?.id, 41);
+        assert_eq!(
+            tracker
+                .github_integrity_report(41)?
+                .map(|report| report.work_item_id),
+            Some(41)
+        );
         Ok(())
     }
 
