@@ -52,6 +52,12 @@ fn exact_recovery_restores_verified_copy_revalidates_and_rebuilds_projection() -
     )?;
     gh.respond(11, 0, "", "")?;
     gh.respond(12, 0, &scenario.healthy_issue.to_string(), "")?;
+    gh.respond(
+        13,
+        0,
+        &json!([[remote_comment(&scenario.original_comment)]]).to_string(),
+        "",
+    )?;
     let recovered = cli.run_with_fake_gh(
         &gh,
         ["--json", "recover", "41", "--mode", "restore-exact-copy"],
@@ -322,6 +328,57 @@ fn exact_recovery_rereads_and_latches_a_new_variant_before_overwriting() -> Resu
             .iter()
             .any(|entry| entry["body"] == edited_b_comment)
     );
+    Ok(())
+}
+
+#[test]
+fn exact_recovery_latches_a_comment_edit_observed_after_projection() -> Result<()> {
+    let cli = CliHarness::new()?;
+    configure_github(&cli)?;
+    let gh = FakeGh::new()?;
+    let scenario = seed_edited_integrity(&cli, &gh)?;
+    let raced_comment = comment(&event("Changed during exact projection"))?;
+    gh.respond(5, 0, &scenario.corrupt_issue.to_string(), "")?;
+    gh.respond(
+        6,
+        0,
+        &json!([[remote_comment(&scenario.edited_comment)]]).to_string(),
+        "",
+    )?;
+    gh.respond(
+        7,
+        0,
+        &json!([[remote_comment(&scenario.edited_comment)]]).to_string(),
+        "",
+    )?;
+    gh.respond(8, 0, "", "")?;
+    gh.respond(9, 0, &scenario.healthy_issue.to_string(), "")?;
+    gh.respond(
+        10,
+        0,
+        &json!([[remote_comment(&scenario.original_comment)]]).to_string(),
+        "",
+    )?;
+    gh.respond(11, 0, "", "")?;
+    gh.respond(12, 0, &scenario.healthy_issue.to_string(), "")?;
+    gh.respond(
+        13,
+        0,
+        &json!([[remote_comment(&raced_comment)]]).to_string(),
+        "",
+    )?;
+    let recovered = cli.run_with_fake_gh(
+        &gh,
+        ["--json", "recover", "41", "--mode", "restore-exact-copy"],
+    )?;
+    ensure!(!recovered.status.success());
+    let connection = Connection::open(cli.github_cache_path("octocat", "work-tracker-data"))?;
+    let report: String = connection.query_row(
+        "SELECT report_json FROM github_integrity_errors WHERE work_item_id = 41",
+        [],
+        |row| row.get(0),
+    )?;
+    ensure!(report.contains("Changed during exact projection"));
     Ok(())
 }
 
@@ -1476,6 +1533,193 @@ fn rebaseline_latches_the_published_anchor_before_its_first_reload() -> Result<(
     Ok(())
 }
 
+#[test]
+fn rebaseline_reconciles_a_lost_post_response_and_retains_the_deleted_anchor() -> Result<()> {
+    let cli = CliHarness::new()?;
+    configure_github(&cli)?;
+    let gh = FakeGh::new()?;
+    let original_comment = comment(&event("Original title"))?;
+    let invalid_projection = projection("disconnected-projection-head");
+    let corrupt_issue = issue(&invalid_projection, "2026-09-23T02:02:04Z", false);
+    let original_comments = vec![remote_comment(&original_comment)];
+
+    gh.respond(1, 0, &corrupt_issue.to_string(), "")?;
+    gh.respond(2, 0, &json!([original_comments]).to_string(), "")?;
+    gh.respond(3, 0, "[[]]", "")?;
+    gh.respond(4, 0, r#"{"login":"octocat"}"#, "")?;
+    gh.respond(5, 1, "", "lost POST response")?;
+    let mut discovered = original_comments.clone();
+    discovered.push(json!({
+        "id": 9100,
+        "created_at": "2026-09-23T04:02:03Z",
+        "user": {"login": "octocat"},
+        "body": "{{LAST_REQUEST_BODY}}"
+    }));
+    gh.respond(6, 0, &json!([discovered]).to_string(), "")?;
+    gh.respond(7, 0, &corrupt_issue.to_string(), "")?;
+    gh.respond(8, 0, &json!([original_comments]).to_string(), "")?;
+    let raced = cli.run_with_fake_gh(
+        &gh,
+        [
+            "--json",
+            "recover",
+            "41",
+            "--mode",
+            "rebaseline",
+            "--actor",
+            "reviewer-a",
+            "--reason",
+            "first review",
+        ],
+    )?;
+    ensure!(!raced.status.success());
+    let first_anchor_body = last_published_rebaseline_body(&gh.calls()?)?;
+
+    respond_rebaseline_attempt(
+        &gh,
+        9,
+        &corrupt_issue,
+        &original_comments,
+        &json!([]),
+        9200,
+        "2026-09-23T04:03:03Z",
+        &corrupt_issue,
+        &original_comments,
+    )?;
+    let recovered = cli.run_with_fake_gh(
+        &gh,
+        [
+            "--json",
+            "recover",
+            "41",
+            "--mode",
+            "rebaseline",
+            "--actor",
+            "reviewer-a",
+            "--reason",
+            "reviewed after lost response",
+        ],
+    )?;
+    assert_success(&recovered)?;
+    assert!(cached_retained_bodies(&cli)?.contains(&first_anchor_body));
+    Ok(())
+}
+
+#[test]
+fn cacheless_rebaseline_retains_a_markerless_interior_projection_candidate() -> Result<()> {
+    let cli = CliHarness::new()?;
+    configure_github(&cli)?;
+    let gh = FakeGh::new()?;
+    let markerless_body = "markerless interior evidence between projected endpoints";
+    let projection = format!(
+        "Evidence body\n\n<!-- work-tracker:projection\n{}\n-->",
+        json!({
+            "schema_version": 1,
+            "kind": "work_item",
+            "event_id": "genesis-integrity-41",
+            "creation_fingerprint": "creation-integrity-41",
+            "creation_event_id_supplied": true,
+            "pending_genesis_event_id": null,
+            "genesis_comment_id": 9001,
+            "state_revision": 2,
+            "head_event_id": "damaged-head",
+            "head_comment_id": 9003,
+            "history_hash": "disconnected-head"
+        })
+    );
+    let corrupt_issue = issue(&projection, "2026-09-23T02:02:04Z", false);
+    let comments = vec![
+        remote_comment(&comment(&event("Original title"))?),
+        remote_comment_with_id(9002, markerless_body),
+        remote_comment_with_id(
+            9003,
+            "damaged head\n\n<!-- work-tracker:event\nnot json\n-->",
+        ),
+    ];
+    respond_rebaseline(
+        &gh,
+        1,
+        &corrupt_issue,
+        &comments,
+        &json!([]),
+        "2026-09-23T04:02:03Z",
+    )?;
+    let recovered = cli.run_with_fake_gh(
+        &gh,
+        [
+            "--json",
+            "recover",
+            "41",
+            "--mode",
+            "rebaseline",
+            "--actor",
+            "reviewer-a",
+            "--reason",
+            "reviewed cacheless interior",
+        ],
+    )?;
+    assert_success(&recovered)?;
+    assert!(cached_retained_bodies(&cli)?.contains(&markerless_body.to_owned()));
+    Ok(())
+}
+
+#[test]
+fn rebaseline_latches_a_comment_edit_observed_after_projection() -> Result<()> {
+    let cli = CliHarness::new()?;
+    configure_github(&cli)?;
+    let gh = FakeGh::new()?;
+    let original_comment = comment(&event("Original title"))?;
+    let raced_comment = comment(&event("Changed during projection"))?;
+    let invalid_projection = projection("disconnected-projection-head");
+    let corrupt_issue = issue(&invalid_projection, "2026-09-23T02:02:04Z", false);
+    respond_rebaseline(
+        &gh,
+        1,
+        &corrupt_issue,
+        &[remote_comment(&original_comment)],
+        &json!([]),
+        "2026-09-23T04:02:03Z",
+    )?;
+    gh.respond(
+        12,
+        0,
+        &json!([[
+            remote_comment(&raced_comment),
+            {
+                "id": 9100,
+                "created_at": "2026-09-23T04:02:03Z",
+                "user": {"login": "octocat"},
+                "body": "{{LAST_REBASELINE_BODY}}"
+            }
+        ]])
+        .to_string(),
+        "",
+    )?;
+    let recovered = cli.run_with_fake_gh(
+        &gh,
+        [
+            "--json",
+            "recover",
+            "41",
+            "--mode",
+            "rebaseline",
+            "--actor",
+            "reviewer-a",
+            "--reason",
+            "reviewed projection race",
+        ],
+    )?;
+    ensure!(!recovered.status.success());
+    let connection = Connection::open(cli.github_cache_path("octocat", "work-tracker-data"))?;
+    let report: String = connection.query_row(
+        "SELECT report_json FROM github_integrity_errors WHERE work_item_id = 41",
+        [],
+        |row| row.get(0),
+    )?;
+    ensure!(report.contains("Changed during projection"));
+    Ok(())
+}
+
 #[derive(Clone, Serialize)]
 struct Event<'a> {
     schema_version: u32,
@@ -1704,7 +1948,22 @@ fn respond_rebaseline_attempt_with_final(
     )?;
     gh.respond(start + 9, 0, "", "")?;
     if !final_issue["locked"].as_bool().unwrap_or(false) {
-        gh.respond(start + 10, 0, &final_issue.to_string(), "")?;
+        let mut post_projection_issue = final_issue.clone();
+        post_projection_issue["body"] = json!("{{LAST_REQUEST_BODY}}");
+        gh.respond(start + 10, 0, &post_projection_issue.to_string(), "")?;
+        let mut post_projection_comments = final_comments.to_vec();
+        post_projection_comments.push(json!({
+            "id": anchor_id,
+            "created_at": created_at,
+            "user": {"login": "octocat"},
+            "body": "{{LAST_REBASELINE_BODY}}"
+        }));
+        gh.respond(
+            start + 11,
+            0,
+            &json!([post_projection_comments]).to_string(),
+            "",
+        )?;
     }
     Ok(())
 }
@@ -2700,7 +2959,24 @@ fn archived_rebaseline_stays_locked_and_remains_immutable() -> Result<()> {
         "2026-09-23T06:02:03Z",
     )?;
     gh.respond(15, 0, "", "")?;
-    gh.respond(16, 0, &damaged_archived_issue.to_string(), "")?;
+    let mut projected_archived_issue = damaged_archived_issue.clone();
+    projected_archived_issue["body"] = json!("{{LAST_REQUEST_BODY}}");
+    gh.respond(16, 0, &projected_archived_issue.to_string(), "")?;
+    gh.respond(
+        17,
+        0,
+        &json!([[
+            archive_comment,
+            {
+                "id": 9100,
+                "created_at": "2026-09-23T06:02:03Z",
+                "user": {"login": "octocat"},
+                "body": "{{LAST_REBASELINE_BODY}}"
+            }
+        ]])
+        .to_string(),
+        "",
+    )?;
     let recovered = cli.run_with_fake_gh(
         &gh,
         [

@@ -146,12 +146,18 @@ printf '%s' "$count" > "$count_file"
 } >> "$root/calls"
 for argument in "$@"; do
     case "$argument" in
+        body=Work\ Tracker\ History\ Entry:\ rebaseline*)
+            printf '%s' "${argument#body=}" > "$root/last_request_body"
+            printf '%s' "${argument#body=}" > "$root/last_rebaseline_body"
+            ;;
         body=*) printf '%s' "${argument#body=}" > "$root/last_request_body" ;;
     esac
 done
 response=$root/responses/$count
 if [ -f "$response.stdout" ]; then
-    if /bin/grep -q '{{LAST_REQUEST_BODY}}' "$response.stdout"; then
+    if /bin/grep -q '{{LAST_REBASELINE_BODY}}' "$response.stdout"; then
+        /usr/bin/python3 -c 'import json, pathlib, sys; print(pathlib.Path(sys.argv[1]).read_text().replace("\"{{LAST_REBASELINE_BODY}}\"", json.dumps(pathlib.Path(sys.argv[2]).read_text())), end="")' "$response.stdout" "$root/last_rebaseline_body"
+    elif /bin/grep -q '{{LAST_REQUEST_BODY}}' "$response.stdout"; then
         /usr/bin/python3 -c 'import json, pathlib, sys; print(pathlib.Path(sys.argv[1]).read_text().replace("\"{{LAST_REQUEST_BODY}}\"", json.dumps(pathlib.Path(sys.argv[2]).read_text())), end="")' "$response.stdout" "$root/last_request_body"
     elif /bin/grep -q '{{LAST_EVENT_ID}}' "$response.stdout"; then
         event_id=$(/bin/sed -n -e 's/.*"event_id":"\(update-[^"]*\)".*/\1/p' -e 's/.*"event_id":"\(status-[^"]*\)".*/\1/p' -e 's/.*"event_id":"\(archive-[^"]*\)".*/\1/p' "$root/calls" | /bin/tail -n 1)

@@ -1514,29 +1514,8 @@ impl GitHubLedger {
                 .map(observed_integrity_evidence)
                 .into_iter()
                 .collect::<Vec<_>>();
-            let mut untrusted_variants = cached[index..]
-                .iter()
-                .map(|evidence| {
-                    (
-                        evidence.comment_id,
-                        evidence.github_actor.clone(),
-                        evidence.body.clone(),
-                    )
-                })
-                .collect::<HashSet<_>>();
-            untrusted_variants.extend(
-                structured
-                    .iter()
-                    .skip(index)
-                    .map(|comment| (comment.id, comment.user.login.clone(), comment.body.clone())),
-            );
-            untrusted_variants.extend(observed_evidence.iter().map(|evidence| {
-                (
-                    evidence.github_comment_id,
-                    evidence.github_actor.clone(),
-                    evidence.body.clone(),
-                )
-            }));
+            let untrusted_event_count =
+                untrusted_variant_count(&cached, index, &structured, &observed_evidence);
             let report = IntegrityDoctorReport {
                 work_item_id: issue.number,
                 integrity_health: IntegrityHealth::LedgerIntegrityError,
@@ -1558,7 +1537,7 @@ impl GitHubLedger {
                     detail,
                 }),
                 trusted_event_count: index,
-                untrusted_event_count: untrusted_variants.len(),
+                untrusted_event_count,
                 timeline_evidence,
                 eligible_repair_modes: if exact_copy_verified {
                     vec![RepairMode::RestoreExactCopy, RepairMode::Rebaseline]
@@ -1847,7 +1826,11 @@ impl GitHubLedger {
         )
     }
 
-    fn verify_recovery_lock_state(&self, issue_number: i64, status: Status) -> Result<()> {
+    fn verify_recovery_lock_state(
+        &self,
+        issue_number: i64,
+        status: Status,
+    ) -> Result<(LedgerIssue, ProjectionMetadata)> {
         if status == Status::Archived {
             self.github
                 .api_empty(
@@ -1864,7 +1847,7 @@ impl GitHubLedger {
                     )
                 })?;
         }
-        let (verified, _) = self.load_work_item_issue(issue_number).map_err(|error| {
+        let (verified, metadata) = self.load_work_item_issue(issue_number).map_err(|error| {
             recovery_validation_failed(
                 issue_number,
                 format!("the lock state could not be verified after projection: {error:#}"),
@@ -1877,7 +1860,7 @@ impl GitHubLedger {
             )
             .into());
         }
-        Ok(())
+        Ok((verified, metadata))
     }
 
     fn load_prepared_mutation(&self, issue_number: i64) -> Result<PreparedMutation> {
@@ -2481,6 +2464,57 @@ impl GitHubLedger {
         self.preserve_integrity_snapshot(issue, comments, &latched, None)
     }
 
+    fn reconcile_rebaseline_candidate(
+        &mut self,
+        issue: &LedgerIssue,
+        comments: &[LedgerComment],
+        diagnosis: &IntegrityDoctorReport,
+        candidate: &ObservedIntegrityEvidence,
+        published: &ObservedIntegrityEvidence,
+    ) -> Result<()> {
+        let mut latched = self
+            .cache
+            .github_integrity_report(diagnosis.work_item_id)?
+            .unwrap_or_else(|| diagnosis.clone());
+        if let Some(observed) = latched.observed_evidence.iter_mut().find(|observed| {
+            observed.github_comment_id == candidate.github_comment_id
+                && observed.github_actor == candidate.github_actor
+                && observed.body == candidate.body
+        }) {
+            *observed = published.clone();
+        } else if !latched.observed_evidence.iter().any(|observed| {
+            observed.github_comment_id == published.github_comment_id
+                && observed.github_actor == published.github_actor
+                && observed.body == published.body
+        }) {
+            latched.observed_evidence.push(published.clone());
+            latched.untrusted_event_count += 1;
+        }
+        self.preserve_integrity_snapshot(issue, comments, &latched, None)
+    }
+
+    fn find_rebaseline_after_uncertain_post(
+        &self,
+        issue_number: i64,
+        event_id: &str,
+        github_actor: &str,
+        body: &str,
+    ) -> Result<Option<LedgerComment>> {
+        let mut matching = self
+            .load_comments(issue_number)?
+            .into_iter()
+            .filter(|comment| {
+                comment.user.login == github_actor
+                    && comment.body == body
+                    && parse_event(&comment.body).is_ok_and(|event| event.event_id == event_id)
+            });
+        let found = matching.next();
+        if matching.next().is_some() {
+            return Err(metadata_collision(issue_number).into());
+        }
+        Ok(found)
+    }
+
     fn load_rebaseline_validation_snapshot(
         &self,
         issue_number: i64,
@@ -2643,8 +2677,51 @@ impl GitHubLedger {
             )
         })?;
         self.project_history_head(&reloaded_issue, metadata, &replayed.accepted)?;
-        self.verify_recovery_lock_state(issue_number, item.status)?;
-        let evidence = event_evidence(&reloaded_comments, &replayed.accepted);
+        let (post_issue, post_metadata) =
+            self.verify_recovery_lock_state(issue_number, item.status)?;
+        let post_comments = self.load_comments(issue_number)?;
+        let cached_comment_ids = cached
+            .iter()
+            .map(|evidence| evidence.comment_id)
+            .collect::<HashSet<_>>();
+        let before = recovery_evidence_snapshot(
+            &reloaded_comments,
+            &post_metadata,
+            &cached_comment_ids,
+            None,
+        );
+        let after =
+            recovery_evidence_snapshot(&post_comments, &post_metadata, &cached_comment_ids, None);
+        if before != after {
+            self.latch_recovery_race(
+                &post_issue,
+                &post_comments,
+                &diagnosis,
+                &before,
+                &after,
+                &[],
+            )?;
+            return Err(recovery_validation_failed(
+                issue_number,
+                "authoritative history changed during exact recovery projection",
+            )
+            .into());
+        }
+        let replayed = replay_trusted_history(issue_number, &post_comments).map_err(|error| {
+            recovery_validation_failed(
+                issue_number,
+                format!("post-projection exact history did not replay: {error:#}"),
+            )
+        })?;
+        projection_head_needs_update(issue_number, &post_metadata, &replayed.accepted, None)
+            .map_err(|error| {
+                recovery_validation_failed(
+                    issue_number,
+                    format!("post-projection exact history did not match: {error:#}"),
+                )
+            })?;
+        let item = materialize_item(issue_number, &replayed.accepted)?;
+        let evidence = event_evidence(&post_comments, &replayed.accepted);
         let trusted_event_count = replayed.accepted.len();
         self.cache.complete_github_recovery(&GithubCacheItem {
             item: item.clone(),
@@ -2866,13 +2943,44 @@ impl GitHubLedger {
         };
         let body = event_comment_body(&event)?;
         let archived = reviewed.status == Status::Archived;
+        let pending_anchor = ObservedIntegrityEvidence {
+            github_comment_id: 0,
+            github_actor: event.github_actor.clone(),
+            body: body.clone(),
+            observed_at: Utc::now(),
+        };
+        self.latch_recovery_race(
+            &issue,
+            &comments,
+            &diagnosis,
+            &initial_evidence,
+            &initial_evidence,
+            std::slice::from_ref(&pending_anchor),
+        )?;
 
         let recovery = (|| -> Result<(WorkItem, ReplayedHistory, Vec<LedgerComment>)> {
-            let published_anchor: LedgerComment = self.github.api_json(
+            let published_anchor: LedgerComment = match self.github.api_json(
                 "POST",
                 &format!("repos/{}/issues/{issue_number}/comments", self.repository),
                 &[("body", body.as_str())],
-            )?;
+            ) {
+                Ok(published) => published,
+                Err(publish_error) => self
+                    .find_rebaseline_after_uncertain_post(
+                        issue_number,
+                        &event.event_id,
+                        &event.github_actor,
+                        &body,
+                    )?
+                    .ok_or_else(|| {
+                        recovery_validation_failed(
+                            issue_number,
+                            format!(
+                                "the Rebaseline publication outcome is uncertain and no exact anchor could be found: {publish_error:#}"
+                            ),
+                        )
+                    })?,
+            };
             if published_anchor.user.login != event.github_actor {
                 return Err(metadata_collision(issue_number).into());
             }
@@ -2883,13 +2991,12 @@ impl GitHubLedger {
                 body: body.clone(),
                 observed_at: published_anchor.created_at,
             };
-            self.latch_recovery_race(
+            self.reconcile_rebaseline_candidate(
                 &issue,
                 &comments,
                 &diagnosis,
-                &initial_evidence,
-                &initial_evidence,
-                std::slice::from_ref(&published_anchor_evidence),
+                &pending_anchor,
+                &published_anchor_evidence,
             )?;
 
             let reloaded = self.load_rebaseline_validation_snapshot(
@@ -3021,8 +3128,65 @@ impl GitHubLedger {
                 projected_metadata,
                 &replayed.accepted,
             )?;
-            self.verify_recovery_lock_state(issue_number, item.status)?;
-            Ok((item, replayed, final_snapshot.comments))
+            let (post_issue, post_metadata) =
+                self.verify_recovery_lock_state(issue_number, item.status)?;
+            let post_comments = self.load_comments(issue_number)?;
+            let post_evidence = recovery_evidence_snapshot(
+                &post_comments,
+                &post_metadata,
+                &tracked_comment_ids,
+                Some(anchor_id),
+            );
+            let post_reviewed =
+                reviewed_item_from_issue(&post_issue, &post_comments).map_err(|error| {
+                    recovery_validation_failed(
+                        issue_number,
+                        format!("post-projection reviewed state became ambiguous: {error:#}"),
+                    )
+                })?;
+            if post_evidence != final_snapshot.evidence
+                || post_reviewed.title != item.title
+                || post_reviewed.description != item.description
+                || post_reviewed.status != item.status
+                || !rebaseline_anchor_is_exact(
+                    &post_comments,
+                    anchor_id,
+                    &event.github_actor,
+                    &body,
+                )
+            {
+                let anchor_evidence =
+                    rebaseline_anchor_evidence(&published_anchor_evidence, &post_comments);
+                self.latch_recovery_race(
+                    &post_issue,
+                    &post_comments,
+                    &diagnosis,
+                    &final_snapshot.evidence,
+                    &post_evidence,
+                    &anchor_evidence,
+                )?;
+                return Err(recovery_validation_failed(
+                    issue_number,
+                    "authoritative state or evidence changed during Rebaseline projection",
+                )
+                .into());
+            }
+            let replayed =
+                replay_trusted_history(issue_number, &post_comments).map_err(|error| {
+                    recovery_validation_failed(
+                        issue_number,
+                        format!("post-projection Rebaseline history did not replay: {error:#}"),
+                    )
+                })?;
+            projection_head_needs_update(issue_number, &post_metadata, &replayed.accepted, None)
+                .map_err(|error| {
+                    recovery_validation_failed(
+                        issue_number,
+                        format!("post-projection Rebaseline history did not match: {error:#}"),
+                    )
+                })?;
+            let item = materialize_item(issue_number, &replayed.accepted)?;
+            Ok((item, replayed, post_comments))
         })();
         let (item, replayed, comments) = recovery?;
         let trusted_event_count = replayed.accepted.len();
@@ -3969,9 +4133,21 @@ fn is_projected_or_structured_event(
     metadata: &ProjectionMetadata,
     comment: &LedgerComment,
 ) -> bool {
+    let is_projected_range = metadata
+        .genesis_comment_id
+        .zip(metadata.head_comment_id)
+        .is_some_and(|(genesis, head)| {
+            let (start, end) = if genesis <= head {
+                (genesis, head)
+            } else {
+                (head, genesis)
+            };
+            (start..=end).contains(&comment.id)
+        });
     has_metadata(&comment.body, EVENT_MARKER)
         || metadata.genesis_comment_id == Some(comment.id)
         || metadata.head_comment_id == Some(comment.id)
+        || is_projected_range
 }
 
 fn recovery_evidence_snapshot(
@@ -4033,6 +4209,39 @@ fn rebaseline_anchor_evidence(
         evidence.push(observed);
     }
     evidence
+}
+
+fn untrusted_variant_count(
+    cached: &[GithubEventEvidence],
+    first_untrusted_index: usize,
+    structured: &[&LedgerComment],
+    observed: &[ObservedIntegrityEvidence],
+) -> usize {
+    let mut variants = cached[first_untrusted_index..]
+        .iter()
+        .map(|evidence| {
+            (
+                evidence.comment_id,
+                evidence.github_actor.clone(),
+                evidence.body.clone(),
+            )
+        })
+        .collect::<HashSet<_>>();
+    let first_untrusted_comment_id = cached[first_untrusted_index].comment_id;
+    variants.extend(
+        structured
+            .iter()
+            .filter(|comment| comment.id >= first_untrusted_comment_id)
+            .map(|comment| (comment.id, comment.user.login.clone(), comment.body.clone())),
+    );
+    variants.extend(observed.iter().map(|evidence| {
+        (
+            evidence.github_comment_id,
+            evidence.github_actor.clone(),
+            evidence.body.clone(),
+        )
+    }));
+    variants.len()
 }
 
 fn observed_integrity_evidence(comment: &LedgerComment) -> ObservedIntegrityEvidence {
@@ -4824,5 +5033,44 @@ mod tests {
             "79e879fd72adacc4ae4131da76b1cadb83afe65479ad8e5f7ca2924b0a916e40"
         );
         Ok(())
+    }
+
+    #[test]
+    fn untrusted_count_scopes_live_variants_to_the_current_rebaseline_sequence() {
+        let cached = vec![
+            GithubEventEvidence {
+                comment_id: 300,
+                event_id: Some("rebaseline-current".to_owned()),
+                github_actor: "octocat".to_owned(),
+                body: "current anchor".to_owned(),
+                history_hash: Some("anchor-hash".to_owned()),
+            },
+            GithubEventEvidence {
+                comment_id: 400,
+                event_id: Some("update-current".to_owned()),
+                github_actor: "octocat".to_owned(),
+                body: "original update".to_owned(),
+                history_hash: Some("update-hash".to_owned()),
+            },
+        ];
+        let comment = |id, body: &str| LedgerComment {
+            id,
+            created_at: Utc::now(),
+            user: User {
+                login: "octocat".to_owned(),
+            },
+            body: body.to_owned(),
+        };
+        let old_genesis = comment(100, "old genesis");
+        let old_update = comment(200, "old update");
+        let current_anchor = comment(300, "current anchor");
+        let damaged_update = comment(400, "damaged update");
+        let structured = vec![&old_genesis, &old_update, &current_anchor, &damaged_update];
+        let observed = vec![observed_integrity_evidence(&damaged_update)];
+
+        assert_eq!(
+            untrusted_variant_count(&cached, 1, &structured, &observed),
+            2
+        );
     }
 }
