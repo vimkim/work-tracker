@@ -2722,7 +2722,7 @@ impl GitHubLedger {
                     )
                 })?;
         let item = materialize_item(issue_number, &replayed.accepted)?;
-        if projection_differs(&post_issue, &item, head_differs)? {
+        if recovery_projection_differs(&post_issue, &item, head_differs)? {
             self.preserve_integrity_snapshot(&post_issue, &post_comments, &diagnosis, None)?;
             return Err(recovery_validation_failed(
                 issue_number,
@@ -3207,7 +3207,7 @@ impl GitHubLedger {
                 )
             })?;
             let item = materialize_item(issue_number, &replayed.accepted)?;
-            if projection_differs(&post_issue, &item, head_differs)? {
+            if recovery_projection_differs(&post_issue, &item, head_differs)? {
                 self.preserve_integrity_snapshot(&post_issue, &post_comments, &diagnosis, None)?;
                 return Err(recovery_validation_failed(
                     issue_number,
@@ -4120,7 +4120,7 @@ fn reviewed_item_from_issue(issue: &LedgerIssue, comments: &[LedgerComment]) -> 
         .or(issue.updated_at)
         .unwrap_or_else(Utc::now);
     let updated_at = issue.updated_at.unwrap_or(observed_at);
-    let visible = projection_visible_text(&issue.body).unwrap_or_default();
+    let visible = projection_visible_text(&issue.body)?;
     let description =
         (!matches!(visible, "" | "_No description provided._")).then(|| visible.to_owned());
     let archived_at = (status == Status::Archived).then_some(updated_at);
@@ -4129,7 +4129,7 @@ fn reviewed_item_from_issue(issue: &LedgerIssue, comments: &[LedgerComment]) -> 
         title: issue
             .title
             .clone()
-            .unwrap_or_else(|| format!("GitHub issue #{}", issue.number)),
+            .context("GitHub issue omitted its title")?,
         description,
         status,
         created_at: observed_at,
@@ -4402,7 +4402,9 @@ fn exact_chain_preserves_live_archive(
         .collect::<Vec<_>>();
     replay_trusted_history(issue.number, &comments)
         .and_then(|replayed| materialize_item(issue.number, &replayed.accepted))
-        .is_ok_and(|item| (item.status == Status::Archived) == live_archived)
+        .is_ok_and(|item| {
+            (item.status == Status::Archived) == live_archived && (!live_archived || issue.locked)
+        })
 }
 
 fn next_observed_evidence_id(evidence: &[RetainedRecoveryEvidence], github_comment_id: i64) -> i64 {
@@ -4944,6 +4946,16 @@ fn projection_differs(
         || lock_projection_differs(issue, item.status))
 }
 
+fn recovery_projection_differs(
+    issue: &LedgerIssue,
+    item: &WorkItem,
+    history_head_differs: bool,
+) -> Result<bool> {
+    Ok(issue.title.is_none()
+        || issue.state.is_none()
+        || projection_differs(issue, item, history_head_differs)?)
+}
+
 fn lock_projection_differs(issue: &LedgerIssue, status: Status) -> bool {
     issue.locked != (status == Status::Archived)
 }
@@ -5104,5 +5116,65 @@ mod tests {
             untrusted_variant_count(&cached, 1, &structured, &observed),
             2
         );
+    }
+
+    #[test]
+    fn exact_archived_chain_requires_the_live_issue_to_already_be_locked() -> Result<()> {
+        let created = CanonicalEvent {
+            schema_version: 1,
+            event_id: "created-archived".to_owned(),
+            kind: EventKind::Created,
+            actor: "agent-a".to_owned(),
+            github_actor: "octocat".to_owned(),
+            note: None,
+            changes: json!({"title": "Archived item", "description": null, "status": "active"}),
+            expected_state_revision: None,
+        };
+        let created_hash = history_hash(None, &created, 9001)?;
+        let archived = CanonicalEvent {
+            schema_version: 1,
+            event_id: "archived-event".to_owned(),
+            kind: EventKind::Archived,
+            actor: "agent-a".to_owned(),
+            github_actor: "octocat".to_owned(),
+            note: None,
+            changes: json!({"status": {"from": "active", "to": "archived"}}),
+            expected_state_revision: Some(1),
+        };
+        let archived_hash = history_hash(Some(&created_hash), &archived, 9002)?;
+        let evidence = vec![
+            GithubEventEvidence {
+                comment_id: 9001,
+                event_id: Some(created.event_id.clone()),
+                github_actor: "octocat".to_owned(),
+                body: event_comment_body(&created)?,
+                history_hash: Some(created_hash),
+            },
+            GithubEventEvidence {
+                comment_id: 9002,
+                event_id: Some(archived.event_id.clone()),
+                github_actor: "octocat".to_owned(),
+                body: event_comment_body(&archived)?,
+                history_hash: Some(archived_hash),
+            },
+        ];
+        let mut issue = LedgerIssue {
+            number: 41,
+            title: Some("Archived item".to_owned()),
+            body: String::new(),
+            labels: vec![IssueLabel {
+                name: "work-tracker:status:archived".to_owned(),
+            }],
+            state: Some("closed".to_owned()),
+            state_reason: Some("not_planned".to_owned()),
+            locked: false,
+            updated_at: None,
+            pull_request: None,
+        };
+
+        assert!(!exact_chain_preserves_live_archive(&issue, &evidence));
+        issue.locked = true;
+        assert!(exact_chain_preserves_live_archive(&issue, &evidence));
+        Ok(())
     }
 }

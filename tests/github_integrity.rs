@@ -410,13 +410,13 @@ fn exact_recovery_latches_a_comment_edit_observed_after_projection() -> Result<(
 }
 
 #[test]
-fn exact_recovery_rejects_readable_projection_drift_after_projection() -> Result<()> {
+fn exact_recovery_rejects_a_missing_title_after_projection() -> Result<()> {
     let cli = CliHarness::new()?;
     configure_github(&cli)?;
     let gh = FakeGh::new()?;
     let scenario = seed_edited_integrity(&cli, &gh)?;
     let mut drifted = scenario.healthy_issue.clone();
-    drifted["title"] = json!("Changed after projection");
+    drifted["title"] = Value::Null;
     gh.respond(5, 0, &scenario.corrupt_issue.to_string(), "")?;
     gh.respond(
         6,
@@ -1831,7 +1831,7 @@ fn rebaseline_latches_a_comment_edit_observed_after_projection() -> Result<()> {
 }
 
 #[test]
-fn rebaseline_rejects_issue_state_drift_after_projection() -> Result<()> {
+fn rebaseline_rejects_a_missing_issue_state_after_projection() -> Result<()> {
     let cli = CliHarness::new()?;
     configure_github(&cli)?;
     let gh = FakeGh::new()?;
@@ -1848,8 +1848,7 @@ fn rebaseline_rejects_issue_state_drift_after_projection() -> Result<()> {
     )?;
     let mut drifted = corrupt_issue.clone();
     drifted["body"] = json!("{{LAST_REQUEST_BODY}}");
-    drifted["state"] = json!("closed");
-    drifted["state_reason"] = json!("completed");
+    drifted["state"] = Value::Null;
     gh.respond(11, 0, &drifted.to_string(), "")?;
     let recovered = cli.run_with_fake_gh(
         &gh,
