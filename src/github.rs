@@ -323,6 +323,7 @@ enum EventKind {
     Noted,
     Updated,
     StatusChanged,
+    Archived,
 }
 
 impl EventKind {
@@ -332,6 +333,7 @@ impl EventKind {
             Self::Noted => "noted",
             Self::Updated => "updated",
             Self::StatusChanged => "status_changed",
+            Self::Archived => "archived",
         }
     }
 
@@ -341,6 +343,7 @@ impl EventKind {
             "noted" => Some(Self::Noted),
             "updated" => Some(Self::Updated),
             "status_changed" => Some(Self::StatusChanged),
+            "archived" => Some(Self::Archived),
             _ => None,
         }
     }
@@ -349,6 +352,7 @@ impl EventKind {
         match self {
             Self::Updated => Some("update"),
             Self::StatusChanged => Some("Status transition"),
+            Self::Archived => Some("archive"),
             Self::Created | Self::Noted => None,
         }
     }
@@ -377,11 +381,15 @@ struct StatusChanges {
 }
 
 impl StatusChanges {
-    fn is_valid_for(&self, item: &WorkItem) -> bool {
+    fn is_valid_for(&self, kind: EventKind, item: &WorkItem) -> bool {
         self.status.from != Status::Archived
-            && self.status.to != Status::Archived
             && self.status.from == item.status
             && self.status.to != self.status.from
+            && match kind {
+                EventKind::Archived => self.status.to == Status::Archived,
+                EventKind::StatusChanged => self.status.to != Status::Archived,
+                _ => false,
+            }
     }
 }
 
@@ -397,7 +405,7 @@ impl MutationChanges {
                 .map(Self::Fields)
                 .map(Some)
                 .context("invalid updated changes"),
-            EventKind::StatusChanged => serde_json::from_value(value)
+            EventKind::StatusChanged | EventKind::Archived => serde_json::from_value(value)
                 .map(Self::Status)
                 .map(Some)
                 .context("invalid Status changes"),
@@ -405,10 +413,10 @@ impl MutationChanges {
         }
     }
 
-    fn is_valid_for(&self, item: &WorkItem) -> bool {
+    fn is_valid_for(&self, kind: EventKind, item: &WorkItem) -> bool {
         match self {
             Self::Fields(changes) => changes.is_valid_for(item),
-            Self::Status(changes) => changes.is_valid_for(item),
+            Self::Status(changes) => changes.is_valid_for(kind, item),
         }
     }
 
@@ -503,6 +511,8 @@ struct LedgerIssue {
     state: Option<String>,
     #[serde(default)]
     state_reason: Option<String>,
+    #[serde(default)]
+    locked: bool,
     #[serde(default)]
     updated_at: Option<DateTime<Utc>>,
     #[serde(default)]
@@ -820,10 +830,7 @@ impl GitHubLedger {
                 legacy_genesis.as_ref(),
             )?;
             let item = materialize_item(issue.number, history)?;
-            let projection_needs_update = projection_needs_update
-                || readable_projection_differs(&issue, &item)?
-                || status_projection_differs(&issue, item.status);
-            if projection_needs_update {
+            if projection_differs(&issue, &item, projection_needs_update)? {
                 projection_updates.push((issue, metadata, history.clone()));
             }
             synchronized.push(GithubCacheItem {
@@ -1091,11 +1098,24 @@ impl GitHubLedger {
             "PATCH",
             &format!("repos/{}/issues/{}", self.repository, issue.number),
             &fields,
+        )?;
+        self.project_lock_state(issue, item.status)
+    }
+
+    fn project_lock_state(&self, issue: &LedgerIssue, status: Status) -> Result<()> {
+        let should_be_locked = status == Status::Archived;
+        if issue.locked == should_be_locked {
+            return Ok(());
+        }
+        self.github.api_empty(
+            if should_be_locked { "PUT" } else { "DELETE" },
+            &format!("repos/{}/issues/{}/lock", self.repository, issue.number),
+            &[],
         )
     }
 
-    fn prepare_mutation(&self, issue_number: i64) -> Result<PreparedMutation> {
-        let (issue, metadata) = self.load_work_item_issue(issue_number)?;
+    fn load_prepared_mutation(&self, issue_number: i64) -> Result<PreparedMutation> {
+        let (mut issue, metadata) = self.load_work_item_issue(issue_number)?;
         let comments = self.load_comments(issue_number)?;
         let replayed = replay_trusted_history(issue_number, &comments)?;
         let legacy_genesis = self.cache.legacy_github_genesis_evidence(issue_number)?;
@@ -1106,8 +1126,9 @@ impl GitHubLedger {
             legacy_genesis.as_ref(),
         )?;
         let current = materialize_item(issue_number, &replayed.accepted)?;
-        if current.status == Status::Archived {
-            bail!("work item {issue_number} is archived and cannot be modified");
+        if issue.locked && current.status != Status::Archived {
+            self.project_lock_state(&issue, current.status)?;
+            issue.locked = false;
         }
         Ok(PreparedMutation {
             issue,
@@ -1118,6 +1139,14 @@ impl GitHubLedger {
         })
     }
 
+    fn prepare_mutation(&self, issue_number: i64) -> Result<PreparedMutation> {
+        let prepared = self.load_prepared_mutation(issue_number)?;
+        if prepared.current.status == Status::Archived {
+            bail!("work item {issue_number} is archived and cannot be modified");
+        }
+        Ok(prepared)
+    }
+
     fn finish_noop_mutation(&mut self, prepared: PreparedMutation) -> Result<WorkItem> {
         let PreparedMutation {
             issue,
@@ -1126,10 +1155,7 @@ impl GitHubLedger {
             current,
             projection_needs_update,
         } = prepared;
-        if projection_needs_update
-            || readable_projection_differs(&issue, &current)?
-            || status_projection_differs(&issue, current.status)
-        {
+        if projection_differs(&issue, &current, projection_needs_update)? {
             self.project_history_head(&issue, metadata, &replayed.accepted)?;
         }
         self.cache.replace_github_item(&GithubCacheItem {
@@ -1251,18 +1277,29 @@ impl GitHubLedger {
         actor: &str,
         note: Option<&str>,
     ) -> Result<WorkItem> {
-        if status == Status::Archived {
-            bail!("GitHub-backed archival is not implemented yet");
-        }
         let actor = normalized_required(actor, "actor")?;
         let note = normalized_optional(note);
         let github_actor = self.github.authenticated_user()?;
-        let prepared = self.prepare_mutation(issue_number)?;
+        let prepared = if status == Status::Archived {
+            self.load_prepared_mutation(issue_number)?
+        } else {
+            self.prepare_mutation(issue_number)?
+        };
+        if prepared.current.status == Status::Archived {
+            // Archival is stricter than ordinary Status idempotency: ticket #11
+            // requires every repeated archive attempt to be rejected. Read
+            // synchronization repairs any accepted-but-incomplete projection.
+            bail!("work item {issue_number} is archived and cannot be modified");
+        }
         if prepared.current.status == status {
             return self.finish_noop_mutation(prepared);
         }
 
-        let event_id = new_event_id("status");
+        let event_id = new_event_id(if status == Status::Archived {
+            "archive"
+        } else {
+            "status"
+        });
         let expected_state_revision = prepared
             .replayed
             .accepted
@@ -1272,7 +1309,11 @@ impl GitHubLedger {
         let event = CanonicalEvent {
             schema_version: 1,
             event_id: event_id.clone(),
-            kind: EventKind::StatusChanged,
+            kind: if status == Status::Archived {
+                EventKind::Archived
+            } else {
+                EventKind::StatusChanged
+            },
             actor,
             github_actor,
             note,
@@ -1359,14 +1400,14 @@ impl GitHubLedger {
             .unwrap_or_else(|| new_event_id("note"));
         let github_actor = self.github.authenticated_user()?;
         let (issue, metadata) = self.load_work_item_issue(issue_number)?;
-        if status_from_issue(&issue)? == Status::Archived {
-            bail!("work item {issue_number} is archived and cannot be modified");
-        }
         let comments = self.load_comments(issue_number)?;
         let replayed = replay_trusted_history(issue_number, &comments)?;
         let history = &replayed.accepted;
         let legacy_genesis = self.cache.legacy_github_genesis_evidence(issue_number)?;
         projection_head_needs_update(issue_number, &metadata, history, legacy_genesis.as_ref())?;
+        if materialize_item(issue_number, history)?.status == Status::Archived {
+            bail!("work item {issue_number} is archived and cannot be modified");
+        }
         let event = CanonicalEvent {
             schema_version: 1,
             event_id: event_id.clone(),
@@ -2136,6 +2177,7 @@ fn replay_history(issue_number: i64, comments: &[LedgerComment]) -> Result<Repla
     let mut seen = HashMap::<String, CanonicalEvent>::new();
     let mut previous_hash: Option<String> = None;
     let mut state_revision = 0_u64;
+    let mut archived = false;
     for comment in comments {
         if !has_metadata(&comment.body, EVENT_MARKER) {
             continue;
@@ -2149,6 +2191,10 @@ fn replay_history(issue_number: i64, comments: &[LedgerComment]) -> Result<Repla
                 continue;
             }
             return Err(metadata_collision(issue_number).into());
+        }
+        if archived {
+            seen.insert(event.event_id.clone(), event);
+            continue;
         }
         match event.kind {
             EventKind::Created if history.is_empty() => {
@@ -2165,7 +2211,9 @@ fn replay_history(issue_number: i64, comments: &[LedgerComment]) -> Result<Repla
                     return Err(metadata_collision(issue_number).into());
                 }
             }
-            EventKind::Updated | EventKind::StatusChanged if !history.is_empty() => {
+            EventKind::Updated | EventKind::StatusChanged | EventKind::Archived
+                if !history.is_empty() =>
+            {
                 seen.insert(event.event_id.clone(), event.clone());
                 let Some(expected) = event.expected_state_revision else {
                     // Invalid proposals are not Rejected Mutations: that domain
@@ -2181,7 +2229,7 @@ fn replay_history(issue_number: i64, comments: &[LedgerComment]) -> Result<Repla
                 else {
                     continue;
                 };
-                if !changes.is_valid_for(&item) {
+                if !changes.is_valid_for(event.kind, &item) {
                     continue;
                 }
                 if expected != state_revision {
@@ -2214,6 +2262,7 @@ fn replay_history(issue_number: i64, comments: &[LedgerComment]) -> Result<Repla
             state_revision: Some(state_revision),
         });
         previous_hash = Some(current_hash);
+        archived = event.kind == EventKind::Archived;
         seen.insert(event.event_id.clone(), event);
     }
     if history.first().is_none_or(|entry| entry.kind != "created") {
@@ -2467,7 +2516,7 @@ fn has_valid_projection_stage(metadata: &ProjectionMetadata) -> bool {
         && metadata.state_revision == 0)
         || (metadata.pending_genesis_event_id.is_none()
             && metadata.genesis_comment_id.is_some()
-            && metadata.state_revision == 1)
+            && metadata.state_revision > 0)
 }
 
 fn validate_status_label(issue: &LedgerIssue, status: Status) -> Result<()> {
@@ -2498,6 +2547,21 @@ fn status_projection_differs(issue: &LedgerIssue, status: Status) -> bool {
                 .as_deref()
                 .is_none_or(|reason| !reason.eq_ignore_ascii_case(expected_reason))
     }
+}
+
+fn projection_differs(
+    issue: &LedgerIssue,
+    item: &WorkItem,
+    history_head_differs: bool,
+) -> Result<bool> {
+    Ok(history_head_differs
+        || readable_projection_differs(issue, item)?
+        || status_projection_differs(issue, item.status)
+        || lock_projection_differs(issue, item.status))
+}
+
+fn lock_projection_differs(issue: &LedgerIssue, status: Status) -> bool {
+    issue.locked != (status == Status::Archived)
 }
 
 fn status_label_matches(issue: &LedgerIssue, status: Status) -> bool {

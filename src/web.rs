@@ -276,6 +276,14 @@ mod tests {
             "agent-a",
             Some("Queue position 12"),
         )?;
+        let archived = ledger.create(
+            "Retained evidence",
+            Some("Final record"),
+            Status::Pending,
+            "agent-a",
+            None,
+        )?;
+        ledger.set_status(archived.id, Status::Archived, "agent-a", Some("superseded"))?;
         drop(ledger);
 
         let app = router(config, ReadPolicy::PreferFresh);
@@ -289,6 +297,7 @@ mod tests {
         assert!(index_body.contains("Watch &lt;CI&gt;"));
 
         let detail = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri(format!("/items/{}", item.id))
@@ -299,6 +308,20 @@ mod tests {
         let detail_body = to_bytes(detail.into_body(), usize::MAX).await?;
         let detail_body = String::from_utf8(detail_body.to_vec())?;
         assert!(detail_body.contains("Queue position 12"));
+
+        let archived_detail = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/items/{}", archived.id))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(archived_detail.status(), StatusCode::OK);
+        let archived_body = to_bytes(archived_detail.into_body(), usize::MAX).await?;
+        let archived_body = String::from_utf8(archived_body.to_vec())?;
+        assert!(archived_body.contains("Retained evidence"));
+        assert!(archived_body.contains("status-archived\">archived"));
+        assert!(archived_body.contains("superseded"));
         Ok(())
     }
 

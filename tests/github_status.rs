@@ -125,10 +125,15 @@ impl StatusScenario {
     }
 
     fn script_initial_load(&self, extra_labels: &[&str]) -> Result<Value> {
+        self.script_initial_load_with_lock(extra_labels, false)
+    }
+
+    fn script_initial_load_with_lock(&self, extra_labels: &[&str], locked: bool) -> Result<Value> {
         let genesis = self.genesis_comment();
+        let mut issue = self.issue(extra_labels);
+        issue["locked"] = Value::Bool(locked);
         self.gh.respond(17, 0, r#"{"login":"octocat"}"#, "")?;
-        self.gh
-            .respond(18, 0, &self.issue(extra_labels).to_string(), "")?;
+        self.gh.respond(18, 0, &issue.to_string(), "")?;
         self.gh
             .respond(19, 0, &serde_json::json!([[genesis]]).to_string(), "")?;
         Ok(genesis)
@@ -403,7 +408,8 @@ fn repeated_status_is_idempotent_and_publishes_no_proposal() -> Result<()> {
     let scenario = StatusScenario::new()?;
     let cli = &scenario.cli;
     let gh = &scenario.gh;
-    scenario.script_initial_load(&[])?;
+    scenario.script_initial_load_with_lock(&[], true)?;
+    gh.respond(20, 0, "{}", "")?;
 
     let unchanged = cli.run_with_fake_gh(
         gh,
@@ -417,6 +423,10 @@ fn repeated_status_is_idempotent_and_publishes_no_proposal() -> Result<()> {
             .count(),
         1,
         "only the genesis comment should exist"
+    );
+    ensure!(
+        gh.calls()?
+            .contains("\tDELETE\trepos/octocat/work-tracker-data/issues/41/lock")
     );
     Ok(())
 }

@@ -779,6 +779,7 @@ fn github_lists_preserve_filters_limits_attention_order_and_viewer_local_day() -
                     {"name": "work-tracker:item"},
                     {"name": format!("work-tracker:status:{status}")}
                 ],
+                "locked": *status == "archived",
                 "updated_at": occurred_at.to_rfc3339()
             }))
         })
