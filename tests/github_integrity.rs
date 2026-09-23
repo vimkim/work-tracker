@@ -157,6 +157,13 @@ fn doctor_never_offers_exact_recovery_for_unverified_cached_evidence() -> Result
     let report: Value = serde_json::from_slice(&diagnosed.stdout)?;
     assert_eq!(report["eligible_repair_modes"], json!(["rebaseline"]));
 
+    gh.respond(6, 0, &corrupt_issue.to_string(), "")?;
+    gh.respond(
+        7,
+        0,
+        &json!([[remote_comment(&original_comment)]]).to_string(),
+        "",
+    )?;
     let recovered = cli.run_with_fake_gh(
         &gh,
         ["--json", "recover", "41", "--mode", "restore-exact-copy"],
@@ -303,6 +310,142 @@ fn explicit_rebaseline_retains_untrusted_evidence_and_starts_a_new_hash_root() -
         entries[1]["changes"]["prior_evidence"][0]["body"]
             .as_str()
             .is_some_and(|body| body.contains("genesis-integrity-41"))
+    );
+    Ok(())
+}
+
+#[test]
+fn doctor_diagnosis_can_be_rebaselined_without_a_prior_cached_latch() -> Result<()> {
+    let cli = CliHarness::new()?;
+    configure_github(&cli)?;
+    let gh = FakeGh::new()?;
+    let original_event = event("Original title");
+    let original_comment = comment(&original_event)?;
+    let invalid_projection = projection("disconnected-projection-head");
+    let corrupt_issue = issue(&invalid_projection, "2026-09-23T01:02:04Z", false);
+
+    gh.respond(1, 0, &corrupt_issue.to_string(), "")?;
+    gh.respond(
+        2,
+        0,
+        &json!([[remote_comment(&original_comment)]]).to_string(),
+        "",
+    )?;
+    gh.respond(3, 0, "[[]]", "")?;
+    let diagnosed = cli.run_with_fake_gh(&gh, ["--json", "doctor", "41"])?;
+    assert_success(&diagnosed)?;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&diagnosed.stdout)?["eligible_repair_modes"],
+        json!(["rebaseline"])
+    );
+
+    gh.respond(4, 0, &corrupt_issue.to_string(), "")?;
+    gh.respond(
+        5,
+        0,
+        &json!([[remote_comment(&original_comment)]]).to_string(),
+        "",
+    )?;
+    gh.respond(6, 0, "[[]]", "")?;
+    gh.respond(7, 0, r#"{"login":"octocat"}"#, "")?;
+    gh.respond(
+        8,
+        0,
+        r#"{"id":9100,"created_at":"2026-09-23T04:02:03Z","user":{"login":"octocat"}}"#,
+        "",
+    )?;
+    gh.respond(9, 0, "", "")?;
+    let recovered = cli.run_with_fake_gh(
+        &gh,
+        [
+            "--json",
+            "recover",
+            "41",
+            "--mode",
+            "rebaseline",
+            "--actor",
+            "reviewer-a",
+            "--reason",
+            "doctor-reviewed projection",
+        ],
+    )?;
+    assert_success(&recovered)?;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&recovered.stdout)?["outcome"],
+        "rebaseline"
+    );
+    Ok(())
+}
+
+#[test]
+fn rebaseline_retains_cached_and_observed_edited_variants_as_untrusted() -> Result<()> {
+    let cli = CliHarness::new()?;
+    configure_github(&cli)?;
+    let gh = FakeGh::new()?;
+    let original_event = event("Original title");
+    let edited_event = event("Edited behind Work Tracker");
+    let original_comment = comment(&original_event)?;
+    let edited_comment = comment(&edited_event)?;
+    let projection = projection(&hash(&original_event, 9001)?);
+    let healthy_issue = issue(&projection, "2026-09-23T01:02:04Z", false);
+    let corrupt_issue = issue(&projection, "2026-09-23T02:02:04Z", false);
+    respond_sync(&gh, 1, &healthy_issue, &remote_comment(&original_comment))?;
+    assert_success(&cli.run_with_fake_gh(&gh, ["--json", "show", "41"])?)?;
+    respond_sync(&gh, 3, &corrupt_issue, &remote_comment(&edited_comment))?;
+    assert_success(&cli.run_with_fake_gh(&gh, ["--json", "show", "41"])?)?;
+
+    gh.respond(5, 0, &corrupt_issue.to_string(), "")?;
+    gh.respond(
+        6,
+        0,
+        &json!([[remote_comment(&edited_comment)]]).to_string(),
+        "",
+    )?;
+    gh.respond(7, 0, "[[]]", "")?;
+    gh.respond(8, 0, r#"{"login":"octocat"}"#, "")?;
+    gh.respond(
+        9,
+        0,
+        r#"{"id":9100,"created_at":"2026-09-23T04:02:03Z","user":{"login":"octocat"}}"#,
+        "",
+    )?;
+    gh.respond(10, 0, "", "")?;
+    let recovered = cli.run_with_fake_gh(
+        &gh,
+        [
+            "--json",
+            "recover",
+            "41",
+            "--mode",
+            "rebaseline",
+            "--actor",
+            "reviewer-a",
+            "--reason",
+            "reviewed both variants",
+        ],
+    )?;
+    assert_success(&recovered)?;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&recovered.stdout)?["untrusted_event_count"],
+        2
+    );
+
+    let history = cli.run_with_fake_gh(&gh, ["--offline", "--json", "history", "41"])?;
+    assert_success(&history)?;
+    let entries: Value = serde_json::from_slice(&history.stdout)?;
+    assert_eq!(entries.as_array().map(Vec::len), Some(3));
+    assert_eq!(entries[0]["trust"], "untrusted");
+    assert_eq!(entries[0]["changes"]["title"], "Edited behind Work Tracker");
+    assert_eq!(entries[1]["trust"], "untrusted");
+    assert_eq!(entries[1]["changes"]["title"], "Original title");
+    assert_eq!(entries[2]["kind"], "rebaseline");
+    assert_eq!(
+        entries[2]["changes"]["prior_evidence"][0]["variant"],
+        "observed_damaged_copy"
+    );
+    assert_eq!(
+        entries[2]["changes"]["prior_evidence"][1]["variant"],
+        "cached_exact_copy"
     );
     Ok(())
 }

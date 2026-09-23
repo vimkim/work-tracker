@@ -526,7 +526,9 @@ impl ReplayedHistory {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RetainedRecoveryEvidence {
-    comment_id: i64,
+    evidence_id: i64,
+    github_comment_id: i64,
+    variant: String,
     event_id: Option<String>,
     github_actor: String,
     body: String,
@@ -2344,20 +2346,101 @@ impl GitHubLedger {
         })?;
         Ok(entry)
     }
+
+    fn diagnose_loaded(
+        &self,
+        issue: &LedgerIssue,
+        metadata: &ProjectionMetadata,
+        comments: &[LedgerComment],
+        timeline: Vec<Value>,
+    ) -> Result<IntegrityDoctorReport> {
+        if let Some(report) = self.cached_integrity_report(issue, comments, timeline.clone())? {
+            return Ok(report);
+        }
+        let replayed = match replay_trusted_history(issue.number, comments) {
+            Ok(replayed) => replayed,
+            Err(error) => {
+                return Ok(self.replay_failure_report(issue, metadata, comments, &error, timeline));
+            }
+        };
+        match projection_head_needs_update(issue.number, metadata, &replayed.accepted, None) {
+            Ok(_) => {
+                if let Some(mut latched) = self.cache.github_integrity_report(issue.number)? {
+                    latched.archived = issue.locked;
+                    latched.timeline_evidence = timeline;
+                    return Ok(latched);
+                }
+                Ok(IntegrityDoctorReport {
+                    work_item_id: issue.number,
+                    integrity_health: IntegrityHealth::Healthy,
+                    archived: issue.locked,
+                    first_break: None,
+                    trusted_event_count: replayed.accepted.len(),
+                    untrusted_event_count: 0,
+                    timeline_evidence: timeline,
+                    eligible_repair_modes: Vec::new(),
+                })
+            }
+            Err(error) => {
+                Ok(self.head_failure_report(issue, metadata, &replayed.accepted, &error, timeline))
+            }
+        }
+    }
+
+    fn reviewed_item_from_issue(
+        &self,
+        issue: &LedgerIssue,
+        comments: &[LedgerComment],
+    ) -> WorkItem {
+        let status = issue
+            .labels
+            .iter()
+            .find_map(|label| {
+                label
+                    .name
+                    .strip_prefix("work-tracker:status:")
+                    .and_then(|status| Status::from_str(status).ok())
+            })
+            .unwrap_or(Status::Pending);
+        let observed_at = comments
+            .iter()
+            .map(|comment| comment.created_at)
+            .min()
+            .or(issue.updated_at)
+            .unwrap_or_else(Utc::now);
+        let updated_at = issue.updated_at.unwrap_or(observed_at);
+        let visible = projection_visible_text(&issue.body).unwrap_or_default();
+        let description =
+            (!matches!(visible, "" | "_No description provided._")).then(|| visible.to_owned());
+        let archived_at = (status == Status::Archived).then_some(updated_at);
+        WorkItem {
+            id: issue.number,
+            title: issue
+                .title
+                .clone()
+                .unwrap_or_else(|| format!("GitHub issue #{}", issue.number)),
+            description,
+            status,
+            created_at: observed_at,
+            updated_at,
+            archived_at,
+            deleted_at: archived_at,
+            purge_after: None,
+            ledger_integrity_error: true,
+        }
+    }
+
     fn restore_exact_copy(&mut self, issue_number: i64) -> Result<RecoveryReport> {
-        let latched = self
-            .cache
-            .github_integrity_report(issue_number)?
-            .ok_or_else(|| {
-                recovery_still_blocked(issue_number, "no diagnosed integrity error is cached")
-            })?;
-        let first_break = latched.first_break.as_ref().ok_or_else(|| {
+        let (issue, metadata) = self.load_work_item_issue(issue_number)?;
+        let comments = self.load_comments(issue_number)?;
+        let diagnosis = self.diagnose_loaded(&issue, &metadata, &comments, Vec::new())?;
+        let first_break = diagnosis.first_break.as_ref().ok_or_else(|| {
             recovery_still_blocked(
                 issue_number,
                 "the diagnosis does not identify a restorable event",
             )
         })?;
-        if !latched
+        if !diagnosis
             .eligible_repair_modes
             .contains(&RepairMode::RestoreExactCopy)
         {
@@ -2392,9 +2475,6 @@ impl GitHubLedger {
             )
             .into());
         }
-
-        let (issue, _) = self.load_work_item_issue(issue_number)?;
-        let comments = self.load_comments(issue_number)?;
         if !comments.iter().any(|comment| comment.id == comment_id) {
             return Err(recovery_still_blocked(
                 issue_number,
@@ -2491,12 +2571,10 @@ impl GitHubLedger {
                 normalized_required(reason, "reason")
                     .map_err(|error| recovery_still_blocked(issue_number, error))
             })?;
-        let mut diagnosis = self
-            .cache
-            .github_integrity_report(issue_number)?
-            .ok_or_else(|| {
-                recovery_still_blocked(issue_number, "no diagnosed integrity error is cached")
-            })?;
+        let (issue, mut metadata) = self.load_work_item_issue(issue_number)?;
+        let mut comments = self.load_comments(issue_number)?;
+        let timeline = self.load_timeline(issue_number)?;
+        let mut diagnosis = self.diagnose_loaded(&issue, &metadata, &comments, timeline)?;
         if !diagnosis
             .eligible_repair_modes
             .contains(&RepairMode::Rebaseline)
@@ -2507,19 +2585,24 @@ impl GitHubLedger {
             )
             .into());
         }
-
-        let reviewed = self.cache.get(issue_number)?;
-        let (issue, mut metadata) = self.load_work_item_issue(issue_number)?;
-        let mut comments = self.load_comments(issue_number)?;
-        diagnosis.timeline_evidence = self.load_timeline(issue_number)?;
+        let cached_reviewed = self.cache.get(issue_number).ok();
+        let reviewed = cached_reviewed
+            .clone()
+            .unwrap_or_else(|| self.reviewed_item_from_issue(&issue, &comments));
         diagnosis.archived = reviewed.status == Status::Archived;
-        let cached_history = self.cache.history(issue_number)?;
+        let cached_history = if cached_reviewed.is_some() {
+            self.cache.history(issue_number)?
+        } else {
+            Vec::new()
+        };
         let mut prior_evidence = self
             .cache
             .github_event_evidence(issue_number)?
             .into_iter()
             .map(|evidence| RetainedRecoveryEvidence {
-                comment_id: evidence.comment_id,
+                evidence_id: evidence.comment_id,
+                github_comment_id: evidence.comment_id,
+                variant: "cached_exact_copy".to_owned(),
                 event_id: evidence.event_id,
                 github_actor: evidence.github_actor,
                 body: evidence.body,
@@ -2534,15 +2617,25 @@ impl GitHubLedger {
             .iter()
             .filter(|comment| has_metadata(&comment.body, EVENT_MARKER))
         {
-            if prior_evidence
+            let matching = prior_evidence
                 .iter()
-                .any(|evidence| evidence.comment_id == comment.id)
-            {
+                .find(|evidence| evidence.github_comment_id == comment.id);
+            if matching.is_some_and(|evidence| evidence.body == comment.body) {
                 continue;
             }
             let parsed = parse_event(&comment.body).ok();
             prior_evidence.push(RetainedRecoveryEvidence {
-                comment_id: comment.id,
+                evidence_id: if matching.is_some() {
+                    -comment.id
+                } else {
+                    comment.id
+                },
+                github_comment_id: comment.id,
+                variant: if matching.is_some() {
+                    "observed_damaged_copy".to_owned()
+                } else {
+                    "observed_copy".to_owned()
+                },
                 event_id: parsed.as_ref().map(|event| event.event_id.clone()),
                 github_actor: comment.user.login.clone(),
                 body: comment.body.clone(),
@@ -2550,7 +2643,7 @@ impl GitHubLedger {
                 occurred_at: Some(comment.created_at),
             });
         }
-        prior_evidence.sort_by_key(|evidence| evidence.comment_id);
+        prior_evidence.sort_by_key(|evidence| (evidence.github_comment_id, evidence.evidence_id));
 
         let github_actor = self.github.authenticated_user()?;
         let event = CanonicalEvent {
@@ -2875,44 +2968,7 @@ impl Ledger for GitHubLedger {
         let (issue, metadata) = self.load_work_item_issue(id)?;
         let comments = self.load_comments(id)?;
         let timeline = self.load_timeline(id)?;
-        if let Some(report) = self.cached_integrity_report(&issue, &comments, timeline.clone())? {
-            return Ok(report);
-        }
-
-        let replayed = match replay_trusted_history(id, &comments) {
-            Ok(replayed) => replayed,
-            Err(error) => {
-                return Ok(
-                    self.replay_failure_report(&issue, &metadata, &comments, &error, timeline)
-                );
-            }
-        };
-        match projection_head_needs_update(id, &metadata, &replayed.accepted, None) {
-            Ok(_) => {
-                if let Some(mut latched) = self.cache.github_integrity_report(id)? {
-                    latched.archived = issue.locked;
-                    latched.timeline_evidence = timeline;
-                    return Ok(latched);
-                }
-                Ok(IntegrityDoctorReport {
-                    work_item_id: id,
-                    integrity_health: IntegrityHealth::Healthy,
-                    archived: issue.locked,
-                    first_break: None,
-                    trusted_event_count: replayed.accepted.len(),
-                    untrusted_event_count: 0,
-                    timeline_evidence: timeline,
-                    eligible_repair_modes: Vec::new(),
-                })
-            }
-            Err(error) => Ok(self.head_failure_report(
-                &issue,
-                &metadata,
-                &replayed.accepted,
-                &error,
-                timeline,
-            )),
-        }
+        self.diagnose_loaded(&issue, &metadata, &comments, timeline)
     }
 
     fn recover(
@@ -3819,7 +3875,7 @@ fn retained_evidence_history(
         .map(|evidence| {
             let parsed = parse_event(&evidence.body).ok();
             HistoryEntry {
-                id: evidence.comment_id,
+                id: evidence.evidence_id,
                 work_item_id: issue_number,
                 event_id: evidence
                     .event_id
