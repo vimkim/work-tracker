@@ -4,7 +4,7 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::{
-    domain::{HistoryEntry, IntegrityDoctorReport, RejectedMutation, WorkItem},
+    domain::{HistoryEntry, IntegrityDoctorReport, RecoveryReport, RejectedMutation, WorkItem},
     github::{GitHubError, GitHubErrorKind},
     ledger::{ReadHealth, ReadHealthError, ReadHealthErrorKind, ReadHealthKind},
 };
@@ -133,6 +133,8 @@ fn github_error_code(kind: GitHubErrorKind) -> &'static str {
         GitHubErrorKind::RejectedMutation => "github_rejected_mutation",
         GitHubErrorKind::ProjectionPending => "github_projection_pending",
         GitHubErrorKind::ArchivedImmutable => "github_archived_immutable",
+        GitHubErrorKind::RecoveryValidationFailed => "github_recovery_validation_failed",
+        GitHubErrorKind::RecoveryStillBlocked => "github_recovery_still_blocked",
         GitHubErrorKind::LedgerIntegrity
         | GitHubErrorKind::UnknownEventSchema
         | GitHubErrorKind::IncompatibleMetadata
@@ -316,6 +318,25 @@ pub fn print_doctor_report(report: &IntegrityDoctorReport) {
         .join(", ");
     println!("Timeline evidence: {}", json!(report.timeline_evidence));
     println!("Repair modes: {repair_modes}");
+}
+
+pub fn print_recovery_report(report: &RecoveryReport) {
+    println!("Work Item:   {}", report.work_item_id);
+    println!("Recovery:    {}", report.outcome.as_str());
+    println!("Archived:    {}", report.archived);
+    println!(
+        "Validation:  {}",
+        if report.full_history_revalidated {
+            "full history revalidated"
+        } else {
+            "new sequence validated"
+        }
+    );
+    println!("Projection:  rebuilt");
+    println!(
+        "Evidence:    {} trusted, {} untrusted",
+        report.trusted_event_count, report.untrusted_event_count
+    );
 }
 
 pub fn print_rejected_mutations(rejected: &[RejectedMutation]) {

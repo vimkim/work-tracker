@@ -6,7 +6,10 @@ use std::{
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
-use crate::{domain::Status, ledger::ReadPolicy};
+use crate::{
+    domain::{RepairMode, Status},
+    ledger::ReadPolicy,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -76,6 +79,8 @@ pub enum Command {
     Rejected(IdArgs),
     /// Diagnose structured ledger integrity without modifying GitHub.
     Doctor(IdArgs),
+    /// Recover a Work Item from a diagnosed Ledger Integrity Error.
+    Recover(RecoverArgs),
     /// Print the database path in use.
     Path,
     /// Host the read-only HTML dashboard.
@@ -259,6 +264,22 @@ pub struct ArchiveArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct RecoverArgs {
+    pub id: i64,
+
+    /// Explicit recovery strategy; recovery never falls back automatically.
+    #[arg(long, value_enum)]
+    pub mode: RepairMode,
+
+    /// Required explanation when establishing a Rebaseline.
+    #[arg(long)]
+    pub reason: Option<String>,
+
+    #[command(flatten)]
+    pub actor: ActorArgs,
+}
+
+#[derive(Debug, Args)]
 pub struct ServeArgs {
     /// Socket address. Keep the localhost default and use an SSH tunnel.
     #[arg(long, default_value = "127.0.0.1:8787")]
@@ -351,6 +372,47 @@ mod tests {
         let database = directory.path().join("nested/path/tracker.db");
         prepare_database_path(&database)?;
         assert!(database.parent().context("missing parent")?.is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn recover_requires_an_explicit_mode_and_rebaseline_attribution() -> Result<()> {
+        let missing_mode = Cli::try_parse_from(["work-tracker", "recover", "7"])
+            .expect_err("recovery mode must be explicit");
+        assert_eq!(
+            missing_mode.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+
+        let restore = Cli::try_parse_from([
+            "work-tracker",
+            "recover",
+            "7",
+            "--mode",
+            "restore-exact-copy",
+        ])?;
+        let Command::Recover(restore) = restore.command else {
+            anyhow::bail!("expected recover command");
+        };
+        assert_eq!(restore.mode, RepairMode::RestoreExactCopy);
+
+        let rebaseline = Cli::try_parse_from([
+            "work-tracker",
+            "recover",
+            "7",
+            "--mode",
+            "rebaseline",
+            "--actor",
+            "reviewer",
+            "--reason",
+            "reviewed current state",
+        ])?;
+        let Command::Recover(rebaseline) = rebaseline.command else {
+            anyhow::bail!("expected recover command");
+        };
+        assert_eq!(rebaseline.mode, RepairMode::Rebaseline);
+        assert_eq!(rebaseline.actor.actor.as_deref(), Some("reviewer"));
+        assert_eq!(rebaseline.reason.as_deref(), Some("reviewed current state"));
         Ok(())
     }
 }

@@ -436,6 +436,30 @@ impl SqliteLedger {
         transaction.commit()?;
         Ok(())
     }
+
+    pub(crate) fn complete_github_recovery(
+        &mut self,
+        repository: &str,
+        item: &GithubCacheItem,
+    ) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        replace_github_item_in_transaction(&transaction, item)?;
+        transaction.execute(
+            "DELETE FROM github_integrity_errors WHERE work_item_id = ?1",
+            params![item.item.id],
+        )?;
+        transaction.execute(
+            "INSERT INTO github_cache_state (repository, last_successful_sync_at)
+             VALUES (?1, ?2)
+             ON CONFLICT(repository) DO UPDATE SET
+               last_successful_sync_at = excluded.last_successful_sync_at",
+            params![repository, timestamp(Utc::now())],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
 }
 
 pub(crate) struct GithubCacheItem {

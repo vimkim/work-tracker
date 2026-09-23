@@ -81,6 +81,7 @@ async fn run(cli: Cli) -> Result<()> {
                 | Command::History(_)
                 | Command::Rejected(_)
                 | Command::Doctor(_)
+                | Command::Recover(_)
         )
     {
         anyhow::bail!("the GitHub ledger does not support this mutation yet");
@@ -214,6 +215,20 @@ async fn run(cli: Cli) -> Result<()> {
                 Ok(())
             }
         }
+        Command::Recover(args) => {
+            let report = ledger.recover(
+                args.id,
+                args.mode,
+                args.actor.actor.as_deref(),
+                args.reason.as_deref(),
+            )?;
+            if cli.json {
+                output::print_json(&report)
+            } else {
+                output::print_recovery_report(&report);
+                Ok(())
+            }
+        }
         Command::Init(_) | Command::Path | Command::Serve(_) => unreachable!(),
     }
 }
@@ -237,6 +252,7 @@ fn is_write_command(command: &Command) -> bool {
             | Command::Status(_)
             | Command::Note(_)
             | Command::Archive(_)
+            | Command::Recover(_)
     )
 }
 

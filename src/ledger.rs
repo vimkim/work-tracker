@@ -5,7 +5,10 @@ use chrono::{DateTime, Utc};
 
 use crate::{
     db::SqliteLedger,
-    domain::{HistoryEntry, IntegrityDoctorReport, RejectedMutation, Status, WorkItem},
+    domain::{
+        HistoryEntry, IntegrityDoctorReport, RecoveryReport, RejectedMutation, RepairMode, Status,
+        WorkItem,
+    },
     github::{GitHubLedger, RepositoryName},
 };
 
@@ -263,6 +266,16 @@ pub trait Ledger: Send {
 
     fn doctor(&mut self, _id: i64) -> Result<IntegrityDoctorReport> {
         anyhow::bail!("doctor is available only for the GitHub ledger")
+    }
+
+    fn recover(
+        &mut self,
+        _id: i64,
+        _mode: RepairMode,
+        _actor: Option<&str>,
+        _reason: Option<&str>,
+    ) -> Result<RecoveryReport> {
+        anyhow::bail!("recover is available only for the GitHub ledger")
     }
 
     fn take_projection_repairs(&mut self) -> Vec<i64> {

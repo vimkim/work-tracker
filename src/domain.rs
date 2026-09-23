@@ -166,11 +166,39 @@ impl IntegrityHealth {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
+#[value(rename_all = "kebab-case")]
 pub enum RepairMode {
     RestoreExactCopy,
     Rebaseline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryOutcome {
+    ExactRestoration,
+    Rebaseline,
+}
+
+impl RecoveryOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ExactRestoration => "exact_restoration",
+            Self::Rebaseline => "rebaseline",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryReport {
+    pub work_item_id: i64,
+    pub outcome: RecoveryOutcome,
+    pub archived: bool,
+    pub full_history_revalidated: bool,
+    pub projection_rebuilt: bool,
+    pub trusted_event_count: usize,
+    pub untrusted_event_count: usize,
 }
 
 impl RepairMode {

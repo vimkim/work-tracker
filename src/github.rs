@@ -18,8 +18,8 @@ use crate::{
     db::{GithubCacheCleanup, GithubCacheItem, GithubEventEvidence, SqliteLedger},
     domain::{
         EvidenceTrust, HistoryEntry, IntegrityBreak, IntegrityBreakKind, IntegrityDoctorReport,
-        IntegrityHealth, RejectedMutation, RepairMode, Status, WorkItem, normalized_optional,
-        normalized_required,
+        IntegrityHealth, RecoveryOutcome, RecoveryReport, RejectedMutation, RepairMode, Status,
+        WorkItem, normalized_optional, normalized_required,
     },
     ledger::{Ledger, ListFilter, ReadHealth, ReadHealthErrorKind, ReadPolicy},
 };
@@ -221,6 +221,8 @@ pub enum GitHubErrorKind {
     RejectedMutation,
     ProjectionPending,
     ArchivedImmutable,
+    RecoveryValidationFailed,
+    RecoveryStillBlocked,
 }
 
 impl GitHubError {
@@ -359,6 +361,7 @@ struct CanonicalEvent {
 #[serde(rename_all = "snake_case")]
 enum EventKind {
     Created,
+    Rebaseline,
     Noted,
     Updated,
     StatusChanged,
@@ -369,6 +372,7 @@ impl EventKind {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Created => "created",
+            Self::Rebaseline => "rebaseline",
             Self::Noted => "noted",
             Self::Updated => "updated",
             Self::StatusChanged => "status_changed",
@@ -379,6 +383,7 @@ impl EventKind {
     fn from_history_name(name: &str) -> Option<Self> {
         match name {
             "created" => Some(Self::Created),
+            "rebaseline" => Some(Self::Rebaseline),
             "noted" => Some(Self::Noted),
             "updated" => Some(Self::Updated),
             "status_changed" => Some(Self::StatusChanged),
@@ -392,7 +397,7 @@ impl EventKind {
             Self::Updated => Some("update"),
             Self::StatusChanged => Some("Status transition"),
             Self::Archived => Some("archive"),
-            Self::Created | Self::Noted => None,
+            Self::Created | Self::Rebaseline | Self::Noted => None,
         }
     }
 }
@@ -448,7 +453,7 @@ impl MutationChanges {
                 .map(Self::Status)
                 .map(Some)
                 .context("invalid Status changes"),
-            EventKind::Created | EventKind::Noted => Ok(None),
+            EventKind::Created | EventKind::Rebaseline | EventKind::Noted => Ok(None),
         }
     }
 
@@ -505,7 +510,37 @@ impl FieldChanges {
 #[derive(Debug)]
 struct ReplayedHistory {
     accepted: Vec<HistoryEntry>,
+    untrusted: Vec<HistoryEntry>,
     rejected: Vec<RejectedMutation>,
+}
+
+impl ReplayedHistory {
+    fn cache_history(&self) -> Vec<HistoryEntry> {
+        self.untrusted
+            .iter()
+            .chain(&self.accepted)
+            .cloned()
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RetainedRecoveryEvidence {
+    comment_id: i64,
+    event_id: Option<String>,
+    github_actor: String,
+    body: String,
+    history_hash: Option<String>,
+    occurred_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RebaselineChanges {
+    title: String,
+    description: Option<String>,
+    status: Status,
+    integrity_context: IntegrityDoctorReport,
+    prior_evidence: Vec<RetainedRecoveryEvidence>,
 }
 
 struct PreparedMutation {
@@ -1138,7 +1173,7 @@ impl GitHubLedger {
             let evidence = event_evidence(&comments, history);
             synchronized.push(GithubCacheItem {
                 item,
-                history: replayed.accepted,
+                history: replayed.cache_history(),
                 rejected: replayed.rejected,
                 evidence,
             });
@@ -1214,7 +1249,7 @@ impl GitHubLedger {
             request_json,
             &GithubCacheItem {
                 item: item.clone(),
-                history: replayed.accepted,
+                history: replayed.cache_history(),
                 rejected: replayed.rejected,
                 evidence,
             },
@@ -1460,6 +1495,8 @@ impl GitHubLedger {
                 ),
                 _ => continue,
             };
+            let exact_copy_verified =
+                observed.is_some() && cached_exact_chain_is_verified(&cached[..=index]);
             let report = IntegrityDoctorReport {
                 work_item_id: issue.number,
                 integrity_health: IntegrityHealth::LedgerIntegrityError,
@@ -1483,7 +1520,11 @@ impl GitHubLedger {
                 trusted_event_count: index,
                 untrusted_event_count: structured.len().saturating_sub(index),
                 timeline_evidence,
-                eligible_repair_modes: vec![RepairMode::RestoreExactCopy, RepairMode::Rebaseline],
+                eligible_repair_modes: if exact_copy_verified {
+                    vec![RepairMode::RestoreExactCopy, RepairMode::Rebaseline]
+                } else {
+                    vec![RepairMode::Rebaseline]
+                },
             };
             return Ok(Some(report));
         }
@@ -1836,7 +1877,7 @@ impl GitHubLedger {
         }
         self.cache.replace_github_item(&GithubCacheItem {
             item: current.clone(),
-            history: replayed.accepted,
+            history: replayed.cache_history(),
             rejected: replayed.rejected,
             evidence,
         })?;
@@ -1890,7 +1931,7 @@ impl GitHubLedger {
         let evidence = event_evidence(&comments, &history);
         self.cache.replace_github_item(&GithubCacheItem {
             item: item.clone(),
-            history: replayed.accepted,
+            history: replayed.cache_history(),
             rejected: replayed.rejected,
             evidence,
         })?;
@@ -2264,7 +2305,7 @@ impl GitHubLedger {
             let evidence = event_evidence(&comments, history);
             self.cache.replace_github_item(&GithubCacheItem {
                 item,
-                history: replayed.accepted,
+                history: replayed.cache_history(),
                 rejected: replayed.rejected,
                 evidence,
             })?;
@@ -2297,11 +2338,337 @@ impl GitHubLedger {
         let evidence = event_evidence(&comments, history);
         self.cache.replace_github_item(&GithubCacheItem {
             item,
-            history: replayed.accepted,
+            history: replayed.cache_history(),
             rejected: replayed.rejected,
             evidence,
         })?;
         Ok(entry)
+    }
+    fn restore_exact_copy(&mut self, issue_number: i64) -> Result<RecoveryReport> {
+        let latched = self
+            .cache
+            .github_integrity_report(issue_number)?
+            .ok_or_else(|| {
+                recovery_still_blocked(issue_number, "no diagnosed integrity error is cached")
+            })?;
+        let first_break = latched.first_break.as_ref().ok_or_else(|| {
+            recovery_still_blocked(
+                issue_number,
+                "the diagnosis does not identify a restorable event",
+            )
+        })?;
+        if !latched
+            .eligible_repair_modes
+            .contains(&RepairMode::RestoreExactCopy)
+        {
+            return Err(recovery_still_blocked(
+                issue_number,
+                "doctor did not verify an exact original copy for this break",
+            )
+            .into());
+        }
+        let comment_id = first_break.github_comment_id.ok_or_else(|| {
+            recovery_still_blocked(
+                issue_number,
+                "the verified copy has no GitHub comment identity",
+            )
+        })?;
+        let exact_body = first_break.cached_exact_copy.as_deref().ok_or_else(|| {
+            recovery_still_blocked(issue_number, "the verified exact copy is unavailable")
+        })?;
+        let cached = self.cache.github_event_evidence(issue_number)?;
+        let target_index = cached
+            .iter()
+            .position(|evidence| evidence.comment_id == comment_id)
+            .ok_or_else(|| {
+                recovery_still_blocked(issue_number, "the diagnosed event has no cached evidence")
+            })?;
+        if !cached_exact_chain_is_verified(&cached[..=target_index])
+            || cached[target_index].body != exact_body
+        {
+            return Err(recovery_still_blocked(
+                issue_number,
+                "the cached copy no longer verifies against the expected hash-chain evidence",
+            )
+            .into());
+        }
+
+        let (issue, _) = self.load_work_item_issue(issue_number)?;
+        let comments = self.load_comments(issue_number)?;
+        if !comments.iter().any(|comment| comment.id == comment_id) {
+            return Err(recovery_still_blocked(
+                issue_number,
+                "the original GitHub comment was deleted and cannot be restored with its identity",
+            )
+            .into());
+        }
+        self.github.api_empty(
+            "PATCH",
+            &format!("repos/{}/issues/comments/{comment_id}", self.repository),
+            &[("body", exact_body)],
+        )?;
+
+        let (reloaded_issue, metadata) = self.load_work_item_issue(issue_number)?;
+        let reloaded_comments = self.load_comments(issue_number)?;
+        if self
+            .cached_integrity_report(&reloaded_issue, &reloaded_comments, Vec::new())?
+            .is_some()
+        {
+            return Err(recovery_validation_failed(
+                issue_number,
+                "the restored event still differs from verified cached evidence",
+            )
+            .into());
+        }
+        let replayed =
+            replay_trusted_history(issue_number, &reloaded_comments).map_err(|error| {
+                recovery_validation_failed(
+                    issue_number,
+                    format!("the complete restored history did not replay: {error:#}"),
+                )
+            })?;
+        projection_head_needs_update(issue_number, &metadata, &replayed.accepted, None).map_err(
+            |error| {
+                recovery_validation_failed(
+                    issue_number,
+                    format!(
+                        "the complete restored history did not match its projection: {error:#}"
+                    ),
+                )
+            },
+        )?;
+        let item = materialize_item(issue_number, &replayed.accepted).map_err(|error| {
+            recovery_validation_failed(
+                issue_number,
+                format!("the restored current state could not be rebuilt: {error:#}"),
+            )
+        })?;
+        self.project_history_head(&reloaded_issue, metadata, &replayed.accepted)?;
+        let evidence = event_evidence(&reloaded_comments, &replayed.accepted);
+        let trusted_event_count = replayed.accepted.len();
+        self.cache.complete_github_recovery(
+            &self.repository.to_string(),
+            &GithubCacheItem {
+                item: item.clone(),
+                history: replayed.cache_history(),
+                rejected: replayed.rejected,
+                evidence,
+            },
+        )?;
+        Ok(RecoveryReport {
+            work_item_id: issue_number,
+            outcome: RecoveryOutcome::ExactRestoration,
+            archived: item.status == Status::Archived || issue.locked,
+            full_history_revalidated: true,
+            projection_rebuilt: true,
+            trusted_event_count,
+            untrusted_event_count: 0,
+        })
+    }
+
+    fn rebaseline(
+        &mut self,
+        issue_number: i64,
+        actor: Option<&str>,
+        reason: Option<&str>,
+    ) -> Result<RecoveryReport> {
+        let actor = actor
+            .ok_or_else(|| {
+                recovery_still_blocked(issue_number, "Rebaseline requires an explicit --actor")
+            })
+            .and_then(|actor| {
+                normalized_required(actor, "actor")
+                    .map_err(|error| recovery_still_blocked(issue_number, error))
+            })?;
+        let reason = reason
+            .ok_or_else(|| {
+                recovery_still_blocked(
+                    issue_number,
+                    "Rebaseline requires an explicit non-empty --reason",
+                )
+            })
+            .and_then(|reason| {
+                normalized_required(reason, "reason")
+                    .map_err(|error| recovery_still_blocked(issue_number, error))
+            })?;
+        let mut diagnosis = self
+            .cache
+            .github_integrity_report(issue_number)?
+            .ok_or_else(|| {
+                recovery_still_blocked(issue_number, "no diagnosed integrity error is cached")
+            })?;
+        if !diagnosis
+            .eligible_repair_modes
+            .contains(&RepairMode::Rebaseline)
+        {
+            return Err(recovery_still_blocked(
+                issue_number,
+                "doctor did not make Rebaseline eligible",
+            )
+            .into());
+        }
+
+        let reviewed = self.cache.get(issue_number)?;
+        let (issue, mut metadata) = self.load_work_item_issue(issue_number)?;
+        let mut comments = self.load_comments(issue_number)?;
+        diagnosis.timeline_evidence = self.load_timeline(issue_number)?;
+        diagnosis.archived = reviewed.status == Status::Archived;
+        let cached_history = self.cache.history(issue_number)?;
+        let mut prior_evidence = self
+            .cache
+            .github_event_evidence(issue_number)?
+            .into_iter()
+            .map(|evidence| RetainedRecoveryEvidence {
+                comment_id: evidence.comment_id,
+                event_id: evidence.event_id,
+                github_actor: evidence.github_actor,
+                body: evidence.body,
+                history_hash: evidence.history_hash,
+                occurred_at: cached_history
+                    .iter()
+                    .find(|entry| entry.id == evidence.comment_id)
+                    .map(|entry| entry.occurred_at),
+            })
+            .collect::<Vec<_>>();
+        for comment in comments
+            .iter()
+            .filter(|comment| has_metadata(&comment.body, EVENT_MARKER))
+        {
+            if prior_evidence
+                .iter()
+                .any(|evidence| evidence.comment_id == comment.id)
+            {
+                continue;
+            }
+            let parsed = parse_event(&comment.body).ok();
+            prior_evidence.push(RetainedRecoveryEvidence {
+                comment_id: comment.id,
+                event_id: parsed.as_ref().map(|event| event.event_id.clone()),
+                github_actor: comment.user.login.clone(),
+                body: comment.body.clone(),
+                history_hash: None,
+                occurred_at: Some(comment.created_at),
+            });
+        }
+        prior_evidence.sort_by_key(|evidence| evidence.comment_id);
+
+        let github_actor = self.github.authenticated_user()?;
+        let event = CanonicalEvent {
+            schema_version: 1,
+            event_id: new_event_id("rebaseline"),
+            kind: EventKind::Rebaseline,
+            actor,
+            github_actor,
+            note: Some(reason),
+            changes: serde_json::to_value(RebaselineChanges {
+                title: reviewed.title.clone(),
+                description: reviewed.description.clone(),
+                status: reviewed.status,
+                integrity_context: diagnosis,
+                prior_evidence,
+            })?,
+            expected_state_revision: None,
+        };
+        let body = event_comment_body(&event)?;
+        let archived = reviewed.status == Status::Archived;
+        if archived && issue.locked {
+            self.github.api_empty(
+                "DELETE",
+                &format!("repos/{}/issues/{issue_number}/lock", self.repository),
+                &[],
+            )?;
+        }
+
+        let recovery = (|| -> Result<(WorkItem, ReplayedHistory, Vec<LedgerComment>)> {
+            let mut comment: LedgerComment = self.github.api_json(
+                "POST",
+                &format!("repos/{}/issues/{issue_number}/comments", self.repository),
+                &[("body", body.as_str())],
+            )?;
+            if comment.user.login != event.github_actor {
+                return Err(metadata_collision(issue_number).into());
+            }
+            comment.body = body.clone();
+            let anchor_id = comment.id;
+            comments.push(comment);
+            let replayed = replay_trusted_history(issue_number, &comments).map_err(|error| {
+                recovery_validation_failed(
+                    issue_number,
+                    format!("the Rebaseline sequence did not replay: {error:#}"),
+                )
+            })?;
+            let anchor = replayed.accepted.first().ok_or_else(|| {
+                recovery_validation_failed(
+                    issue_number,
+                    "the Rebaseline anchor was not reconstructed",
+                )
+            })?;
+            if anchor.id != anchor_id
+                || anchor.kind != EventKind::Rebaseline.as_str()
+                || anchor.previous_history_hash.is_some()
+            {
+                return Err(recovery_validation_failed(
+                    issue_number,
+                    "the Rebaseline did not start a new valid hash sequence",
+                )
+                .into());
+            }
+            metadata.event_id = event.event_id.clone();
+            metadata.pending_genesis_event_id = None;
+            metadata.pending_genesis_event = None;
+            metadata.genesis_comment_id = Some(anchor_id);
+            metadata.state_revision = 1;
+            metadata.head_event_id = None;
+            metadata.head_comment_id = None;
+            metadata.history_hash = None;
+            let item = materialize_item(issue_number, &replayed.accepted).map_err(|error| {
+                recovery_validation_failed(
+                    issue_number,
+                    format!("the reviewed current state could not be rebuilt: {error:#}"),
+                )
+            })?;
+            self.project_history_head(&issue, metadata.clone(), &replayed.accepted)?;
+            Ok((item, replayed, comments.clone()))
+        })();
+
+        let relock = if archived && issue.locked {
+            self.github.api_empty(
+                "PUT",
+                &format!("repos/{}/issues/{issue_number}/lock", self.repository),
+                &[],
+            )
+        } else {
+            Ok(())
+        };
+        if let Err(error) = relock {
+            return Err(recovery_validation_failed(
+                issue_number,
+                format!("the archived Work Item could not be relocked: {error:#}"),
+            )
+            .into());
+        }
+        let (item, replayed, comments) = recovery?;
+        let trusted_event_count = replayed.accepted.len();
+        let untrusted_event_count = replayed.untrusted.len();
+        let evidence = event_evidence(&comments, &replayed.accepted);
+        self.cache.complete_github_recovery(
+            &self.repository.to_string(),
+            &GithubCacheItem {
+                item,
+                history: replayed.cache_history(),
+                rejected: replayed.rejected,
+                evidence,
+            },
+        )?;
+        Ok(RecoveryReport {
+            work_item_id: issue_number,
+            outcome: RecoveryOutcome::Rebaseline,
+            archived,
+            full_history_revalidated: false,
+            projection_rebuilt: true,
+            trusted_event_count,
+            untrusted_event_count,
+        })
     }
 }
 
@@ -2545,6 +2912,19 @@ impl Ledger for GitHubLedger {
                 &error,
                 timeline,
             )),
+        }
+    }
+
+    fn recover(
+        &mut self,
+        id: i64,
+        mode: RepairMode,
+        actor: Option<&str>,
+        reason: Option<&str>,
+    ) -> Result<RecoveryReport> {
+        match mode {
+            RepairMode::RestoreExactCopy => self.restore_exact_copy(id),
+            RepairMode::Rebaseline => self.rebaseline(id, actor, reason),
         }
     }
 
@@ -3147,8 +3527,17 @@ fn materialize_item(issue_number: i64, history: &[HistoryEntry]) -> Result<WorkI
     let genesis = history
         .first()
         .context("Work Tracker history has no genesis entry")?;
-    let mut values: GenesisValues =
-        serde_json::from_value(genesis.changes.clone()).context("invalid genesis changes")?;
+    let mut values = if genesis.kind == EventKind::Rebaseline.as_str() {
+        let changes: RebaselineChanges = serde_json::from_value(genesis.changes.clone())
+            .context("invalid Rebaseline changes")?;
+        GenesisValues {
+            title: changes.title,
+            description: changes.description,
+            status: changes.status,
+        }
+    } else {
+        serde_json::from_value(genesis.changes.clone()).context("invalid genesis changes")?
+    };
     for entry in &history[1..] {
         if let Some(kind) = EventKind::from_history_name(&entry.kind)
             && let Some(changes) = MutationChanges::parse(kind, entry.changes.clone())?
@@ -3231,7 +3620,10 @@ fn event_evidence(
 ) -> Vec<GithubEventEvidence> {
     comments
         .iter()
-        .filter(|comment| has_metadata(&comment.body, EVENT_MARKER))
+        .filter(|comment| {
+            has_metadata(&comment.body, EVENT_MARKER)
+                && history.iter().any(|entry| entry.id == comment.id)
+        })
         .map(|comment| {
             let event_id = parse_event(&comment.body).ok().map(|event| event.event_id);
             let history_hash = history
@@ -3249,6 +3641,29 @@ fn event_evidence(
         .collect()
 }
 
+fn cached_exact_chain_is_verified(evidence: &[GithubEventEvidence]) -> bool {
+    let mut previous_hash: Option<String> = None;
+    for expected in evidence {
+        let Ok(event) = parse_event(&expected.body) else {
+            return false;
+        };
+        if event.github_actor != expected.github_actor
+            || expected.event_id.as_deref() != Some(event.event_id.as_str())
+        {
+            return false;
+        }
+        let Ok(observed_hash) = history_hash(previous_hash.as_deref(), &event, expected.comment_id)
+        else {
+            return false;
+        };
+        if expected.history_hash.as_deref() != Some(observed_hash.as_str()) {
+            return false;
+        }
+        previous_hash = Some(observed_hash);
+    }
+    true
+}
+
 fn hash_part(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update((bytes.len() as u64).to_be_bytes());
     hasher.update(bytes);
@@ -3257,7 +3672,14 @@ fn hash_part(hasher: &mut Sha256, bytes: &[u8]) {
 fn replay_history(issue_number: i64, comments: &[LedgerComment]) -> Result<ReplayedHistory> {
     let mut comments = comments.to_vec();
     comments.sort_by_key(|comment| comment.id);
+    if let Some(anchor) = comments.iter().rposition(|comment| {
+        has_metadata(&comment.body, EVENT_MARKER)
+            && parse_event(&comment.body).is_ok_and(|event| event.kind == EventKind::Rebaseline)
+    }) {
+        comments = comments.split_off(anchor);
+    }
     let mut history = Vec::new();
+    let mut untrusted = Vec::new();
     let mut rejected = Vec::new();
     let mut seen = HashMap::<String, CanonicalEvent>::new();
     let mut previous_hash: Option<String> = None;
@@ -3286,6 +3708,26 @@ fn replay_history(issue_number: i64, comments: &[LedgerComment]) -> Result<Repla
                 if !event.changes.is_object() || event.expected_state_revision.is_some() {
                     return Err(metadata_collision(issue_number).into());
                 }
+                state_revision = 1;
+            }
+            EventKind::Rebaseline if history.is_empty() => {
+                let changes: RebaselineChanges = serde_json::from_value(event.changes.clone())
+                    .context("invalid Rebaseline changes")?;
+                if event.expected_state_revision.is_some()
+                    || event
+                        .note
+                        .as_deref()
+                        .is_none_or(|reason| reason.trim().is_empty())
+                    || event.actor.trim().is_empty()
+                    || changes.title.trim().is_empty()
+                {
+                    return Err(metadata_collision(issue_number).into());
+                }
+                untrusted = retained_evidence_history(
+                    issue_number,
+                    &changes.prior_evidence,
+                    comment.created_at,
+                );
                 state_revision = 1;
             }
             EventKind::Noted if !history.is_empty() => {
@@ -3348,16 +3790,63 @@ fn replay_history(issue_number: i64, comments: &[LedgerComment]) -> Result<Repla
             trust: EvidenceTrust::Trusted,
         });
         previous_hash = Some(current_hash);
-        archived = event.kind == EventKind::Archived;
+        archived = event.kind == EventKind::Archived
+            || (event.kind == EventKind::Rebaseline
+                && serde_json::from_value::<RebaselineChanges>(event.changes.clone())
+                    .is_ok_and(|values| values.status == Status::Archived));
         seen.insert(event.event_id.clone(), event);
     }
-    if history.first().is_none_or(|entry| entry.kind != "created") {
+    if history
+        .first()
+        .is_none_or(|entry| !matches!(entry.kind.as_str(), "created" | "rebaseline"))
+    {
         return Err(metadata_collision(issue_number).into());
     }
     Ok(ReplayedHistory {
         accepted: history,
+        untrusted,
         rejected,
     })
+}
+
+fn retained_evidence_history(
+    issue_number: i64,
+    evidence: &[RetainedRecoveryEvidence],
+    fallback_time: DateTime<Utc>,
+) -> Vec<HistoryEntry> {
+    evidence
+        .iter()
+        .map(|evidence| {
+            let parsed = parse_event(&evidence.body).ok();
+            HistoryEntry {
+                id: evidence.comment_id,
+                work_item_id: issue_number,
+                event_id: evidence
+                    .event_id
+                    .clone()
+                    .or_else(|| parsed.as_ref().map(|event| event.event_id.clone())),
+                kind: parsed
+                    .as_ref()
+                    .map_or("untrusted_evidence", |event| event.kind.as_str())
+                    .to_owned(),
+                actor: parsed.as_ref().map_or_else(
+                    || evidence.github_actor.clone(),
+                    |event| event.actor.clone(),
+                ),
+                github_actor: Some(evidence.github_actor.clone()),
+                note: parsed.as_ref().and_then(|event| event.note.clone()),
+                occurred_at: evidence.occurred_at.unwrap_or(fallback_time),
+                changes: parsed.as_ref().map_or_else(
+                    || json!({"retained_body": evidence.body}),
+                    |event| event.changes.clone(),
+                ),
+                previous_history_hash: None,
+                history_hash: evidence.history_hash.clone(),
+                state_revision: None,
+                trust: EvidenceTrust::Untrusted,
+            }
+        })
+        .collect()
 }
 
 fn rejected_mutation(
@@ -3485,7 +3974,7 @@ fn projection_head_needs_update(
         .ok_or_else(|| ledger_integrity_error(issue_number, "history has no genesis entry"))?;
     if metadata.genesis_comment_id != Some(genesis.id)
         || genesis.event_id.as_deref() != Some(metadata.event_id.as_str())
-        || genesis.kind != "created"
+        || !matches!(genesis.kind.as_str(), "created" | "rebaseline")
     {
         return Err(ledger_integrity_error(
             issue_number,
@@ -3724,6 +4213,30 @@ fn ledger_integrity_error(issue_number: i64, detail: impl fmt::Display) -> GitHu
         GitHubErrorKind::LedgerIntegrity,
         format!("Ledger Integrity Error for GitHub issue #{issue_number}: {detail}"),
     )
+}
+
+fn recovery_validation_failed(issue_number: i64, detail: impl fmt::Display) -> GitHubError {
+    GitHubError::new(
+        GitHubErrorKind::RecoveryValidationFailed,
+        format!("recovery validation failed for work item {issue_number}: {detail}"),
+    )
+    .with_details(json!({
+        "work_item_id": issue_number,
+        "outcome": "failed_validation",
+        "integrity_error": true,
+    }))
+}
+
+fn recovery_still_blocked(issue_number: i64, detail: impl fmt::Display) -> GitHubError {
+    GitHubError::new(
+        GitHubErrorKind::RecoveryStillBlocked,
+        format!("work item {issue_number} is still blocked by Ledger Integrity Error: {detail}"),
+    )
+    .with_details(json!({
+        "work_item_id": issue_number,
+        "outcome": "still_blocked",
+        "integrity_error": true,
+    }))
 }
 
 fn validate_reserved_labels(
