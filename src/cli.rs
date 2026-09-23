@@ -74,6 +74,8 @@ pub enum Command {
     History(IdArgs),
     /// Show field or Status proposals rejected by State Revision checks.
     Rejected(IdArgs),
+    /// Diagnose structured ledger integrity without modifying GitHub.
+    Doctor(IdArgs),
     /// Print the database path in use.
     Path,
     /// Host the read-only HTML dashboard.

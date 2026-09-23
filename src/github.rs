@@ -1,4 +1,11 @@
-use std::{cell::RefCell, collections::HashMap, fmt, path::Path, process::Command, str::FromStr};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    fmt,
+    path::Path,
+    process::Command,
+    str::FromStr,
+};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
@@ -8,9 +15,11 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    db::{GithubCacheCleanup, GithubCacheItem, SqliteLedger},
+    db::{GithubCacheCleanup, GithubCacheItem, GithubEventEvidence, SqliteLedger},
     domain::{
-        HistoryEntry, RejectedMutation, Status, WorkItem, normalized_optional, normalized_required,
+        EvidenceTrust, HistoryEntry, IntegrityBreak, IntegrityBreakKind, IntegrityDoctorReport,
+        IntegrityHealth, RejectedMutation, RepairMode, Status, WorkItem, normalized_optional,
+        normalized_required,
     },
     ledger::{Ledger, ListFilter, ReadHealth, ReadHealthErrorKind, ReadPolicy},
 };
@@ -505,6 +514,7 @@ struct PreparedMutation {
     replayed: ReplayedHistory,
     current: WorkItem,
     projection_needs_update: bool,
+    evidence: Vec<GithubEventEvidence>,
 }
 
 struct ProjectionRepair {
@@ -563,6 +573,12 @@ struct LedgerComment {
     user: User,
     #[serde(default)]
     body: String,
+}
+
+struct CorrelatedDeletion {
+    comment_id: Option<i64>,
+    event_id: Option<String>,
+    github_actor: Option<String>,
 }
 
 enum ConditionalResult<T> {
@@ -797,6 +813,14 @@ impl GitHubLedger {
             archived_at: None,
             deleted_at: None,
             purge_after: None,
+            ledger_integrity_error: false,
+        };
+        let evidence = GithubEventEvidence {
+            comment_id: comment.id,
+            event_id: Some(event_id.clone()),
+            github_actor: event.github_actor.clone(),
+            body: event_comment_body(&event)?,
+            history_hash: Some(history_hash.clone()),
         };
         let history = HistoryEntry {
             id: comment.id,
@@ -811,10 +835,94 @@ impl GitHubLedger {
             previous_history_hash: None,
             history_hash: Some(history_hash),
             state_revision: Some(1),
+            trust: EvidenceTrust::Trusted,
         };
         self.cache
-            .finish_github_creation(&request_json, &item, &history)?;
+            .finish_github_creation(&request_json, &item, &history, &evidence)?;
         Ok(item)
+    }
+
+    fn audit_unchanged_cached_evidence(&mut self, changed_issue_ids: &HashSet<i64>) -> Result<()> {
+        let mut first_error: Option<anyhow::Error> = None;
+        for issue_number in self.cache.github_cached_evidence_work_item_ids()? {
+            if changed_issue_ids.contains(&issue_number) {
+                continue;
+            }
+            let comments = self.load_comments(issue_number)?;
+            let item = self.cache.get(issue_number)?;
+            let issue = LedgerIssue {
+                number: issue_number,
+                title: Some(item.title.clone()),
+                body: String::new(),
+                labels: vec![
+                    IssueLabel {
+                        name: "work-tracker:item".to_owned(),
+                    },
+                    IssueLabel {
+                        name: format!("work-tracker:status:{}", item.status.as_str()),
+                    },
+                ],
+                state: Some(if item.status.is_actionable() {
+                    "open".to_owned()
+                } else {
+                    "closed".to_owned()
+                }),
+                state_reason: None,
+                locked: item.status == Status::Archived,
+                updated_at: Some(item.updated_at),
+                pull_request: None,
+            };
+            if let Some(report) = self.cached_integrity_report(&issue, &comments, Vec::new())? {
+                let detail = report
+                    .first_break
+                    .as_ref()
+                    .map(|first_break| first_break.detail.as_str())
+                    .unwrap_or("structured ledger evidence is inconsistent");
+                self.cache.record_github_integrity(&report)?;
+                first_error
+                    .get_or_insert_with(|| ledger_integrity_error(issue_number, detail).into());
+                continue;
+            }
+
+            let cached_history = self.cache.history(issue_number)?;
+            let Some(genesis) = cached_history.first() else {
+                continue;
+            };
+            let head = cached_history
+                .last()
+                .context("cached Work Tracker history has no head")?;
+            let metadata = ProjectionMetadata {
+                schema_version: 1,
+                kind: "work_item".to_owned(),
+                event_id: genesis
+                    .event_id
+                    .clone()
+                    .context("cached genesis omitted event ID")?,
+                creation_fingerprint: String::new(),
+                creation_event_id_supplied: false,
+                pending_genesis_event_id: None,
+                pending_genesis_event: None,
+                genesis_comment_id: Some(genesis.id),
+                state_revision: head
+                    .state_revision
+                    .context("cached history head omitted State Revision")?,
+                head_event_id: head.event_id.clone(),
+                head_comment_id: Some(head.id),
+                history_hash: head.history_hash.clone(),
+            };
+            if let Err(error) = replay_trusted_history(issue_number, &comments) {
+                let report =
+                    self.replay_failure_report(&issue, &metadata, &comments, &error, Vec::new());
+                self.cache.record_github_integrity(&report)?;
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     fn synchronize(&mut self) -> Result<(DateTime<Utc>, Vec<i64>)> {
@@ -837,6 +945,7 @@ impl GitHubLedger {
             .api_conditional_paginated_json::<LedgerIssue>(&endpoint, previous_etag.as_deref())?
         {
             ConditionalResult::NotModified => {
+                self.audit_unchanged_cached_evidence(&HashSet::new())?;
                 let synchronized_at = Utc::now();
                 self.cache
                     .mark_github_sync_success(&repository, synchronized_at)?;
@@ -844,6 +953,8 @@ impl GitHubLedger {
             }
             ConditionalResult::Modified { values, etag } => (values, etag),
         };
+        let changed_issue_ids = issues.iter().map(|issue| issue.number).collect();
+        self.audit_unchanged_cached_evidence(&changed_issue_ids)?;
         let mut synchronized = Vec::new();
         let mut projection_updates = Vec::new();
         let mut removed_item_ids = Vec::new();
@@ -891,6 +1002,17 @@ impl GitHubLedger {
                 ),
             )?;
             let pending_genesis = metadata.pending_genesis_event_id.is_some();
+            if !pending_genesis
+                && let Some(report) = self.cached_integrity_report(&issue, &comments, Vec::new())?
+            {
+                let detail = report
+                    .first_break
+                    .as_ref()
+                    .map(|first_break| first_break.detail.as_str())
+                    .unwrap_or("structured ledger evidence is inconsistent");
+                self.preserve_integrity_snapshot(&issue, &comments, &report, None)?;
+                return Err(ledger_integrity_error(issue.number, detail).into());
+            }
             if pending_genesis
                 && !comments
                     .iter()
@@ -936,7 +1058,20 @@ impl GitHubLedger {
             {
                 completed_creation_requests.push(request_json);
             }
-            let replayed = replay_trusted_history(issue.number, &comments)?;
+            let replayed = match replay_trusted_history(issue.number, &comments) {
+                Ok(replayed) => replayed,
+                Err(error) => {
+                    let report = self.replay_failure_report(
+                        &issue,
+                        &metadata,
+                        &comments,
+                        &error,
+                        Vec::new(),
+                    );
+                    self.preserve_integrity_snapshot(&issue, &comments, &report, None)?;
+                    return Err(error);
+                }
+            };
             let history = &replayed.accepted;
             let projection_needs_update = if pending_genesis {
                 let genesis = history.first().ok_or_else(|| {
@@ -957,12 +1092,30 @@ impl GitHubLedger {
                 true
             } else {
                 let legacy_genesis = self.cache.legacy_github_genesis_evidence(issue.number)?;
-                projection_head_needs_update(
+                match projection_head_needs_update(
                     issue.number,
                     &metadata,
                     history,
                     legacy_genesis.as_ref(),
-                )?
+                ) {
+                    Ok(needs_update) => needs_update,
+                    Err(error) => {
+                        let report = self.head_failure_report(
+                            &issue,
+                            &metadata,
+                            history,
+                            &error,
+                            Vec::new(),
+                        );
+                        self.preserve_integrity_snapshot(
+                            &issue,
+                            &comments,
+                            &report,
+                            Some(history),
+                        )?;
+                        return Err(error);
+                    }
+                }
             };
             let item = materialize_item(issue.number, history)?;
             if projection_differs(&issue, &item, projection_needs_update)? {
@@ -982,10 +1135,12 @@ impl GitHubLedger {
                         || visible_or_status_drift,
                 });
             }
+            let evidence = event_evidence(&comments, history);
             synchronized.push(GithubCacheItem {
                 item,
                 history: replayed.accepted,
                 rejected: replayed.rejected,
+                evidence,
             });
         }
         let repaired_work_item_ids = projection_updates
@@ -1054,12 +1209,14 @@ impl GitHubLedger {
             self.project_history_head(&issue, metadata, &replayed.accepted)?;
             self.repaired_work_item_ids.push(issue.number);
         }
+        let evidence = event_evidence(&comments, &replayed.accepted);
         self.cache.finish_github_creation_recovery(
             request_json,
             &GithubCacheItem {
                 item: item.clone(),
                 history: replayed.accepted,
                 rejected: replayed.rejected,
+                evidence,
             },
         )?;
         Ok(item)
@@ -1244,6 +1401,328 @@ impl GitHubLedger {
         )
     }
 
+    fn load_timeline(&self, issue_number: i64) -> Result<Vec<Value>> {
+        self.github.api_paginated_json(
+            "GET",
+            &format!(
+                "repos/{}/issues/{issue_number}/timeline?per_page=100",
+                self.repository
+            ),
+        )
+    }
+
+    fn cached_integrity_report(
+        &self,
+        issue: &LedgerIssue,
+        comments: &[LedgerComment],
+        timeline_evidence: Vec<Value>,
+    ) -> Result<Option<IntegrityDoctorReport>> {
+        let cached = self.cache.github_event_evidence(issue.number)?;
+        if cached.is_empty() {
+            return Ok(None);
+        }
+        let structured = comments
+            .iter()
+            .filter(|comment| has_metadata(&comment.body, EVENT_MARKER))
+            .collect::<Vec<_>>();
+        let replayed = replay_history(issue.number, comments).ok();
+        for (index, expected) in cached.iter().enumerate() {
+            let observed = structured
+                .iter()
+                .find(|comment| comment.id == expected.comment_id)
+                .copied();
+            let (kind, observed_copy, observed_hash, github_actor, detail) = match observed {
+                None => (
+                    IntegrityBreakKind::DeletedEvent,
+                    None,
+                    None,
+                    Some(expected.github_actor.clone()),
+                    format!(
+                        "cached structured comment {} is absent from the GitHub comment timeline",
+                        expected.comment_id
+                    ),
+                ),
+                Some(observed) if observed.body != expected.body => (
+                    IntegrityBreakKind::EditedEvent,
+                    Some(observed.body.clone()),
+                    replayed.as_ref().and_then(|replayed| {
+                        replayed
+                            .accepted
+                            .iter()
+                            .find(|entry| entry.id == observed.id)
+                            .and_then(|entry| entry.history_hash.clone())
+                    }),
+                    Some(observed.user.login.clone()),
+                    format!(
+                        "structured comment {} differs from the cached exact copy",
+                        expected.comment_id
+                    ),
+                ),
+                _ => continue,
+            };
+            let report = IntegrityDoctorReport {
+                work_item_id: issue.number,
+                integrity_health: IntegrityHealth::LedgerIntegrityError,
+                archived: issue.locked
+                    || issue.labels.iter().any(|label| {
+                        label
+                            .name
+                            .eq_ignore_ascii_case("work-tracker:status:archived")
+                    }),
+                first_break: Some(IntegrityBreak {
+                    kind,
+                    github_comment_id: Some(expected.comment_id),
+                    event_id: expected.event_id.clone(),
+                    github_actor,
+                    expected_hash: expected.history_hash.clone(),
+                    observed_hash,
+                    cached_exact_copy: Some(expected.body.clone()),
+                    observed_copy,
+                    detail,
+                }),
+                trusted_event_count: index,
+                untrusted_event_count: structured.len().saturating_sub(index),
+                timeline_evidence,
+                eligible_repair_modes: vec![RepairMode::RestoreExactCopy, RepairMode::Rebaseline],
+            };
+            return Ok(Some(report));
+        }
+        Ok(None)
+    }
+
+    fn cached_integrity_error(&self, issue_number: i64) -> Result<Option<GitHubError>> {
+        Ok(self
+            .cache
+            .github_integrity_report(issue_number)?
+            .and_then(|report| report.first_break)
+            .map(|first_break| {
+                ledger_integrity_error(issue_number, first_break.detail).with_details(json!({
+                    "work_item_id": issue_number,
+                    "integrity_error": true,
+                }))
+            }))
+    }
+
+    fn ensure_integrity_allows_mutation(&self, issue_number: i64) -> Result<()> {
+        if let Some(error) = self.cached_integrity_error(issue_number)? {
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    fn decorate_integrity(&self, items: &mut [WorkItem]) -> Result<()> {
+        for item in items {
+            item.ledger_integrity_error = self.cache.github_integrity_report(item.id)?.is_some();
+        }
+        Ok(())
+    }
+
+    fn preserve_integrity_snapshot(
+        &mut self,
+        issue: &LedgerIssue,
+        comments: &[LedgerComment],
+        report: &IntegrityDoctorReport,
+        observed_history: Option<&[HistoryEntry]>,
+    ) -> Result<()> {
+        if self.cache.get(issue.number).is_err() {
+            let status = issue
+                .labels
+                .iter()
+                .find_map(|label| {
+                    label
+                        .name
+                        .strip_prefix("work-tracker:status:")
+                        .and_then(|status| Status::from_str(status).ok())
+                })
+                .unwrap_or(Status::Pending);
+            let observed_at = comments
+                .iter()
+                .map(|comment| comment.created_at)
+                .min()
+                .or(issue.updated_at)
+                .unwrap_or_else(Utc::now);
+            let updated_at = issue.updated_at.unwrap_or(observed_at);
+            let visible = projection_visible_text(&issue.body).unwrap_or_default();
+            let description =
+                (!matches!(visible, "" | "_No description provided._")).then(|| visible.to_owned());
+            let mut history = observed_history.unwrap_or_default().to_vec();
+            for entry in &mut history {
+                entry.trust = EvidenceTrust::Untrusted;
+            }
+            let evidence = event_evidence(comments, &history);
+            self.cache.replace_github_item(&GithubCacheItem {
+                item: WorkItem {
+                    id: issue.number,
+                    title: issue
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| format!("GitHub issue #{}", issue.number)),
+                    description,
+                    status,
+                    created_at: observed_at,
+                    updated_at,
+                    archived_at: (status == Status::Archived).then_some(updated_at),
+                    deleted_at: (status == Status::Archived).then_some(updated_at),
+                    purge_after: None,
+                    ledger_integrity_error: true,
+                },
+                history,
+                rejected: Vec::new(),
+                evidence,
+            })?;
+        }
+        self.cache.record_github_integrity(report)
+    }
+
+    fn correlated_deletion(
+        metadata: &ProjectionMetadata,
+        timeline_evidence: &[Value],
+    ) -> Option<CorrelatedDeletion> {
+        timeline_evidence.iter().find_map(|event| {
+            let is_deletion = event
+                .get("event")
+                .and_then(Value::as_str)
+                .is_some_and(|event| event.contains("deleted"));
+            let comment_id = event.get("comment_id").and_then(Value::as_i64);
+            let event_id = event.get("event_id").and_then(Value::as_str);
+            let matches_projected_endpoint = comment_id == metadata.genesis_comment_id
+                || comment_id == metadata.head_comment_id
+                || event_id == Some(metadata.event_id.as_str())
+                || event_id == metadata.head_event_id.as_deref();
+            let matches_structured_interior = match (
+                comment_id,
+                event_id,
+                metadata.genesis_comment_id,
+                metadata.head_comment_id,
+            ) {
+                (Some(comment_id), Some(_), Some(genesis_id), Some(head_id)) => {
+                    comment_id > genesis_id.min(head_id) && comment_id < genesis_id.max(head_id)
+                }
+                _ => false,
+            };
+            (is_deletion && (matches_projected_endpoint || matches_structured_interior)).then(
+                || CorrelatedDeletion {
+                    comment_id,
+                    event_id: event_id.map(str::to_owned),
+                    github_actor: event
+                        .get("actor")
+                        .and_then(|actor| actor.get("login"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                },
+            )
+        })
+    }
+
+    fn replay_failure_report(
+        &self,
+        issue: &LedgerIssue,
+        metadata: &ProjectionMetadata,
+        comments: &[LedgerComment],
+        error: &anyhow::Error,
+        timeline_evidence: Vec<Value>,
+    ) -> IntegrityDoctorReport {
+        let deletion = Self::correlated_deletion(metadata, &timeline_evidence);
+        let first_unreadable_comment = comments
+            .iter()
+            .filter(|comment| has_metadata(&comment.body, EVENT_MARKER))
+            .find(|comment| parse_event(&comment.body).is_err());
+        let is_unknown_schema = error
+            .downcast_ref::<GitHubError>()
+            .is_some_and(|error| error.kind() == GitHubErrorKind::UnknownEventSchema);
+        IntegrityDoctorReport {
+            work_item_id: issue.number,
+            integrity_health: IntegrityHealth::LedgerIntegrityError,
+            archived: issue.locked,
+            first_break: Some(IntegrityBreak {
+                kind: if deletion.is_some() {
+                    IntegrityBreakKind::DeletedEvent
+                } else if is_unknown_schema {
+                    IntegrityBreakKind::UnknownSchemaVersion
+                } else {
+                    IntegrityBreakKind::UnreadableEvent
+                },
+                github_comment_id: deletion
+                    .as_ref()
+                    .and_then(|deletion| deletion.comment_id)
+                    .or_else(|| first_unreadable_comment.map(|comment| comment.id)),
+                event_id: deletion
+                    .as_ref()
+                    .and_then(|deletion| deletion.event_id.clone()),
+                github_actor: deletion
+                    .as_ref()
+                    .and_then(|deletion| deletion.github_actor.clone())
+                    .or_else(|| first_unreadable_comment.map(|comment| comment.user.login.clone())),
+                expected_hash: metadata.history_hash.clone(),
+                observed_hash: None,
+                cached_exact_copy: None,
+                observed_copy: first_unreadable_comment.map(|comment| comment.body.clone()),
+                detail: format!("{error:#}"),
+            }),
+            trusted_event_count: 0,
+            untrusted_event_count: comments
+                .iter()
+                .filter(|comment| has_metadata(&comment.body, EVENT_MARKER))
+                .count(),
+            timeline_evidence,
+            eligible_repair_modes: vec![RepairMode::Rebaseline],
+        }
+    }
+
+    fn head_failure_report(
+        &self,
+        issue: &LedgerIssue,
+        metadata: &ProjectionMetadata,
+        history: &[HistoryEntry],
+        error: &anyhow::Error,
+        timeline_evidence: Vec<Value>,
+    ) -> IntegrityDoctorReport {
+        let deletion = Self::correlated_deletion(metadata, &timeline_evidence);
+        let projected = metadata.head_comment_id.and_then(|comment_id| {
+            history.iter().find(|entry| {
+                entry.id == comment_id
+                    && entry.event_id.as_deref() == metadata.head_event_id.as_deref()
+            })
+        });
+        let kind = if deletion.is_some() {
+            IntegrityBreakKind::DeletedEvent
+        } else if projected.is_some() {
+            IntegrityBreakKind::BrokenHashContinuity
+        } else {
+            IntegrityBreakKind::HeadMismatch
+        };
+        let observed = projected.or_else(|| history.last());
+        IntegrityDoctorReport {
+            work_item_id: issue.number,
+            integrity_health: IntegrityHealth::LedgerIntegrityError,
+            archived: issue.locked,
+            first_break: Some(IntegrityBreak {
+                kind,
+                github_comment_id: deletion
+                    .as_ref()
+                    .and_then(|deletion| deletion.comment_id)
+                    .or_else(|| observed.map(|entry| entry.id)),
+                event_id: deletion
+                    .as_ref()
+                    .and_then(|deletion| deletion.event_id.clone())
+                    .or_else(|| observed.and_then(|entry| entry.event_id.clone())),
+                github_actor: deletion
+                    .as_ref()
+                    .and_then(|deletion| deletion.github_actor.clone())
+                    .or_else(|| observed.and_then(|entry| entry.github_actor.clone())),
+                expected_hash: metadata.history_hash.clone(),
+                observed_hash: observed.and_then(|entry| entry.history_hash.clone()),
+                cached_exact_copy: None,
+                observed_copy: None,
+                detail: format!("{error:#}"),
+            }),
+            trusted_event_count: 0,
+            untrusted_event_count: history.len(),
+            timeline_evidence,
+            eligible_repair_modes: vec![RepairMode::Rebaseline],
+        }
+    }
+
     fn project_history_head(
         &self,
         issue: &LedgerIssue,
@@ -1322,12 +1801,14 @@ impl GitHubLedger {
             legacy_genesis.as_ref(),
         )?;
         let current = materialize_item(issue_number, &replayed.accepted)?;
+        let evidence = event_evidence(&comments, &replayed.accepted);
         Ok(PreparedMutation {
             issue,
             metadata,
             replayed,
             current,
             projection_needs_update,
+            evidence,
         })
     }
 
@@ -1346,6 +1827,7 @@ impl GitHubLedger {
             replayed,
             current,
             projection_needs_update,
+            evidence,
         } = prepared;
         let repaired_projection = projection_differs(&issue, &current, projection_needs_update)?;
         if repaired_projection {
@@ -1356,6 +1838,7 @@ impl GitHubLedger {
             item: current.clone(),
             history: replayed.accepted,
             rejected: replayed.rejected,
+            evidence,
         })?;
         Ok(current)
     }
@@ -1404,10 +1887,12 @@ impl GitHubLedger {
             bail!("published {operation} was not confirmed from GitHub");
         }
         let item = materialize_item(issue_number, &history)?;
+        let evidence = event_evidence(&comments, &history);
         self.cache.replace_github_item(&GithubCacheItem {
             item: item.clone(),
             history: replayed.accepted,
             rejected: replayed.rejected,
+            evidence,
         })?;
         let projection_error = self
             .project_history_head(&prepared.issue, prepared.metadata, &history)
@@ -1480,6 +1965,7 @@ impl GitHubLedger {
         note: Option<&str>,
         requested_event_id: Option<&str>,
     ) -> Result<WorkItem> {
+        self.ensure_integrity_allows_mutation(issue_number)?;
         let actor = normalized_required(actor, "actor")?;
         let note = normalized_optional(note);
         let requested_event_id = requested_event_id
@@ -1612,6 +2098,7 @@ impl GitHubLedger {
         note: Option<&str>,
         requested_event_id: Option<&str>,
     ) -> Result<WorkItem> {
+        self.ensure_integrity_allows_mutation(issue_number)?;
         let actor = normalized_required(actor, "actor")?;
         let note = normalized_optional(note);
         let requested_event_id = requested_event_id
@@ -1726,6 +2213,7 @@ impl GitHubLedger {
         actor: &str,
         requested_event_id: Option<&str>,
     ) -> Result<HistoryEntry> {
+        self.ensure_integrity_allows_mutation(issue_number)?;
         let message = normalized_required(message, "message")?;
         let actor = normalized_required(actor, "actor")?;
         let event_id = requested_event_id
@@ -1773,10 +2261,12 @@ impl GitHubLedger {
                 self.repaired_work_item_ids.push(issue_number);
             }
             let item = materialize_item(issue_number, history)?;
+            let evidence = event_evidence(&comments, history);
             self.cache.replace_github_item(&GithubCacheItem {
                 item,
                 history: replayed.accepted,
                 rejected: replayed.rejected,
+                evidence,
             })?;
             return Ok(existing);
         }
@@ -1804,10 +2294,12 @@ impl GitHubLedger {
             self.repaired_work_item_ids.push(issue_number);
         }
         let item = materialize_item(issue_number, history)?;
+        let evidence = event_evidence(&comments, history);
         self.cache.replace_github_item(&GithubCacheItem {
             item,
             history: replayed.accepted,
             rejected: replayed.rejected,
+            evidence,
         })?;
         Ok(entry)
     }
@@ -1818,6 +2310,33 @@ impl Ledger for GitHubLedger {
         let repository = self.repository.to_string();
         let last_successful_sync_at = self.cache.github_last_successful_sync_at(&repository)?;
         if policy == ReadPolicy::Offline {
+            if let Some(report) = self.cache.first_github_integrity_report()? {
+                let first_break = report.first_break.as_ref();
+                return Ok(ReadHealth::Integrity {
+                    last_successful_sync_at,
+                    reason: first_break.map_or_else(
+                        || {
+                            format!(
+                                "Ledger Integrity Error for GitHub issue #{}",
+                                report.work_item_id
+                            )
+                        },
+                        |first_break| {
+                            format!(
+                                "Ledger Integrity Error for GitHub issue #{}: {}",
+                                report.work_item_id, first_break.detail
+                            )
+                        },
+                    ),
+                    error_kind: if first_break.is_some_and(|first_break| {
+                        first_break.kind == IntegrityBreakKind::UnknownSchemaVersion
+                    }) {
+                        ReadHealthErrorKind::UnknownEventSchema
+                    } else {
+                        ReadHealthErrorKind::LedgerIntegrity
+                    },
+                });
+            }
             return Ok(match last_successful_sync_at {
                 Some(last_successful_sync_at) => ReadHealth::Stale {
                     last_successful_sync_at,
@@ -1833,10 +2352,22 @@ impl Ledger for GitHubLedger {
         }
 
         match self.synchronize() {
-            Ok((synchronized_at, repaired_work_item_ids)) => Ok(ReadHealth::Fresh {
-                synchronized_at,
-                repaired_work_item_ids,
-            }),
+            Ok((synchronized_at, repaired_work_item_ids)) => {
+                if let Some(report) = self.cache.first_github_integrity_report()? {
+                    return Ok(ReadHealth::Integrity {
+                        last_successful_sync_at: Some(synchronized_at),
+                        reason: format!(
+                            "Ledger Integrity Error for GitHub issue #{} remains cached pending explicit repair",
+                            report.work_item_id
+                        ),
+                        error_kind: ReadHealthErrorKind::LedgerIntegrity,
+                    });
+                }
+                Ok(ReadHealth::Fresh {
+                    synchronized_at,
+                    repaired_work_item_ids,
+                })
+            }
             Err(error) if policy == ReadPolicy::Fresh => Err(error),
             Err(error) => {
                 let github_error = error.downcast_ref::<GitHubError>();
@@ -1889,7 +2420,9 @@ impl Ledger for GitHubLedger {
     }
 
     fn get(&self, id: i64) -> Result<WorkItem> {
-        self.cache.get(id)
+        let mut item = self.cache.get(id)?;
+        self.decorate_integrity(std::slice::from_mut(&mut item))?;
+        Ok(item)
     }
 
     fn list(
@@ -1898,11 +2431,15 @@ impl Ledger for GitHubLedger {
         include_archived: bool,
         limit: usize,
     ) -> Result<Vec<WorkItem>> {
-        self.cache.list(filter, include_archived, limit)
+        let mut items = self.cache.list(filter, include_archived, limit)?;
+        self.decorate_integrity(&mut items)?;
+        Ok(items)
     }
 
     fn daily_view(&mut self, include_archived: bool) -> Result<Vec<WorkItem>> {
-        self.cache.daily_view(include_archived)
+        let mut items = self.cache.daily_view(include_archived)?;
+        self.decorate_integrity(&mut items)?;
+        Ok(items)
     }
 
     fn update(
@@ -1965,6 +2502,50 @@ impl Ledger for GitHubLedger {
 
     fn rejected_mutations(&mut self, id: i64) -> Result<Vec<RejectedMutation>> {
         self.cache.rejected_mutations(id)
+    }
+
+    fn doctor(&mut self, id: i64) -> Result<IntegrityDoctorReport> {
+        let (issue, metadata) = self.load_work_item_issue(id)?;
+        let comments = self.load_comments(id)?;
+        let timeline = self.load_timeline(id)?;
+        if let Some(report) = self.cached_integrity_report(&issue, &comments, timeline.clone())? {
+            return Ok(report);
+        }
+
+        let replayed = match replay_trusted_history(id, &comments) {
+            Ok(replayed) => replayed,
+            Err(error) => {
+                return Ok(
+                    self.replay_failure_report(&issue, &metadata, &comments, &error, timeline)
+                );
+            }
+        };
+        match projection_head_needs_update(id, &metadata, &replayed.accepted, None) {
+            Ok(_) => {
+                if let Some(mut latched) = self.cache.github_integrity_report(id)? {
+                    latched.archived = issue.locked;
+                    latched.timeline_evidence = timeline;
+                    return Ok(latched);
+                }
+                Ok(IntegrityDoctorReport {
+                    work_item_id: id,
+                    integrity_health: IntegrityHealth::Healthy,
+                    archived: issue.locked,
+                    first_break: None,
+                    trusted_event_count: replayed.accepted.len(),
+                    untrusted_event_count: 0,
+                    timeline_evidence: timeline,
+                    eligible_repair_modes: Vec::new(),
+                })
+            }
+            Err(error) => Ok(self.head_failure_report(
+                &issue,
+                &metadata,
+                &replayed.accepted,
+                &error,
+                timeline,
+            )),
+        }
     }
 
     fn take_projection_repairs(&mut self) -> Vec<i64> {
@@ -2590,6 +3171,7 @@ fn materialize_item(issue_number: i64, history: &[HistoryEntry]) -> Result<WorkI
         archived_at,
         deleted_at: archived_at,
         purge_after: None,
+        ledger_integrity_error: false,
     })
 }
 
@@ -2641,6 +3223,30 @@ fn history_hash(
     hash_part(&mut hasher, &canonical);
     hash_part(&mut hasher, &comment_id.to_be_bytes());
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn event_evidence(
+    comments: &[LedgerComment],
+    history: &[HistoryEntry],
+) -> Vec<GithubEventEvidence> {
+    comments
+        .iter()
+        .filter(|comment| has_metadata(&comment.body, EVENT_MARKER))
+        .map(|comment| {
+            let event_id = parse_event(&comment.body).ok().map(|event| event.event_id);
+            let history_hash = history
+                .iter()
+                .find(|entry| entry.id == comment.id)
+                .and_then(|entry| entry.history_hash.clone());
+            GithubEventEvidence {
+                comment_id: comment.id,
+                event_id,
+                github_actor: comment.user.login.clone(),
+                body: comment.body.clone(),
+                history_hash,
+            }
+        })
+        .collect()
 }
 
 fn hash_part(hasher: &mut Sha256, bytes: &[u8]) {
@@ -2739,6 +3345,7 @@ fn replay_history(issue_number: i64, comments: &[LedgerComment]) -> Result<Repla
             previous_history_hash: previous_hash.clone(),
             history_hash: Some(current_hash.clone()),
             state_revision: Some(state_revision),
+            trust: EvidenceTrust::Trusted,
         });
         previous_hash = Some(current_hash);
         archived = event.kind == EventKind::Archived;

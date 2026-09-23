@@ -445,7 +445,7 @@ fn migrated_v4_cache_replays_history_and_bootstraps_the_legacy_projection() -> R
 }
 
 #[test]
-fn unknown_headless_projection_is_not_automatically_rebaselined() -> Result<()> {
+fn unknown_headless_projection_is_inspectable_but_not_automatically_rebaselined() -> Result<()> {
     let cli = CliHarness::new()?;
     configure_github(&cli)?;
     let gh = FakeGh::new()?;
@@ -479,12 +479,14 @@ fn unknown_headless_projection_is_not_automatically_rebaselined() -> Result<()> 
         "",
     )?;
 
-    let failed = cli.run_with_fake_gh(&gh, ["--json", "list", "--all"])?;
-    assert!(!failed.status.success());
-    let diagnostic: Value = serde_json::from_slice(&failed.stderr)?;
-    assert_eq!(diagnostic["error"]["code"], "github_ledger_integrity");
+    let inspected = cli.run_with_fake_gh(&gh, ["--json", "list", "--all"])?;
+    assert_success(&inspected)?;
+    assert_eq!(json_stdout(&inspected)?[0]["title"], "Watch CI");
+    assert_eq!(json_stdout(&inspected)?[0]["ledger_integrity_error"], true);
+    let diagnostic: Value = serde_json::from_slice(&inspected.stderr)?;
+    assert_eq!(diagnostic["warning"]["code"], "ledger_integrity");
     assert!(
-        diagnostic["error"]["message"]
+        diagnostic["warning"]["message"]
             .as_str()
             .context("integrity diagnostic omitted message")?
             .contains("missing a trusted history head")
@@ -494,7 +496,7 @@ fn unknown_headless_projection_is_not_automatically_rebaselined() -> Result<()> 
     let connection = Connection::open(cli.github_cache_path("octocat", "work-tracker-data"))?;
     let count: i64 =
         connection.query_row("SELECT count(*) FROM work_items", [], |row| row.get(0))?;
-    assert_eq!(count, 0);
+    assert_eq!(count, 1);
     Ok(())
 }
 
@@ -582,6 +584,13 @@ fn unchanged_incremental_query_reuses_etag_and_accepts_not_modified() -> Result<
     configure_github(&cli)?;
     let gh = FakeGh::new()?;
     let event_id = "11111111-1111-4111-8111-111111111111";
+    let stable_comment = json!([[{
+        "id": 9001,
+        "created_at": "2026-09-22T14:00:00Z",
+        "user": {"login": "octocat"},
+        "body": genesis_body("Stable item", None, "active", event_id)
+    }]])
+    .to_string();
     gh.respond(
         1,
         0,
@@ -597,18 +606,7 @@ fn unchanged_incremental_query_reuses_etag_and_accepts_not_modified() -> Result<
         .to_string(),
         "",
     )?;
-    gh.respond(
-        2,
-        0,
-        &json!([[{
-            "id": 9001,
-            "created_at": "2026-09-22T14:00:00Z",
-            "user": {"login": "octocat"},
-            "body": genesis_body("Stable item", None, "active", event_id)
-        }]])
-        .to_string(),
-        "",
-    )?;
+    gh.respond(2, 0, &stable_comment, "")?;
     assert_success(&cli.run_with_fake_gh(&gh, ["--json", "list"])?)?;
 
     gh.respond(
@@ -617,14 +615,16 @@ fn unchanged_incremental_query_reuses_etag_and_accepts_not_modified() -> Result<
         "HTTP/2.0 200 OK\r\netag: \"stable-etag\"\r\n\r\n[]",
         "",
     )?;
+    gh.respond(4, 0, &stable_comment, "")?;
     assert_success(&cli.run_with_fake_gh(&gh, ["--json", "list"])?)?;
 
     gh.respond(
-        4,
+        5,
         0,
         "HTTP/2.0 304 Not Modified\r\netag: \"stable-etag\"\r\n\r\n",
         "",
     )?;
+    gh.respond(6, 0, &stable_comment, "")?;
     let unchanged = cli.run_with_fake_gh(&gh, ["--json", "list"])?;
     assert_success(&unchanged)?;
     assert_eq!(json_stdout(&unchanged)?[0]["id"], 41);
@@ -878,8 +878,15 @@ fn interrupted_cache_commit_rolls_back_items_history_and_cursor_then_retries() -
         "user": {"login": "octocat"},
         "body": genesis_body("New item", None, "blocked", second_event)
     });
+    let first_comment = json!({
+        "id": 9001,
+        "created_at": "2026-09-22T14:00:00Z",
+        "user": {"login": "octocat"},
+        "body": genesis_body("Existing item", None, "active", first_event)
+    });
     gh.respond(3, 0, &json!([[second_issue.clone()]]).to_string(), "")?;
-    gh.respond(4, 0, &json!([[second_comment.clone()]]).to_string(), "")?;
+    gh.respond(4, 0, &json!([[first_comment.clone()]]).to_string(), "")?;
+    gh.respond(5, 0, &json!([[second_comment.clone()]]).to_string(), "")?;
     let interrupted = cli.run_with_fake_gh(&gh, ["--json", "list"])?;
     assert!(!interrupted.status.success());
 
@@ -896,8 +903,9 @@ fn interrupted_cache_commit_rolls_back_items_history_and_cursor_then_retries() -
     connection.execute_batch("DROP TRIGGER interrupt_second_history;")?;
     drop(connection);
 
-    gh.respond(5, 0, &json!([[second_issue]]).to_string(), "")?;
-    gh.respond(6, 0, &json!([[second_comment]]).to_string(), "")?;
+    gh.respond(6, 0, &json!([[second_issue]]).to_string(), "")?;
+    gh.respond(7, 0, &json!([[first_comment]]).to_string(), "")?;
+    gh.respond(8, 0, &json!([[second_comment]]).to_string(), "")?;
     let retried = cli.run_with_fake_gh(&gh, ["--json", "list"])?;
     assert_success(&retried)?;
     assert_eq!(
@@ -966,8 +974,26 @@ fn github_lists_preserve_filters_limits_attention_order_and_viewer_local_day() -
             "",
         )?;
     }
-    for call in 6..=11 {
-        gh.respond(call, 0, "[[]]", "")?;
+    let mut next_call = 6;
+    for _ in 0..6 {
+        gh.respond(next_call, 0, "[[]]", "")?;
+        next_call += 1;
+        for (number, status, title, occurred_at, comment_id) in &statuses {
+            let event_id = format!("{number:08}-1111-4111-8111-111111111111");
+            gh.respond(
+                next_call,
+                0,
+                &json!([[{
+                    "id": comment_id,
+                    "created_at": occurred_at.to_rfc3339(),
+                    "user": {"login": "octocat"},
+                    "body": genesis_body(title, None, status, &event_id)
+                }]])
+                .to_string(),
+                "",
+            )?;
+            next_call += 1;
+        }
     }
 
     let daily = cli.run_with_fake_gh_and_tz(&gh, "Asia/Seoul", ["--json", "today"])?;

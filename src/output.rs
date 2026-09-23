@@ -4,7 +4,7 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::{
-    domain::{HistoryEntry, RejectedMutation, WorkItem},
+    domain::{HistoryEntry, IntegrityDoctorReport, RejectedMutation, WorkItem},
     github::{GitHubError, GitHubErrorKind},
     ledger::{ReadHealth, ReadHealthError, ReadHealthErrorKind, ReadHealthKind},
 };
@@ -154,6 +154,9 @@ pub fn print_item(item: &WorkItem) {
     println!("ID:          {}", item.id);
     println!("Status:      {}", item.status);
     println!("Title:       {}", item.title);
+    if item.ledger_integrity_error {
+        println!("Integrity:   Ledger Integrity Error");
+    }
     if let Some(description) = &item.description {
         println!("Description: {description}");
     }
@@ -252,7 +255,67 @@ pub fn print_history(entries: &[HistoryEntry]) {
         if let Some(history_hash) = &entry.history_hash {
             println!("  History hash: {history_hash}");
         }
+        println!("  Trust: {}", entry.trust.as_str());
     }
+}
+
+pub fn print_doctor_report(report: &IntegrityDoctorReport) {
+    println!("Work Item:   {}", report.work_item_id);
+    println!("Integrity health: {}", report.integrity_health.as_str());
+    println!("Archived:    {}", report.archived);
+    if let Some(first_break) = &report.first_break {
+        println!("First break: {:?}", first_break.kind);
+        if let Some(comment_id) = first_break.github_comment_id {
+            println!("  GitHub comment: {comment_id}");
+        }
+        if let Some(event_id) = &first_break.event_id {
+            println!("  Event: {event_id}");
+        }
+        if let Some(github_actor) = &first_break.github_actor {
+            println!("  GitHub Actor: {github_actor}");
+        }
+        println!(
+            "  Expected hash: {}",
+            first_break
+                .expected_hash
+                .as_deref()
+                .unwrap_or("unavailable")
+        );
+        println!(
+            "  Observed hash: {}",
+            first_break
+                .observed_hash
+                .as_deref()
+                .unwrap_or("unavailable")
+        );
+        println!(
+            "  Cached exact copy: {}",
+            first_break
+                .cached_exact_copy
+                .as_deref()
+                .unwrap_or("unavailable")
+        );
+        println!(
+            "  Observed copy: {}",
+            first_break
+                .observed_copy
+                .as_deref()
+                .unwrap_or("unavailable")
+        );
+        println!("  Detail: {}", first_break.detail);
+    }
+    println!(
+        "Evidence:    {} trusted, {} untrusted",
+        report.trusted_event_count, report.untrusted_event_count
+    );
+    let repair_modes = report
+        .eligible_repair_modes
+        .iter()
+        .map(|mode| mode.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("Timeline evidence: {}", json!(report.timeline_evidence));
+    println!("Repair modes: {repair_modes}");
 }
 
 pub fn print_rejected_mutations(rejected: &[RejectedMutation]) {

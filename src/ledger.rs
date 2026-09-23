@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 
 use crate::{
     db::SqliteLedger,
-    domain::{HistoryEntry, RejectedMutation, Status, WorkItem},
+    domain::{HistoryEntry, IntegrityDoctorReport, RejectedMutation, Status, WorkItem},
     github::{GitHubLedger, RepositoryName},
 };
 
@@ -158,7 +158,9 @@ impl ReadHealth {
             Self::Integrity {
                 last_successful_sync_at: None,
                 reason,
-                error_kind,
+                error_kind:
+                    error_kind @ (ReadHealthErrorKind::MetadataCollision
+                    | ReadHealthErrorKind::IncompatibleMetadata),
             } => Some(ReadHealthError {
                 kind: *error_kind,
                 message: reason.clone(),
@@ -258,6 +260,10 @@ pub trait Ledger: Send {
     fn history(&mut self, id: i64) -> Result<Vec<HistoryEntry>>;
 
     fn rejected_mutations(&mut self, id: i64) -> Result<Vec<RejectedMutation>>;
+
+    fn doctor(&mut self, _id: i64) -> Result<IntegrityDoctorReport> {
+        anyhow::bail!("doctor is available only for the GitHub ledger")
+    }
 
     fn take_projection_repairs(&mut self) -> Vec<i64> {
         Vec::new()

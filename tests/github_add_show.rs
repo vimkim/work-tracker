@@ -1,6 +1,7 @@
 mod support;
 
 use anyhow::{Context, Result, ensure};
+use rusqlite::Connection;
 use serde_json::Value;
 use support::{CliHarness, FakeGh, assert_success, stderr, stdout};
 
@@ -122,15 +123,31 @@ fn add_creates_a_github_work_item_and_show_reads_the_synchronized_cache() -> Res
     ensure!(calls.contains("\"pending_genesis_event_id\":null"));
     ensure!(calls.contains("\"genesis_comment_id\":9001"));
     ensure!(calls.contains("\"state_revision\":1"));
+    let connection = Connection::open(cli.github_cache_path("octocat", "work-tracker-data"))?;
+    let genesis_body: String = connection.query_row(
+        "SELECT body FROM github_event_evidence
+         WHERE work_item_id = 41 AND comment_id = 9001",
+        [],
+        |row| row.get(0),
+    )?;
+    let genesis_comment = serde_json::json!([[{
+        "id": 9001,
+        "created_at": "2026-09-23T01:02:04Z",
+        "user": {"login": "octocat"},
+        "body": genesis_body
+    }]])
+    .to_string();
 
     gh.respond(17, 0, "HTTP/2 304\n\n", "")?;
-    gh.respond(18, 0, "HTTP/2 304\n\n", "")?;
+    gh.respond(18, 0, &genesis_comment, "")?;
     let shown_human = cli.run_with_fake_gh(&gh, ["show", "41"])?;
     assert_success(&shown_human)?;
     ensure!(stdout(&shown_human)?.contains("ID:          41"));
     ensure!(stdout(&shown_human)?.contains("Status:      waiting"));
     ensure!(stdout(&shown_human)?.contains("Title:       Watch company CI"));
 
+    gh.respond(19, 0, "HTTP/2 304\n\n", "")?;
+    gh.respond(20, 0, &genesis_comment, "")?;
     let shown_json = cli.run_with_fake_gh(&gh, ["--json", "show", "41"])?;
     assert_success(&shown_json)?;
     assert_eq!(json(&shown_json)?, item);

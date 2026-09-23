@@ -57,6 +57,15 @@ GitHub writes are convergent. For `add`, `update`, `status`, `note`, and `archiv
 | Cache batch commit is interrupted | The item/history changes and synchronization cursor roll back together; the next synchronization replays the batch. |
 | A projection field is edited directly on GitHub | Synchronization repairs it and emits `github_projection_repaired`; unstructured comments are left untouched. |
 
+Structured event edits, deletions, unknown event schemas, and broken history heads are never repaired automatically. The affected Work Item remains inspectable with an integrity warning, trusted and untrusted History Entries are labelled, and every mutation of that item is refused before publication. Diagnose the first break without modifying GitHub:
+
+```bash
+work-tracker doctor 41
+work-tracker --json doctor 41
+```
+
+The report includes GitHub comment, event, and Actor identities; expected and observed hashes; any cached exact copy; relevant timeline evidence; and whether exact restoration or only an explicit Rebaseline is eligible.
+
 In `--json` mode, GitHub authentication, permission, validation, rate-limit, network, service, and unknown API failures have distinct error codes on standard error. Successful data remains on standard output, including when a warning is emitted.
 
 ### Local SQLite ledger
@@ -102,6 +111,7 @@ If neither is set, the CLI uses the current `USER`, then `unknown` as a last res
 | `note ID MESSAGE` | Preserve context without changing status |
 | `archive ID` | Permanently archive an item while retaining its history |
 | `history ID` | Show the complete immutable history |
+| `doctor ID` | Read-only diagnosis of a GitHub ledger integrity break |
 | `path` | Show the selected repository/cache or SQLite database path |
 | `serve` | Host the read-only dashboard |
 

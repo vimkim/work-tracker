@@ -9,12 +9,13 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     domain::{
-        HistoryEntry, RejectedMutation, Status, WorkItem, normalized_optional, normalized_required,
+        EvidenceTrust, HistoryEntry, IntegrityDoctorReport, RejectedMutation, Status, WorkItem,
+        normalized_optional, normalized_required,
     },
     ledger::{Ledger, ListFilter, ReadHealth, ReadPolicy},
 };
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 /// SQL list of the statuses that make a Work Item actionable. Keep in sync with
 /// `Status::is_actionable`.
@@ -52,6 +53,7 @@ impl SqliteLedger {
                 migrate_trusted_history(&connection)?;
                 migrate_github_freshness_state(&connection)?;
                 migrate_rejected_mutations(&connection)?;
+                migrate_integrity_evidence(&connection)?;
             }
             2 => {
                 migrate_github_creation_recovery(&connection)?;
@@ -59,23 +61,31 @@ impl SqliteLedger {
                 migrate_trusted_history(&connection)?;
                 migrate_github_freshness_state(&connection)?;
                 migrate_rejected_mutations(&connection)?;
+                migrate_integrity_evidence(&connection)?;
             }
             3 => {
                 migrate_github_sync_state(&connection)?;
                 migrate_trusted_history(&connection)?;
                 migrate_github_freshness_state(&connection)?;
                 migrate_rejected_mutations(&connection)?;
+                migrate_integrity_evidence(&connection)?;
             }
             4 => {
                 migrate_trusted_history(&connection)?;
                 migrate_github_freshness_state(&connection)?;
                 migrate_rejected_mutations(&connection)?;
+                migrate_integrity_evidence(&connection)?;
             }
             5 => {
                 migrate_legacy_schema_5(&connection)?;
                 migrate_rejected_mutations(&connection)?;
+                migrate_integrity_evidence(&connection)?;
             }
-            6 => migrate_rejected_mutations(&connection)?,
+            6 => {
+                migrate_rejected_mutations(&connection)?;
+                migrate_integrity_evidence(&connection)?;
+            }
+            7 => migrate_integrity_evidence(&connection)?,
             SCHEMA_VERSION => {}
             version => bail!("unsupported database schema version {version}"),
         }
@@ -240,7 +250,8 @@ impl SqliteLedger {
         self.connection
             .query_row(
                 "SELECT id, work_item_id, event_id, kind, actor, github_actor, note, occurred_at,
-                        changes_json, previous_history_hash, history_hash, state_revision
+                        changes_json, previous_history_hash, history_hash, state_revision,
+                        evidence_trust
                  FROM history_entries
                  WHERE work_item_id = ?1 AND kind = 'created' AND event_id IS NULL",
                 params![work_item_id],
@@ -250,11 +261,85 @@ impl SqliteLedger {
             .map_err(Into::into)
     }
 
+    pub(crate) fn github_event_evidence(
+        &self,
+        work_item_id: i64,
+    ) -> Result<Vec<GithubEventEvidence>> {
+        let mut statement = self.connection.prepare(
+            "SELECT comment_id, event_id, github_actor, body, history_hash
+             FROM github_event_evidence
+             WHERE work_item_id = ?1
+             ORDER BY comment_id",
+        )?;
+        let rows = statement.query_map(params![work_item_id], |row| {
+            Ok(GithubEventEvidence {
+                comment_id: row.get(0)?,
+                event_id: row.get(1)?,
+                github_actor: row.get(2)?,
+                body: row.get(3)?,
+                history_hash: row.get(4)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn github_cached_evidence_work_item_ids(&self) -> Result<Vec<i64>> {
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT work_item_id FROM github_event_evidence ORDER BY work_item_id",
+        )?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn github_integrity_report(
+        &self,
+        work_item_id: i64,
+    ) -> Result<Option<IntegrityDoctorReport>> {
+        let report: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT report_json FROM github_integrity_errors WHERE work_item_id = ?1",
+                params![work_item_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        report
+            .map(|report| serde_json::from_str(&report).context("invalid cached integrity report"))
+            .transpose()
+    }
+
+    pub(crate) fn first_github_integrity_report(&self) -> Result<Option<IntegrityDoctorReport>> {
+        let report: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT report_json FROM github_integrity_errors ORDER BY work_item_id LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        report
+            .map(|report| serde_json::from_str(&report).context("invalid cached integrity report"))
+            .transpose()
+    }
+
+    pub(crate) fn record_github_integrity(&self, report: &IntegrityDoctorReport) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO github_integrity_errors (work_item_id, report_json)
+             VALUES (?1, ?2)
+             ON CONFLICT(work_item_id) DO UPDATE SET report_json = excluded.report_json",
+            params![report.work_item_id, serde_json::to_string(report)?],
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn finish_github_creation(
         &mut self,
         request_json: &str,
         item: &WorkItem,
         history: &HistoryEntry,
+        evidence: &GithubEventEvidence,
     ) -> Result<()> {
         let transaction = self
             .connection
@@ -274,6 +359,7 @@ impl SqliteLedger {
             ],
         )?;
         insert_github_history_entry(&transaction, history)?;
+        insert_github_event_evidence(&transaction, item.id, evidence)?;
         transaction.execute(
             "DELETE FROM pending_github_creations WHERE request_json = ?1",
             params![request_json],
@@ -356,6 +442,16 @@ pub(crate) struct GithubCacheItem {
     pub item: WorkItem,
     pub history: Vec<HistoryEntry>,
     pub rejected: Vec<RejectedMutation>,
+    pub evidence: Vec<GithubEventEvidence>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GithubEventEvidence {
+    pub comment_id: i64,
+    pub event_id: Option<String>,
+    pub github_actor: String,
+    pub body: String,
+    pub history_hash: Option<String>,
 }
 
 pub(crate) struct GithubCacheCleanup<'a> {
@@ -399,6 +495,36 @@ fn replace_github_item_in_transaction(
         params![item.id],
     )?;
     insert_rejected_mutations(transaction, &cached.rejected)?;
+    if !cached.evidence.is_empty() {
+        transaction.execute(
+            "DELETE FROM github_event_evidence WHERE work_item_id = ?1",
+            params![item.id],
+        )?;
+        for evidence in &cached.evidence {
+            insert_github_event_evidence(transaction, item.id, evidence)?;
+        }
+    }
+    Ok(())
+}
+
+fn insert_github_event_evidence(
+    transaction: &Transaction<'_>,
+    work_item_id: i64,
+    evidence: &GithubEventEvidence,
+) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO github_event_evidence
+         (work_item_id, comment_id, event_id, github_actor, body, history_hash)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            work_item_id,
+            evidence.comment_id,
+            evidence.event_id,
+            evidence.github_actor,
+            evidence.body,
+            evidence.history_hash,
+        ],
+    )?;
     Ok(())
 }
 
@@ -440,8 +566,8 @@ fn insert_github_history_entry(transaction: &Transaction<'_>, entry: &HistoryEnt
     transaction.execute(
         "INSERT INTO history_entries
          (id, work_item_id, event_id, kind, actor, github_actor, note, occurred_at,
-          changes_json, previous_history_hash, history_hash, state_revision)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+          changes_json, previous_history_hash, history_hash, state_revision, evidence_trust)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             entry.id,
             entry.work_item_id,
@@ -455,6 +581,10 @@ fn insert_github_history_entry(transaction: &Transaction<'_>, entry: &HistoryEnt
             entry.previous_history_hash,
             entry.history_hash,
             entry.state_revision,
+            match entry.trust {
+                EvidenceTrust::Trusted => "trusted",
+                EvidenceTrust::Untrusted => "untrusted",
+            },
         ],
     )?;
     Ok(())
@@ -499,6 +629,7 @@ fn create_schema(connection: &Connection) -> Result<()> {
                 previous_history_hash TEXT,
                 history_hash  TEXT,
                 state_revision INTEGER
+                ,evidence_trust TEXT NOT NULL DEFAULT 'trusted'
             );
 
             CREATE INDEX IF NOT EXISTS idx_work_items_status_updated
@@ -534,7 +665,22 @@ fn create_schema(connection: &Connection) -> Result<()> {
             CREATE INDEX IF NOT EXISTS idx_rejected_work_item
                 ON rejected_mutations(work_item_id, id);
 
-            PRAGMA user_version = 7;
+            CREATE TABLE IF NOT EXISTS github_event_evidence (
+                work_item_id INTEGER NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+                comment_id   INTEGER NOT NULL,
+                event_id     TEXT,
+                github_actor TEXT NOT NULL,
+                body         TEXT NOT NULL,
+                history_hash TEXT,
+                PRIMARY KEY (work_item_id, comment_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS github_integrity_errors (
+                work_item_id INTEGER PRIMARY KEY REFERENCES work_items(id) ON DELETE CASCADE,
+                report_json  TEXT NOT NULL
+            );
+
+            PRAGMA user_version = 8;
             ",
     )?;
     Ok(())
@@ -770,6 +916,42 @@ fn migrate_rejected_mutations(connection: &Connection) -> Result<()> {
          UPDATE github_cache_state
          SET sync_cursor = NULL, etag = NULL, last_successful_sync_at = NULL;
          PRAGMA user_version = 7;
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
+fn migrate_integrity_evidence(connection: &Connection) -> Result<()> {
+    connection.execute_batch("BEGIN IMMEDIATE;")?;
+    let locked_version: i64 =
+        connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if locked_version >= 8 {
+        connection.execute_batch("COMMIT;")?;
+        return Ok(());
+    }
+    if locked_version != 7 {
+        connection.execute_batch("ROLLBACK;")?;
+        bail!("cannot migrate database schema version {locked_version}");
+    }
+    connection.execute_batch(
+        "CREATE TABLE github_event_evidence (
+             work_item_id INTEGER NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+             comment_id   INTEGER NOT NULL,
+             event_id     TEXT,
+             github_actor TEXT NOT NULL,
+             body         TEXT NOT NULL,
+             history_hash TEXT,
+             PRIMARY KEY (work_item_id, comment_id)
+         );
+         CREATE TABLE github_integrity_errors (
+             work_item_id INTEGER PRIMARY KEY REFERENCES work_items(id) ON DELETE CASCADE,
+             report_json  TEXT NOT NULL
+         );
+         ALTER TABLE history_entries
+         ADD COLUMN evidence_trust TEXT NOT NULL DEFAULT 'trusted';
+         UPDATE github_cache_state
+         SET sync_cursor = NULL, etag = NULL, last_successful_sync_at = NULL;
+         PRAGMA user_version = 8;
          COMMIT;",
     )?;
     Ok(())
@@ -1030,7 +1212,8 @@ impl Ledger for SqliteLedger {
         self.get(id)?;
         let mut statement = self.connection.prepare(
             "SELECT id, work_item_id, event_id, kind, actor, github_actor, note, occurred_at,
-                    changes_json, previous_history_hash, history_hash, state_revision
+                    changes_json, previous_history_hash, history_hash, state_revision,
+                    evidence_trust
              FROM history_entries
              WHERE work_item_id = ?1
              ORDER BY id",
@@ -1151,6 +1334,7 @@ fn row_to_item(row: &Row<'_>) -> rusqlite::Result<WorkItem> {
         archived_at: optional_datetime_column(row, 6)?,
         deleted_at: optional_datetime_column(row, 6)?,
         purge_after: None,
+        ledger_integrity_error: false,
     })
 }
 
@@ -1189,6 +1373,19 @@ fn row_to_history(row: &Row<'_>) -> rusqlite::Result<HistoryEntry> {
         previous_history_hash: row.get(9)?,
         history_hash: row.get(10)?,
         state_revision: row.get(11)?,
+        trust: match row.get::<_, String>(12)?.as_str() {
+            "trusted" => EvidenceTrust::Trusted,
+            "untrusted" => EvidenceTrust::Untrusted,
+            value => {
+                return Err(conversion_error(
+                    12,
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("invalid evidence trust {value}"),
+                    ),
+                ));
+            }
+        },
     })
 }
 
@@ -1393,6 +1590,68 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(columns, 4);
+        let state: (Option<String>, Option<String>, Option<String>) = connection.query_row(
+            "SELECT sync_cursor, etag, last_successful_sync_at FROM github_cache_state",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(state, (None, None, None));
+        Ok(())
+    }
+
+    #[test]
+    fn schema_7_adds_integrity_evidence_and_preserves_history_as_trusted() -> Result<()> {
+        let connection = Connection::open_in_memory()?;
+        connection.execute_batch(
+            "CREATE TABLE work_items (id INTEGER PRIMARY KEY);
+             CREATE TABLE history_entries (
+                 id INTEGER PRIMARY KEY,
+                 work_item_id INTEGER NOT NULL,
+                 kind TEXT NOT NULL,
+                 actor TEXT NOT NULL,
+                 note TEXT,
+                 occurred_at TEXT NOT NULL,
+                 changes_json TEXT NOT NULL,
+                 event_id TEXT,
+                 github_actor TEXT,
+                 previous_history_hash TEXT,
+                 history_hash TEXT,
+                 state_revision INTEGER
+             );
+             INSERT INTO history_entries
+                 (id, work_item_id, kind, actor, occurred_at, changes_json)
+             VALUES (9001, 41, 'created', 'agent-a',
+                     '2026-09-23T00:00:00Z', '{}');
+             CREATE TABLE github_cache_state (
+                 repository TEXT PRIMARY KEY,
+                 sync_cursor TEXT,
+                 etag TEXT,
+                 last_successful_sync_at TEXT
+             );
+             INSERT INTO github_cache_state VALUES
+                 ('octocat/work-tracker-data', 'cursor-7', 'etag-7',
+                  '2026-09-23T00:00:00Z');
+             PRAGMA user_version = 7;",
+        )?;
+
+        migrate_integrity_evidence(&connection)?;
+
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        assert_eq!(version, 8);
+        let trust: String = connection.query_row(
+            "SELECT evidence_trust FROM history_entries WHERE id = 9001",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(trust, "trusted");
+        let tables: i64 = connection.query_row(
+            "SELECT count(*) FROM sqlite_master
+             WHERE type = 'table'
+               AND name IN ('github_event_evidence', 'github_integrity_errors')",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(tables, 2);
         let state: (Option<String>, Option<String>, Option<String>) = connection.query_row(
             "SELECT sync_cursor, etag, last_successful_sync_at FROM github_cache_state",
             [],

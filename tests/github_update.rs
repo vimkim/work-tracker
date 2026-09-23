@@ -1,6 +1,7 @@
 mod support;
 
 use anyhow::{Context, Result, ensure};
+use rusqlite::Connection;
 use serde_json::Value;
 use support::{CliHarness, FakeGh, assert_success, stderr};
 
@@ -255,6 +256,15 @@ fn accepted_field_update_advances_revision_once_and_records_exact_changes() -> R
         history[0]["history_hash"]
     );
     ensure!(history[1]["history_hash"] != history[0]["history_hash"]);
+    let connection = Connection::open(cache)?;
+    let exact_update: String = connection.query_row(
+        "SELECT body FROM github_event_evidence
+         WHERE work_item_id = 41 AND comment_id = 9002",
+        [],
+        |row| row.get(0),
+    )?;
+    ensure!(exact_update.contains("\"kind\":\"updated\""));
+    ensure!(exact_update.contains("Work Tracker Mutation Proposal: updated by agent-b"));
     Ok(())
 }
 

@@ -80,6 +80,7 @@ async fn run(cli: Cli) -> Result<()> {
                 | Command::Archive(_)
                 | Command::History(_)
                 | Command::Rejected(_)
+                | Command::Doctor(_)
         )
     {
         anyhow::bail!("the GitHub ledger does not support this mutation yet");
@@ -201,6 +202,15 @@ async fn run(cli: Cli) -> Result<()> {
                 output::print_json(&rejected)
             } else {
                 output::print_rejected_mutations(&rejected);
+                Ok(())
+            }
+        }
+        Command::Doctor(args) => {
+            let report = ledger.doctor(args.id)?;
+            if cli.json {
+                output::print_json(&report)
+            } else {
+                output::print_doctor_report(&report);
                 Ok(())
             }
         }

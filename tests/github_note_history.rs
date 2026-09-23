@@ -1,6 +1,8 @@
 mod support;
 
 use anyhow::{Context, Result, ensure};
+use rusqlite::Connection;
+use serde::Serialize;
 use serde_json::Value;
 use support::{CliHarness, FakeGh, assert_success, stderr, stdout};
 
@@ -86,18 +88,30 @@ fn create_item(cli: &CliHarness, gh: &FakeGh) -> Result<(String, String)> {
     Ok((projection, genesis))
 }
 
+#[derive(Serialize)]
+struct NoteEvent<'a> {
+    schema_version: u32,
+    event_id: &'a str,
+    kind: &'a str,
+    actor: &'a str,
+    github_actor: &'a str,
+    note: &'a str,
+    changes: Value,
+}
+
 fn note_comment(event_id: &str, actor: &str, github_actor: &str, note: &str) -> String {
+    let event = NoteEvent {
+        schema_version: 1,
+        event_id,
+        kind: "noted",
+        actor,
+        github_actor,
+        note,
+        changes: serde_json::json!({}),
+    };
     format!(
-        "Work Tracker History Entry: noted by {actor}\n\n<!-- work-tracker:event\n{}\n-->",
-        serde_json::json!({
-            "schema_version": 1,
-            "event_id": event_id,
-            "kind": "noted",
-            "actor": actor,
-            "github_actor": github_actor,
-            "note": note,
-            "changes": {}
-        })
+        "Work Tracker History Entry: noted by {actor}\n\nNote: {note}\n\n<!-- work-tracker:event\n{}\n-->",
+        serde_json::to_string(&event).expect("note event fixture must serialize")
     )
 }
 
@@ -239,6 +253,15 @@ fn note_publishes_one_canonical_event_and_returns_trusted_attribution() -> Resul
     ensure!(calls.contains("\"state_revision\":1"));
     ensure!(calls.contains("\"head_comment_id\":9002"));
     ensure!(calls.contains("\"history_hash\":"));
+    let connection = Connection::open(cli.github_cache_path("octocat", "work-tracker-data"))?;
+    let exact_note: String = connection.query_row(
+        "SELECT body FROM github_event_evidence
+         WHERE work_item_id = 41 AND comment_id = 9002",
+        [],
+        |row| row.get(0),
+    )?;
+    ensure!(exact_note.contains("\"event_id\":\"note-fixed-1\""));
+    ensure!(exact_note.contains("Work Tracker History Entry: noted by agent-b"));
     Ok(())
 }
 
@@ -395,6 +418,16 @@ fn history_replays_github_comment_order_ignores_discussion_and_populates_the_cac
     ])?;
     assert_success(&cached)?;
     assert_eq!(json(&cached)?, Value::Array(expected.clone()));
+    let connection = Connection::open(&cache)?;
+    let integrity_report: Option<String> = connection.query_row(
+        "SELECT max(report_json) FROM github_integrity_errors",
+        [],
+        |row| row.get(0),
+    )?;
+    ensure!(
+        integrity_report.is_none(),
+        "healthy history retained integrity report: {integrity_report:?}"
+    );
 
     let offline_gh = FakeGh::new()?;
     let offline = cli.run_with_fake_gh(&offline_gh, ["--json", "--offline", "history", "41"])?;
@@ -497,7 +530,7 @@ fn concurrent_notes_are_both_accepted_in_comment_order_without_advancing_state_r
 }
 
 #[test]
-fn unknown_event_schema_is_reported_and_never_cached_as_history() -> Result<()> {
+fn unknown_event_schema_warns_and_never_replaces_trusted_cached_history() -> Result<()> {
     let cli = CliHarness::new()?;
     let gh = FakeGh::new()?;
     initialize(&cli, &gh)?;
@@ -547,13 +580,19 @@ fn unknown_event_schema_is_reported_and_never_cached_as_history() -> Result<()> 
         "",
     )?;
 
-    let failed = cli.run_with_fake_gh(&gh, ["--json", "history", "41"])?;
-    ensure!(!failed.status.success());
-    assert_eq!(failed.stdout, b"");
-    let diagnostic: Value = serde_json::from_slice(&failed.stderr)?;
-    assert_eq!(diagnostic["error"]["code"], "github_unknown_event_schema");
+    let inspected = cli.run_with_fake_gh(&gh, ["--json", "history", "41"])?;
+    assert_success(&inspected)?;
+    assert_eq!(
+        json(&inspected)?
+            .as_array()
+            .context("history was not an array")?
+            .len(),
+        1
+    );
+    let diagnostic: Value = serde_json::from_slice(&inspected.stderr)?;
+    assert_eq!(diagnostic["warning"]["code"], "ledger_integrity");
     ensure!(
-        diagnostic["error"]["message"]
+        diagnostic["warning"]["message"]
             .as_str()
             .context("missing error message")?
             .contains("99")
