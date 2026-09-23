@@ -3,7 +3,7 @@ use std::{cell::RefCell, collections::HashMap, fmt, path::Path, process::Command
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -183,6 +183,7 @@ enum GhFailureKind {
 pub struct GitHubError {
     code: &'static str,
     message: String,
+    details: Option<Value>,
 }
 
 impl GitHubError {
@@ -194,7 +195,17 @@ impl GitHubError {
         Self {
             code,
             message: message.into(),
+            details: None,
         }
+    }
+
+    fn with_details(mut self, details: Value) -> Self {
+        self.details = Some(details);
+        self
+    }
+
+    pub fn details(&self) -> Option<&Value> {
+        self.details.as_ref()
     }
 }
 
@@ -261,6 +272,8 @@ struct CanonicalEvent {
     github_actor: String,
     note: Option<String>,
     changes: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_state_revision: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -287,6 +300,8 @@ struct GenesisValues {
 #[derive(Debug, Clone, Deserialize)]
 struct LedgerIssue {
     number: i64,
+    #[serde(default)]
+    title: Option<String>,
     #[serde(default)]
     body: String,
     #[serde(default)]
@@ -426,6 +441,7 @@ impl GitHubLedger {
                 "description": description.clone(),
                 "status": status,
             }),
+            expected_state_revision: None,
         };
         let comment = if retrying {
             self.find_genesis_comment(issue.number, &event)?
@@ -597,6 +613,8 @@ impl GitHubLedger {
                 legacy_genesis.as_ref(),
             )?;
             let item = materialize_item(issue.number, &history)?;
+            let projection_needs_update =
+                projection_needs_update || readable_projection_differs(&issue, &item)?;
             validate_status_label(&issue, item.status)?;
             if projection_needs_update {
                 projection_updates.push((issue, metadata, history.clone()));
@@ -821,13 +839,147 @@ impl GitHubLedger {
         metadata.head_event_id = head.event_id.clone();
         metadata.head_comment_id = Some(head.id);
         metadata.history_hash = head.history_hash.clone();
-        let visible = projection_visible_text(&issue.body)?;
-        let body = projection_body(Some(visible), &metadata)?;
+        metadata.state_revision = head
+            .state_revision
+            .context("Work Tracker history head omitted State Revision")?;
+        let item = materialize_item(issue.number, history)?;
+        let body = projection_body(item.description.as_deref(), &metadata)?;
         self.github.api_empty(
             "PATCH",
             &format!("repos/{}/issues/{}", self.repository, issue.number),
-            &[("body", body.as_str())],
+            &[("title", item.title.as_str()), ("body", body.as_str())],
         )
+    }
+
+    fn update_fields(
+        &mut self,
+        issue_number: i64,
+        title: Option<&str>,
+        description: Option<Option<&str>>,
+        actor: &str,
+        note: Option<&str>,
+        requested_event_id: Option<&str>,
+    ) -> Result<WorkItem> {
+        let actor = normalized_required(actor, "actor")?;
+        let note = normalized_optional(note);
+        let (issue, metadata) = self.load_work_item_issue(issue_number)?;
+        let comments = self.load_comments(issue_number)?;
+        let history = replay_trusted_history(issue_number, &comments)?;
+        let legacy_genesis = self.cache.legacy_github_genesis_evidence(issue_number)?;
+        let projection_needs_update = projection_head_needs_update(
+            issue_number,
+            &metadata,
+            &history,
+            legacy_genesis.as_ref(),
+        )?;
+        let current = materialize_item(issue_number, &history)?;
+        if current.status == Status::Archived {
+            bail!("work item {issue_number} is archived and cannot be modified");
+        }
+        let new_title = match title {
+            Some(value) => normalized_required(value, "title")?,
+            None => current.title.clone(),
+        };
+        let new_description = match description {
+            Some(value) => normalized_optional(value),
+            None => current.description.clone(),
+        };
+        let mut changes = Map::new();
+        if new_title != current.title {
+            changes.insert(
+                "title".to_owned(),
+                json!({"from": current.title, "to": new_title}),
+            );
+        }
+        if new_description != current.description {
+            changes.insert(
+                "description".to_owned(),
+                json!({"from": current.description, "to": new_description}),
+            );
+        }
+        if changes.is_empty() {
+            if projection_needs_update || readable_projection_differs(&issue, &current)? {
+                self.project_history_head(&issue, metadata, &history)?;
+            }
+            self.cache.replace_github_item(&current, &history)?;
+            return Ok(current);
+        }
+
+        let event_id = requested_event_id
+            .map(|value| normalized_required(value, "event ID"))
+            .transpose()?
+            .unwrap_or_else(|| new_event_id("update"));
+        let github_actor = self.github.authenticated_user()?;
+        let expected_state_revision = history
+            .last()
+            .and_then(|entry| entry.state_revision)
+            .context("Work Tracker history head omitted State Revision")?;
+        let event = CanonicalEvent {
+            schema_version: 1,
+            event_id: event_id.clone(),
+            kind: "updated".to_owned(),
+            actor,
+            github_actor,
+            note,
+            changes: Value::Object(changes),
+            expected_state_revision: Some(expected_state_revision),
+        };
+        let body = event_comment_body(&event)?;
+        let comment: LedgerComment = self.github.api_json(
+            "POST",
+            &format!("repos/{}/issues/{issue_number}/comments", self.repository),
+            &[("body", body.as_str())],
+        )?;
+        if comment.user.login != event.github_actor {
+            return Err(metadata_collision(issue_number).into());
+        }
+        let comments = self.load_comments(issue_number)?;
+        let history = replay_trusted_history(issue_number, &comments)?;
+        let entry = history
+            .iter()
+            .find(|entry| entry.event_id.as_deref() == Some(event_id.as_str()))
+            .cloned();
+        let proposal_confirmed = comments.iter().any(|comment| {
+            has_metadata(&comment.body, EVENT_MARKER)
+                && parse_event(&comment.body).is_ok_and(|candidate| candidate == event)
+                && comment.user.login == event.github_actor
+        });
+        if !proposal_confirmed {
+            bail!("published update was not confirmed from GitHub");
+        }
+        let item = materialize_item(issue_number, &history)?;
+        self.project_history_head(&issue, metadata, &history)?;
+        self.cache.replace_github_item(&item, &history)?;
+        if let Some(entry) = entry {
+            validate_retry(&entry, &event)?;
+            return Ok(item);
+        }
+        let current_revision = history
+            .last()
+            .and_then(|entry| entry.state_revision)
+            .context("Work Tracker history head omitted State Revision")?;
+        Err(GitHubError::new(
+            "github_state_conflict",
+            format!(
+                "Rejected Mutation for work item {issue_number}: expected State Revision {expected_state_revision}, current State Revision is {current_revision}; current values are title={:?}, description={:?}, Status={}; refresh current values and retry only by submitting a new proposal",
+                item.title,
+                item.description,
+                item.status,
+            ),
+        )
+        .with_details(json!({
+            "kind": "rejected_mutation",
+            "event_id": event_id,
+            "expected_state_revision": expected_state_revision,
+            "current_state_revision": current_revision,
+            "current_values": {
+                "title": item.title,
+                "description": item.description,
+                "status": item.status,
+            },
+            "instruction": "refresh current values, decide whether the change is still appropriate, and retry with a new proposal",
+        }))
+        .into())
     }
 
     fn append_note(
@@ -860,6 +1012,7 @@ impl GitHubLedger {
             github_actor,
             note: Some(message),
             changes: json!({}),
+            expected_state_revision: None,
         };
         if let Some(existing) = history
             .iter()
@@ -927,13 +1080,14 @@ impl Ledger for GitHubLedger {
 
     fn update(
         &mut self,
-        _id: i64,
-        _title: Option<&str>,
-        _description: Option<Option<&str>>,
-        _actor: &str,
-        _note: Option<&str>,
+        id: i64,
+        title: Option<&str>,
+        description: Option<Option<&str>>,
+        actor: &str,
+        note: Option<&str>,
+        event_id: Option<&str>,
     ) -> Result<WorkItem> {
-        bail!("GitHub-backed update is not implemented yet")
+        self.update_fields(id, title, description, actor, note, event_id)
     }
 
     fn set_status(
@@ -1453,6 +1607,7 @@ fn parse_event(body: &str) -> Result<CanonicalEvent> {
             "description": legacy.initial_values.description,
             "status": legacy.initial_values.status,
         }),
+        expected_state_revision: None,
     })
 }
 
@@ -1460,8 +1615,32 @@ fn materialize_item(issue_number: i64, history: &[HistoryEntry]) -> Result<WorkI
     let genesis = history
         .first()
         .context("Work Tracker history has no genesis entry")?;
-    let values: GenesisValues =
+    let mut values: GenesisValues =
         serde_json::from_value(genesis.changes.clone()).context("invalid genesis changes")?;
+    for entry in &history[1..] {
+        if entry.kind != "updated" {
+            continue;
+        }
+        let changes = entry
+            .changes
+            .as_object()
+            .context("invalid updated changes")?;
+        if let Some(change) = changes.get("title") {
+            values.title = change
+                .get("to")
+                .and_then(Value::as_str)
+                .context("invalid updated title")?
+                .to_owned();
+        }
+        if let Some(change) = changes.get("description") {
+            values.description = serde_json::from_value(
+                change
+                    .get("to")
+                    .cloned()
+                    .context("invalid updated description")?,
+            )?;
+        }
+    }
     let updated_at = history
         .last()
         .map(|entry| entry.occurred_at)
@@ -1503,8 +1682,13 @@ fn event_comment_body(event: &CanonicalEvent) -> Result<String> {
         .as_deref()
         .map(|note| format!("\n\nNote: {note}"))
         .unwrap_or_default();
+    let record_type = if event.expected_state_revision.is_some() {
+        "Mutation Proposal"
+    } else {
+        "History Entry"
+    };
     Ok(format!(
-        "Work Tracker History Entry: {} by {}{note}\n\n<!-- {EVENT_MARKER}\n{}\n-->",
+        "Work Tracker {record_type}: {} by {}{note}\n\n<!-- {EVENT_MARKER}\n{}\n-->",
         event.kind,
         event.actor,
         serde_json::to_string(event)?
@@ -1534,7 +1718,7 @@ fn replay_history(issue_number: i64, comments: &[LedgerComment]) -> Result<Vec<H
     let mut comments = comments.to_vec();
     comments.sort_by_key(|comment| comment.id);
     let mut history = Vec::new();
-    let mut accepted = HashMap::<String, CanonicalEvent>::new();
+    let mut seen = HashMap::<String, CanonicalEvent>::new();
     let mut previous_hash: Option<String> = None;
     let mut state_revision = 0_u64;
     for comment in comments {
@@ -1545,7 +1729,7 @@ fn replay_history(issue_number: i64, comments: &[LedgerComment]) -> Result<Vec<H
         if event.github_actor != comment.user.login {
             return Err(metadata_collision(issue_number).into());
         }
-        if let Some(prior) = accepted.get(&event.event_id) {
+        if let Some(prior) = seen.get(&event.event_id) {
             if prior == &event {
                 continue;
             }
@@ -1553,15 +1737,33 @@ fn replay_history(issue_number: i64, comments: &[LedgerComment]) -> Result<Vec<H
         }
         match event.kind.as_str() {
             "created" if history.is_empty() => {
-                if !event.changes.is_object() {
+                if !event.changes.is_object() || event.expected_state_revision.is_some() {
                     return Err(metadata_collision(issue_number).into());
                 }
                 state_revision = 1;
             }
             "noted" if !history.is_empty() => {
-                if event.note.is_none() || event.changes != json!({}) {
+                if event.note.is_none()
+                    || event.changes != json!({})
+                    || event.expected_state_revision.is_some()
+                {
                     return Err(metadata_collision(issue_number).into());
                 }
+            }
+            "updated" if !history.is_empty() => {
+                let expected = event
+                    .expected_state_revision
+                    .context("Work Tracker updated proposal omitted expected State Revision")?;
+                let expected_item = materialize_at_revision(issue_number, &history, expected)
+                    .ok_or_else(|| metadata_collision(issue_number))?;
+                if !valid_field_changes(&event.changes, &expected_item) {
+                    return Err(metadata_collision(issue_number).into());
+                }
+                seen.insert(event.event_id.clone(), event.clone());
+                if expected != state_revision {
+                    continue;
+                }
+                state_revision += 1;
             }
             _ => return Err(metadata_collision(issue_number).into()),
         }
@@ -1581,12 +1783,62 @@ fn replay_history(issue_number: i64, comments: &[LedgerComment]) -> Result<Vec<H
             state_revision: Some(state_revision),
         });
         previous_hash = Some(current_hash);
-        accepted.insert(event.event_id.clone(), event);
+        seen.insert(event.event_id.clone(), event);
     }
     if history.first().is_none_or(|entry| entry.kind != "created") {
         return Err(metadata_collision(issue_number).into());
     }
     Ok(history)
+}
+
+fn valid_field_changes(changes: &Value, item: &WorkItem) -> bool {
+    let Some(changes) = changes.as_object() else {
+        return false;
+    };
+    !changes.is_empty()
+        && changes.iter().all(|(field, change)| {
+            let Some(change) = change.as_object().filter(|change| change.len() == 2) else {
+                return false;
+            };
+            let (Some(from), Some(to)) = (change.get("from"), change.get("to")) else {
+                return false;
+            };
+            if from == to {
+                return false;
+            }
+            match field.as_str() {
+                "title" => {
+                    from == &json!(item.title)
+                        && to
+                            .as_str()
+                            .is_some_and(|title| !title.is_empty() && title.trim() == title)
+                }
+                "description" => {
+                    from == &json!(item.description)
+                        && (to.is_null()
+                            || to.as_str().is_some_and(|description| {
+                                !description.is_empty() && description.trim() == description
+                            }))
+                }
+                _ => false,
+            }
+        })
+}
+
+fn materialize_at_revision(
+    issue_number: i64,
+    history: &[HistoryEntry],
+    revision: u64,
+) -> Option<WorkItem> {
+    let entries = history
+        .iter()
+        .take_while(|entry| entry.state_revision.is_some_and(|value| value <= revision))
+        .cloned()
+        .collect::<Vec<_>>();
+    entries
+        .last()
+        .filter(|entry| entry.state_revision == Some(revision))?;
+    materialize_item(issue_number, &entries).ok()
 }
 
 fn replay_trusted_history(
@@ -1710,6 +1962,19 @@ fn projection_visible_text(body: &str) -> Result<&str> {
     body.rfind(&marker)
         .map(|index| &body[..index])
         .context("missing Work Tracker projection metadata")
+}
+
+fn readable_projection_differs(issue: &LedgerIssue, item: &WorkItem) -> Result<bool> {
+    let visible_description = projection_visible_text(&issue.body)?;
+    let description_differs = match item.description.as_deref() {
+        Some(expected) => visible_description != expected,
+        None => !matches!(visible_description, "" | "_No description provided._"),
+    };
+    Ok(issue
+        .title
+        .as_deref()
+        .is_some_and(|title| title != item.title)
+        || description_differs)
 }
 
 fn validate_completed_issue(issue: &LedgerIssue) -> Result<ProjectionMetadata> {
@@ -1861,6 +2126,7 @@ mod tests {
             github_actor: "octocat".to_owned(),
             note: Some("known".to_owned()),
             changes: json!({}),
+            expected_state_revision: None,
         };
 
         assert_eq!(

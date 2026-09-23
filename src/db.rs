@@ -307,6 +307,44 @@ impl SqliteLedger {
         transaction.commit()?;
         Ok(())
     }
+
+    pub(crate) fn replace_github_item(
+        &mut self,
+        item: &WorkItem,
+        history: &[HistoryEntry],
+    ) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO work_items
+             (id, title, description, status, created_at, updated_at, archived_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(id) DO UPDATE SET
+               title = excluded.title,
+               description = excluded.description,
+               status = excluded.status,
+               created_at = excluded.created_at,
+               updated_at = excluded.updated_at,
+               archived_at = excluded.archived_at",
+            params![
+                item.id,
+                item.title,
+                item.description,
+                item.status.as_str(),
+                timestamp(item.created_at),
+                timestamp(item.updated_at),
+                item.archived_at.map(timestamp),
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM history_entries WHERE work_item_id = ?1",
+            params![item.id],
+        )?;
+        insert_github_history(&transaction, history)?;
+        transaction.commit()?;
+        Ok(())
+    }
 }
 
 fn insert_github_history(transaction: &Transaction<'_>, history: &[HistoryEntry]) -> Result<()> {
@@ -643,6 +681,7 @@ impl Ledger for SqliteLedger {
         description: Option<Option<&str>>,
         actor: &str,
         note: Option<&str>,
+        _event_id: Option<&str>,
     ) -> Result<WorkItem> {
         let actor = normalized_required(actor, "actor")?;
         let transaction = self
@@ -1067,12 +1106,14 @@ mod tests {
             Some(Some("details")),
             "agent-a",
             Some("clarified"),
+            None,
         )?;
         tracker.update(
             item.id,
             Some("Changed"),
             Some(Some("details")),
             "agent-b",
+            None,
             None,
         )?;
 

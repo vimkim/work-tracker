@@ -22,10 +22,17 @@ async fn main() -> ExitCode {
         Err(error) => {
             if json_output {
                 if let Some(github_error) = error.downcast_ref::<GitHubError>() {
-                    eprintln!(
-                        "{}",
-                        json!({"error": {"code": github_error.code(), "message": format!("{error:#}")}})
-                    );
+                    let mut diagnostic = json!({
+                        "code": github_error.code(),
+                        "message": format!("{error:#}"),
+                    });
+                    if let (Some(target), Some(details)) =
+                        (diagnostic.as_object_mut(), github_error.details())
+                        && let Some(details) = details.as_object()
+                    {
+                        target.extend(details.clone());
+                    }
+                    eprintln!("{}", json!({"error": diagnostic}));
                 } else {
                     eprintln!("{}", json!({"error": format!("{error:#}")}));
                 }
@@ -78,6 +85,7 @@ async fn run(cli: Cli) -> Result<()> {
                 | Command::Show(_)
                 | Command::List(_)
                 | Command::Today(_)
+                | Command::Update(_)
                 | Command::Note(_)
                 | Command::History(_)
         )
@@ -131,6 +139,7 @@ async fn run(cli: Cli) -> Result<()> {
                 description,
                 &args.actor.resolved(),
                 args.note.as_deref(),
+                args.event_id.as_deref(),
             )?;
             show_item(&item, cli.json)
         }

@@ -51,6 +51,7 @@ pub trait Ledger: Send {
         description: Option<Option<&str>>,
         actor: &str,
         note: Option<&str>,
+        event_id: Option<&str>,
     ) -> Result<WorkItem>;
 
     fn set_status(

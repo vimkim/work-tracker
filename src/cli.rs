@@ -175,6 +175,10 @@ pub struct UpdateArgs {
     #[arg(long)]
     pub note: Option<String>,
 
+    /// Stable GitHub mutation identity for safely retrying uncertain publication.
+    #[arg(long)]
+    pub event_id: Option<String>,
+
     #[command(flatten)]
     pub actor: ActorArgs,
 }
