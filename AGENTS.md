@@ -39,3 +39,17 @@ Work Tracker preserves the current status and context of long-running work acros
 - `just release` — build an optimized binary.
 - `just install` / `just uninstall` — manage the current-user installation.
 - `just serve` — run the localhost dashboard with the default database.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs are tracked in GitHub Issues for `vimkim/work-tracker`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the five canonical triage labels. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+This is a single-context repository with `CONTEXT.md` and `docs/adr/` at the root. See `docs/agents/domain.md`.
