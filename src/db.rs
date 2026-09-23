@@ -12,7 +12,7 @@ use crate::{
     ledger::{Ledger, ListFilter},
 };
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// SQL list of the statuses that make a Work Item actionable. Keep in sync with
 /// `Status::is_actionable`.
@@ -46,8 +46,13 @@ impl SqliteLedger {
             1 => {
                 migrate_deleted_items_to_archived(&connection)?;
                 migrate_github_creation_recovery(&connection)?;
+                migrate_github_sync_state(&connection)?;
             }
-            2 => migrate_github_creation_recovery(&connection)?,
+            2 => {
+                migrate_github_creation_recovery(&connection)?;
+                migrate_github_sync_state(&connection)?;
+            }
+            3 => migrate_github_sync_state(&connection)?,
             SCHEMA_VERSION => {}
             version => bail!("unsupported database schema version {version}"),
         }
@@ -124,6 +129,37 @@ impl SqliteLedger {
         Ok(())
     }
 
+    pub(crate) fn github_sync_cursor(&self, repository: &str) -> Result<Option<DateTime<Utc>>> {
+        let value: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT sync_cursor FROM github_cache_state WHERE repository = ?1",
+                params![repository],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        value
+            .map(|value| {
+                DateTime::parse_from_rfc3339(&value)
+                    .map(|value| value.with_timezone(&Utc))
+                    .with_context(|| format!("invalid GitHub synchronization cursor {value}"))
+            })
+            .transpose()
+    }
+
+    pub(crate) fn github_sync_etag(&self, repository: &str) -> Result<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT etag FROM github_cache_state WHERE repository = ?1",
+                params![repository],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(|value| value.flatten())
+            .map_err(Into::into)
+    }
+
     pub(crate) fn finish_github_creation(
         &mut self,
         request_json: &str,
@@ -164,6 +200,81 @@ impl SqliteLedger {
         transaction.execute(
             "DELETE FROM pending_github_creations WHERE request_json = ?1",
             params![request_json],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn replace_github_cache_batch(
+        &mut self,
+        repository: &str,
+        items: &[(WorkItem, HistoryEntry)],
+        removed_item_ids: &[i64],
+        cursor: Option<DateTime<Utc>>,
+        etag: Option<&str>,
+    ) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for id in removed_item_ids {
+            transaction.execute("DELETE FROM work_items WHERE id = ?1", params![id])?;
+        }
+        for (item, history) in items {
+            transaction.execute(
+                "INSERT INTO work_items
+                 (id, title, description, status, created_at, updated_at, archived_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(id) DO UPDATE SET
+                   title = excluded.title,
+                   description = excluded.description,
+                   status = excluded.status,
+                   created_at = excluded.created_at,
+                   updated_at = excluded.updated_at,
+                   archived_at = excluded.archived_at",
+                params![
+                    item.id,
+                    item.title,
+                    item.description,
+                    item.status.as_str(),
+                    timestamp(item.created_at),
+                    timestamp(item.updated_at),
+                    item.archived_at.map(timestamp),
+                ],
+            )?;
+            transaction.execute(
+                "INSERT INTO history_entries
+                 (id, work_item_id, kind, actor, note, occurred_at, changes_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(id) DO UPDATE SET
+                   work_item_id = excluded.work_item_id,
+                   kind = excluded.kind,
+                   actor = excluded.actor,
+                   note = excluded.note,
+                   occurred_at = excluded.occurred_at,
+                   changes_json = excluded.changes_json",
+                params![
+                    history.id,
+                    history.work_item_id,
+                    history.kind,
+                    history.actor,
+                    history.note,
+                    timestamp(history.occurred_at),
+                    serde_json::to_string(&history.changes)?,
+                ],
+            )?;
+        }
+        transaction.execute(
+            "INSERT INTO github_cache_state (repository, sync_cursor, etag)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(repository) DO UPDATE SET
+               sync_cursor = CASE
+                 WHEN excluded.sync_cursor IS NULL THEN github_cache_state.sync_cursor
+                 WHEN github_cache_state.sync_cursor IS NULL THEN excluded.sync_cursor
+                 WHEN excluded.sync_cursor > github_cache_state.sync_cursor THEN excluded.sync_cursor
+                 ELSE github_cache_state.sync_cursor
+               END,
+               etag = excluded.etag",
+            params![repository, cursor.map(timestamp), etag],
         )?;
         transaction.commit()?;
         Ok(())
@@ -218,10 +329,12 @@ fn create_schema(connection: &Connection) -> Result<()> {
             );
 
             CREATE TABLE IF NOT EXISTS github_cache_state (
-                repository TEXT PRIMARY KEY
+                repository  TEXT PRIMARY KEY,
+                sync_cursor TEXT,
+                etag        TEXT
             );
 
-            PRAGMA user_version = 3;
+            PRAGMA user_version = 4;
             ",
     )?;
     Ok(())
@@ -296,9 +409,19 @@ fn migrate_deleted_items_to_archived(connection: &Connection) -> Result<()> {
 }
 
 fn migrate_github_creation_recovery(connection: &Connection) -> Result<()> {
+    connection.execute_batch("BEGIN IMMEDIATE;")?;
+    let locked_version: i64 =
+        connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if locked_version >= 3 {
+        connection.execute_batch("COMMIT;")?;
+        return Ok(());
+    }
+    if locked_version != 2 {
+        connection.execute_batch("ROLLBACK;")?;
+        bail!("cannot migrate database schema version {locked_version}");
+    }
     connection.execute_batch(
-        "BEGIN IMMEDIATE;
-         CREATE TABLE IF NOT EXISTS pending_github_creations (
+        "CREATE TABLE IF NOT EXISTS pending_github_creations (
              request_json  TEXT PRIMARY KEY,
              event_id      TEXT NOT NULL UNIQUE,
              issue_number  INTEGER
@@ -307,6 +430,27 @@ fn migrate_github_creation_recovery(connection: &Connection) -> Result<()> {
              repository TEXT PRIMARY KEY
          );
          PRAGMA user_version = 3;
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
+fn migrate_github_sync_state(connection: &Connection) -> Result<()> {
+    connection.execute_batch("BEGIN IMMEDIATE;")?;
+    let locked_version: i64 =
+        connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if locked_version >= 4 {
+        connection.execute_batch("COMMIT;")?;
+        return Ok(());
+    }
+    if locked_version != 3 {
+        connection.execute_batch("ROLLBACK;")?;
+        bail!("cannot migrate database schema version {locked_version}");
+    }
+    connection.execute_batch(
+        "ALTER TABLE github_cache_state ADD COLUMN sync_cursor TEXT;
+         ALTER TABLE github_cache_state ADD COLUMN etag TEXT;
+         PRAGMA user_version = 4;
          COMMIT;",
     )?;
     Ok(())
@@ -357,7 +501,7 @@ impl Ledger for SqliteLedger {
     }
 
     fn list(
-        &self,
+        &mut self,
         filter: ListFilter,
         include_archived: bool,
         limit: usize,
@@ -385,7 +529,7 @@ impl Ledger for SqliteLedger {
             .map_err(Into::into)
     }
 
-    fn daily_view(&self, include_archived: bool) -> Result<Vec<WorkItem>> {
+    fn daily_view(&mut self, include_archived: bool) -> Result<Vec<WorkItem>> {
         let (start, end) = local_day_bounds(Utc::now())?;
         let mut statement = self.connection.prepare(&format!(
             "SELECT id, title, description, status, created_at, updated_at, archived_at
@@ -939,7 +1083,7 @@ mod tests {
             handle.join().expect("writer thread panicked")?;
         }
 
-        let tracker = SqliteLedger::open(&path)?;
+        let mut tracker = SqliteLedger::open(&path)?;
         assert_eq!(tracker.list(ListFilter::All, false, 100)?.len(), 16);
         Ok(())
     }

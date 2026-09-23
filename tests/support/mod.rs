@@ -68,6 +68,30 @@ impl CliHarness {
             .context("failed to invoke compiled work-tracker CLI")
     }
 
+    pub fn run_with_fake_gh_and_tz<I, S>(
+        &self,
+        fake: &FakeGh,
+        timezone: &str,
+        args: I,
+    ) -> Result<Output>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        Command::new(env!("CARGO_BIN_EXE_work-tracker"))
+            .args(args)
+            .env_clear()
+            .env("HOME", &self.home)
+            .env("XDG_CONFIG_HOME", &self.config)
+            .env("XDG_DATA_HOME", &self.data)
+            .env("USER", "harness-agent")
+            .env("TZ", timezone)
+            .env("PATH", fake.bin_dir())
+            .env("FAKE_GH_ROOT", fake.root())
+            .output()
+            .context("failed to invoke compiled work-tracker CLI")
+    }
+
     pub fn database_path(&self) -> PathBuf {
         self.data.join("work-tracker/work-tracker.db")
     }

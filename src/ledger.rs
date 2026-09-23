@@ -36,13 +36,13 @@ pub trait Ledger: Send {
     fn get(&self, id: i64) -> Result<WorkItem>;
 
     fn list(
-        &self,
+        &mut self,
         filter: ListFilter,
         include_archived: bool,
         limit: usize,
     ) -> Result<Vec<WorkItem>>;
 
-    fn daily_view(&self, include_archived: bool) -> Result<Vec<WorkItem>>;
+    fn daily_view(&mut self, include_archived: bool) -> Result<Vec<WorkItem>>;
 
     fn update(
         &mut self,

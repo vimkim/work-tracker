@@ -40,7 +40,7 @@ fn router(ledger: LedgerConfig) -> Router {
 }
 
 async fn index(State(state): State<AppState>) -> WebResult {
-    let ledger = state.ledger.open().map_err(internal_error)?;
+    let mut ledger = state.ledger.open().map_err(internal_error)?;
     let items = ledger.daily_view(false).map_err(internal_error)?;
     let cards = if items.is_empty() {
         "<p class=\"empty\">No work items in the daily view.</p>".to_owned()

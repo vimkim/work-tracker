@@ -177,12 +177,12 @@ fn human_add_renders_the_github_id_and_projects_a_finished_status_as_closed() ->
 }
 
 #[test]
-fn github_backend_exposes_only_add_and_show_in_this_tracer_slice() -> Result<()> {
+fn github_backend_still_rejects_mutations_outside_the_completed_tracer_slices() -> Result<()> {
     let cli = CliHarness::new()?;
     let gh = FakeGh::new()?;
     initialize(&cli, &gh)?;
 
-    let unsupported = cli.run(["--json", "list"])?;
+    let unsupported = cli.run(["--json", "update", "41", "--title", "Changed"])?;
     ensure!(!unsupported.status.success());
     assert_eq!(stdout(&unsupported)?, "");
     let diagnostic = json_from_stderr(&unsupported)?;
@@ -190,7 +190,7 @@ fn github_backend_exposes_only_add_and_show_in_this_tracer_slice() -> Result<()>
         diagnostic["error"]
             .as_str()
             .context("missing unsupported-command diagnostic")?
-            .contains("only add and show")
+            .contains("does not support this mutation yet")
     );
     Ok(())
 }

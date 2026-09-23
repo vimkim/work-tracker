@@ -71,8 +71,17 @@ async fn run(cli: Cli) -> Result<()> {
             (LedgerConfig::sqlite(database), false)
         }
     };
-    if github_backend && !matches!(&cli.command, Command::Add(_) | Command::Show(_)) {
-        anyhow::bail!("the GitHub ledger currently supports only add and show");
+    if github_backend
+        && !matches!(
+            &cli.command,
+            Command::Add(_)
+                | Command::Show(_)
+                | Command::List(_)
+                | Command::Today(_)
+                | Command::History(_)
+        )
+    {
+        anyhow::bail!("the GitHub ledger does not support this mutation yet");
     }
 
     if let Command::Serve(args) = &cli.command {

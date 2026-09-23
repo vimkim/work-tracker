@@ -3,7 +3,7 @@ use std::{cell::RefCell, collections::HashMap, fmt, path::Path, process::Command
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
-use serde_json::json;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
@@ -270,6 +270,10 @@ struct LedgerIssue {
     body: String,
     #[serde(default)]
     labels: Vec<IssueLabel>,
+    #[serde(default)]
+    updated_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pull_request: Option<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -279,6 +283,21 @@ struct LedgerComment {
     user: User,
     #[serde(default)]
     body: String,
+}
+
+enum ConditionalResult<T> {
+    NotModified,
+    Modified {
+        values: Vec<T>,
+        etag: Option<String>,
+    },
+}
+
+struct IncludedResponse<'a> {
+    status: u16,
+    etag: Option<String>,
+    has_next_page: bool,
+    body: &'a [u8],
 }
 
 impl Default for GitHub {
@@ -442,33 +461,110 @@ impl GitHubLedger {
             &fields,
         )?;
 
-        let item = WorkItem {
-            id: issue.number,
-            title: title.clone(),
-            description: description.clone(),
-            status,
-            created_at: comment.created_at,
-            updated_at: comment.created_at,
-            archived_at: None,
-            deleted_at: None,
-            purge_after: None,
-        };
-        let history = HistoryEntry {
-            id: comment.id,
-            work_item_id: issue.number,
-            kind: "created".to_owned(),
-            actor,
-            note,
-            occurred_at: comment.created_at,
-            changes: json!({
-                "title": title,
-                "description": description,
-                "status": status,
-            }),
-        };
+        let (item, history) = materialize_genesis(issue.number, &event, &comment);
         self.cache
             .finish_github_creation(&request_json, &item, &history)?;
         Ok(item)
+    }
+
+    fn synchronize(&mut self) -> Result<()> {
+        let repository = self.repository.to_string();
+        let previous_cursor = self.cache.github_sync_cursor(&repository)?;
+        let previous_etag = self.cache.github_sync_etag(&repository)?;
+        let since = previous_cursor.map(|cursor| {
+            format!(
+                "&since={}",
+                cursor.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            )
+        });
+        let endpoint = format!(
+            "repos/{}/issues?state=all&sort=updated&direction=asc&per_page=100{}",
+            self.repository,
+            since.as_deref().unwrap_or_default()
+        );
+        let (issues, response_etag) = match self
+            .github
+            .api_conditional_paginated_json::<LedgerIssue>(&endpoint, previous_etag.as_deref())?
+        {
+            ConditionalResult::NotModified => return Ok(()),
+            ConditionalResult::Modified { values, etag } => (values, etag),
+        };
+        let mut synchronized = Vec::new();
+        let mut removed_item_ids = Vec::new();
+        let mut cursor = None;
+        for issue in issues {
+            let issue_updated_at = issue.updated_at.ok_or_else(|| {
+                GitHubError::new(
+                    "github_incompatible_metadata",
+                    format!("GitHub issue #{} omitted updated_at", issue.number),
+                )
+            })?;
+            cursor = Some(cursor.map_or(issue_updated_at, |current: DateTime<Utc>| {
+                current.max(issue_updated_at)
+            }));
+            if issue.pull_request.is_some() {
+                removed_item_ids.push(issue.number);
+                continue;
+            }
+            let has_item_label = issue
+                .labels
+                .iter()
+                .any(|label| label.name.eq_ignore_ascii_case("work-tracker:item"));
+            let has_metadata = issue.body.contains(PROJECTION_MARKER);
+            if !has_item_label && !has_metadata {
+                removed_item_ids.push(issue.number);
+                continue;
+            }
+            if has_item_label != has_metadata {
+                return Err(metadata_collision(issue.number).into());
+            }
+            let metadata =
+                parse_projection(&issue.body).map_err(|_| metadata_collision(issue.number))?;
+            if metadata.schema_version != 1
+                || metadata.kind != "work_item"
+                || !has_valid_projection_stage(&metadata)
+            {
+                return Err(metadata_collision(issue.number).into());
+            }
+            if metadata.pending_genesis_event_id.is_some() {
+                continue;
+            }
+            let comment_id = metadata
+                .genesis_comment_id
+                .ok_or_else(|| metadata_collision(issue.number))?;
+            let comments: Vec<LedgerComment> = self.github.api_paginated_json(
+                "GET",
+                &format!(
+                    "repos/{}/issues/{}/comments?per_page=100",
+                    self.repository, issue.number
+                ),
+            )?;
+            let comment = comments
+                .into_iter()
+                .find(|comment| comment.id == comment_id)
+                .ok_or_else(|| metadata_collision(issue.number))?;
+            let event = parse_event(&comment.body).map_err(|_| metadata_collision(issue.number))?;
+            if event.schema_version != 1
+                || event.kind != "created"
+                || event.event_id != metadata.event_id
+                || event.github_actor != comment.user.login
+                || event.occurred_at_source != "github_comment.created_at"
+            {
+                return Err(metadata_collision(issue.number).into());
+            }
+            validate_status_label(&issue, event.initial_values.status)?;
+
+            let (item, history) = materialize_genesis(issue.number, &event, &comment);
+            synchronized.push((item, history));
+        }
+        let advanced = cursor.is_some_and(|cursor| previous_cursor.is_none_or(|old| cursor > old));
+        self.cache.replace_github_cache_batch(
+            &repository,
+            &synchronized,
+            &removed_item_ids,
+            cursor,
+            (!advanced).then_some(response_etag.as_deref()).flatten(),
+        )
     }
 
     fn load_pending_issue(
@@ -666,15 +762,17 @@ impl Ledger for GitHubLedger {
     }
 
     fn list(
-        &self,
+        &mut self,
         filter: ListFilter,
         include_archived: bool,
         limit: usize,
     ) -> Result<Vec<WorkItem>> {
+        self.synchronize()?;
         self.cache.list(filter, include_archived, limit)
     }
 
-    fn daily_view(&self, include_archived: bool) -> Result<Vec<WorkItem>> {
+    fn daily_view(&mut self, include_archived: bool) -> Result<Vec<WorkItem>> {
+        self.synchronize()?;
         self.cache.daily_view(include_archived)
     }
 
@@ -926,6 +1024,65 @@ impl GitHub {
         Ok(pages.into_iter().flatten().collect())
     }
 
+    fn api_conditional_paginated_json<T: for<'de> Deserialize<'de>>(
+        &self,
+        endpoint: &str,
+        etag: Option<&str>,
+    ) -> Result<ConditionalResult<T>> {
+        let mut values = Vec::new();
+        let mut response_etag = None;
+        let mut page = 1;
+        loop {
+            let page_endpoint = format!("{endpoint}&page={page}");
+            let headers = if page == 1 {
+                etag.map(|etag| format!("If-None-Match: {etag}"))
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            let output = self
+                .api_with_request_options("GET", &page_endpoint, &[], false, true, &headers)
+                .map_err(classify_failure)?;
+
+            // Compatibility with fixtures written before response metadata was
+            // requested: --paginate --slurp returns an outer page array.
+            if output.first() == Some(&b'[') {
+                let pages: Vec<Vec<T>> = serde_json::from_slice(&output).with_context(|| {
+                    format!("GitHub returned invalid JSON for GET {page_endpoint}")
+                })?;
+                values.extend(pages.into_iter().flatten());
+                return Ok(ConditionalResult::Modified { values, etag: None });
+            }
+
+            let response = parse_included_response(&output).with_context(|| {
+                format!("GitHub returned an invalid included response for GET {page_endpoint}")
+            })?;
+            if response.status == 304 {
+                return Ok(ConditionalResult::NotModified);
+            }
+            if response.status != 200 {
+                bail!(
+                    "GitHub returned unexpected HTTP status {} for GET {page_endpoint}",
+                    response.status
+                );
+            }
+            if page == 1 {
+                response_etag = response.etag;
+            }
+            let page_values: Vec<T> = serde_json::from_slice(response.body)
+                .with_context(|| format!("GitHub returned invalid JSON for GET {page_endpoint}"))?;
+            values.extend(page_values);
+            if !response.has_next_page {
+                return Ok(ConditionalResult::Modified {
+                    values,
+                    etag: response_etag,
+                });
+            }
+            page += 1;
+        }
+    }
+
     fn api_json<T: for<'de> Deserialize<'de>>(
         &self,
         method: &str,
@@ -965,10 +1122,28 @@ impl GitHub {
         fields: &[(&str, &str)],
         paginate: bool,
     ) -> std::result::Result<Vec<u8>, GhFailure> {
+        self.api_with_request_options(method, endpoint, fields, paginate, false, &[])
+    }
+
+    fn api_with_request_options(
+        &self,
+        method: &str,
+        endpoint: &str,
+        fields: &[(&str, &str)],
+        paginate: bool,
+        include: bool,
+        headers: &[String],
+    ) -> std::result::Result<Vec<u8>, GhFailure> {
         let mut command = Command::new(&self.executable);
         command.args(["api", "--method", method, endpoint]);
         if paginate {
             command.args(["--paginate", "--slurp"]);
+        }
+        if include {
+            command.arg("--include");
+        }
+        for header in headers {
+            command.args(["--header", header]);
         }
         for (name, value) in fields {
             command.args(["--field", &format!("{name}={value}")]);
@@ -1006,6 +1181,45 @@ impl GitHub {
             Err(GhFailure { stderr, kind })
         }
     }
+}
+
+fn parse_included_response(output: &[u8]) -> Result<IncludedResponse<'_>> {
+    let (header_bytes, body) =
+        if let Some(index) = output.windows(4).position(|part| part == b"\r\n\r\n") {
+            (&output[..index], &output[index + 4..])
+        } else if let Some(index) = output.windows(2).position(|part| part == b"\n\n") {
+            (&output[..index], &output[index + 2..])
+        } else {
+            bail!("response omitted the HTTP header separator");
+        };
+    let headers = std::str::from_utf8(header_bytes).context("response headers were not UTF-8")?;
+    let mut lines = headers.lines();
+    let status = lines
+        .next()
+        .context("response omitted the HTTP status line")?
+        .split_whitespace()
+        .nth(1)
+        .context("response HTTP status line omitted its code")?
+        .parse::<u16>()
+        .context("response HTTP status code was invalid")?;
+    let mut etag = None;
+    let mut has_next_page = false;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("etag") {
+            etag = Some(value.trim().to_owned());
+        } else if name.eq_ignore_ascii_case("link") {
+            has_next_page = value.split(',').any(|link| link.contains("rel=\"next\""));
+        }
+    }
+    Ok(IncludedResponse {
+        status,
+        etag,
+        has_next_page,
+        body,
+    })
 }
 
 fn classify_failure(failure: GhFailure) -> GitHubError {
@@ -1048,6 +1262,40 @@ fn parse_projection(body: &str) -> Result<ProjectionMetadata> {
 fn parse_event(body: &str) -> Result<GenesisEvent> {
     serde_json::from_str(extract_metadata(body, EVENT_MARKER)?)
         .context("invalid Work Tracker event metadata")
+}
+
+fn materialize_genesis(
+    issue_number: i64,
+    event: &GenesisEvent,
+    comment: &LedgerComment,
+) -> (WorkItem, HistoryEntry) {
+    let archived_at =
+        (event.initial_values.status == Status::Archived).then_some(comment.created_at);
+    let item = WorkItem {
+        id: issue_number,
+        title: event.initial_values.title.clone(),
+        description: event.initial_values.description.clone(),
+        status: event.initial_values.status,
+        created_at: comment.created_at,
+        updated_at: comment.created_at,
+        archived_at,
+        deleted_at: archived_at,
+        purge_after: None,
+    };
+    let history = HistoryEntry {
+        id: comment.id,
+        work_item_id: issue_number,
+        kind: "created".to_owned(),
+        actor: event.actor.clone(),
+        note: event.note.clone(),
+        occurred_at: comment.created_at,
+        changes: json!({
+            "title": event.initial_values.title,
+            "description": event.initial_values.description,
+            "status": event.initial_values.status,
+        }),
+    };
+    (item, history)
 }
 
 fn extract_metadata<'a>(body: &'a str, marker: &str) -> Result<&'a str> {
