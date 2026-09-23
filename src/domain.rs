@@ -128,7 +128,6 @@ pub struct RejectedMutation {
     pub expected_state_revision: u64,
     pub current_state_revision: u64,
     pub changes: Value,
-    pub reason: String,
 }
 
 #[cfg(test)]

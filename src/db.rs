@@ -371,8 +371,8 @@ fn insert_rejected_mutations(
         transaction.execute(
             "INSERT INTO rejected_mutations
              (id, work_item_id, event_id, actor, github_actor, note, occurred_at,
-              expected_state_revision, current_state_revision, changes_json, reason)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+              expected_state_revision, current_state_revision, changes_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 mutation.id,
                 mutation.work_item_id,
@@ -384,7 +384,6 @@ fn insert_rejected_mutations(
                 mutation.expected_state_revision,
                 mutation.current_state_revision,
                 serde_json::to_string(&mutation.changes)?,
-                mutation.reason,
             ],
         )?;
     }
@@ -491,8 +490,7 @@ fn create_schema(connection: &Connection) -> Result<()> {
                 occurred_at             TEXT NOT NULL,
                 expected_state_revision INTEGER NOT NULL,
                 current_state_revision  INTEGER NOT NULL,
-                changes_json            TEXT NOT NULL,
-                reason                  TEXT NOT NULL
+                changes_json            TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_rejected_work_item
                 ON rejected_mutations(work_item_id, id);
@@ -726,8 +724,7 @@ fn migrate_rejected_mutations(connection: &Connection) -> Result<()> {
              occurred_at             TEXT NOT NULL,
              expected_state_revision INTEGER NOT NULL,
              current_state_revision  INTEGER NOT NULL,
-             changes_json            TEXT NOT NULL,
-             reason                  TEXT NOT NULL
+             changes_json            TEXT NOT NULL
          );
          CREATE INDEX idx_rejected_work_item
              ON rejected_mutations(work_item_id, id);
@@ -1008,7 +1005,7 @@ impl Ledger for SqliteLedger {
         self.get(id)?;
         let mut statement = self.connection.prepare(
             "SELECT id, work_item_id, event_id, actor, github_actor, note, occurred_at,
-                    expected_state_revision, current_state_revision, changes_json, reason
+                    expected_state_revision, current_state_revision, changes_json
              FROM rejected_mutations
              WHERE work_item_id = ?1
              ORDER BY id",
@@ -1131,7 +1128,6 @@ fn row_to_rejected_mutation(row: &Row<'_>) -> rusqlite::Result<RejectedMutation>
         expected_state_revision: row.get(7)?,
         current_state_revision: row.get(8)?,
         changes: serde_json::from_str(&changes).map_err(|error| conversion_error(9, error))?,
-        reason: row.get(10)?,
     })
 }
 
@@ -1353,11 +1349,11 @@ mod tests {
         let columns: i64 = connection.query_row(
             "SELECT count(*) FROM pragma_table_info('rejected_mutations')
              WHERE name IN ('event_id', 'expected_state_revision',
-                            'current_state_revision', 'changes_json', 'reason')",
+                            'current_state_revision', 'changes_json')",
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(columns, 5);
+        assert_eq!(columns, 4);
         let state: (Option<String>, Option<String>, Option<String>) = connection.query_row(
             "SELECT sync_cursor, etag, last_successful_sync_at FROM github_cache_state",
             [],

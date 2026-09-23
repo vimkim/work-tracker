@@ -242,7 +242,7 @@ pub fn print_rejected_mutations(rejected: &[RejectedMutation]) {
             "  State revision: expected {:?}, current {}",
             mutation.expected_state_revision, mutation.current_state_revision
         );
-        println!("  Reason: {}", mutation.reason);
+        println!("  Reason: stale State Revision");
         println!("  Changes: {}", mutation.changes);
         if let Some(note) = &mutation.note {
             println!("  Note: {note}");

@@ -523,7 +523,7 @@ fn first_valid_proposal_wins_and_rejected_mutation_gets_current_state() -> Resul
         .context("Rejected Mutations were not an array")?;
     assert_eq!(rejected.len(), 1);
     assert_eq!(rejected[0]["event_id"], loser_event_id);
-    assert_eq!(rejected[0]["reason"], "stale State Revision");
+    assert!(rejected[0].get("reason").is_none());
     let rejected_human = cli.run([
         "--database",
         cache.to_str().context("cache path was not UTF-8")?,

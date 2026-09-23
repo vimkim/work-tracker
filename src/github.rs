@@ -2030,7 +2030,6 @@ fn rejected_mutation(
         expected_state_revision,
         current_state_revision,
         changes: event.changes.clone(),
-        reason: "stale State Revision".to_owned(),
     }
 }
 
