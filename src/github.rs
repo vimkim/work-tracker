@@ -1076,9 +1076,12 @@ impl GitHubLedger {
                 return Err(GitHubError::new(
                     GitHubErrorKind::ProjectionPending,
                     format!(
-                        "update {} is accepted and effective at State Revision {}, but the readable GitHub projection still needs repair: {error:#}",
+                        "update {} is accepted and effective at State Revision {}; current values are title={:?}, description={:?}, Status={}; the readable GitHub projection still needs repair: {error:#}",
                         event_id,
                         entry.state_revision.unwrap_or(expected_state_revision + 1),
+                        item.title,
+                        item.description,
+                        item.status,
                     ),
                 )
                 .with_details(json!({
@@ -1950,33 +1953,31 @@ fn replay_history(issue_number: i64, comments: &[LedgerComment]) -> Result<Repla
                 }
             }
             "updated" if !history.is_empty() => {
-                let expected = event.expected_state_revision;
                 seen.insert(event.event_id.clone(), event.clone());
-                let valid = expected
-                    .and_then(|revision| materialize_at_revision(issue_number, &history, revision))
-                    .and_then(|item| {
-                        serde_json::from_value::<FieldChanges>(event.changes.clone())
-                            .ok()
-                            .map(|changes| changes.is_valid_for(&item))
-                    })
-                    .unwrap_or(false);
-                if !valid {
-                    rejected.push(rejected_mutation(
-                        issue_number,
-                        &comment,
-                        &event,
-                        state_revision,
-                        "invalid field mutation proposal",
-                    ));
+                let Some(expected) = event.expected_state_revision else {
+                    // Invalid proposals are not Rejected Mutations: that domain
+                    // term is reserved for otherwise-valid proposals whose
+                    // expected State Revision is stale. Remembering the event
+                    // ID above still makes duplicate/collision handling stable.
+                    continue;
+                };
+                let Some(item) = materialize_at_revision(issue_number, &history, expected) else {
+                    continue;
+                };
+                let Ok(changes) = serde_json::from_value::<FieldChanges>(event.changes.clone())
+                else {
+                    continue;
+                };
+                if !changes.is_valid_for(&item) {
                     continue;
                 }
-                if expected != Some(state_revision) {
+                if expected != state_revision {
                     rejected.push(rejected_mutation(
                         issue_number,
                         &comment,
                         &event,
+                        expected,
                         state_revision,
-                        "stale State Revision",
                     ));
                     continue;
                 }
@@ -2015,8 +2016,8 @@ fn rejected_mutation(
     issue_number: i64,
     comment: &LedgerComment,
     event: &CanonicalEvent,
+    expected_state_revision: u64,
     current_state_revision: u64,
-    reason: &str,
 ) -> RejectedMutation {
     RejectedMutation {
         id: comment.id,
@@ -2026,10 +2027,10 @@ fn rejected_mutation(
         github_actor: event.github_actor.clone(),
         note: event.note.clone(),
         occurred_at: comment.created_at,
-        expected_state_revision: event.expected_state_revision,
+        expected_state_revision,
         current_state_revision,
         changes: event.changes.clone(),
-        reason: reason.to_owned(),
+        reason: "stale State Revision".to_owned(),
     }
 }
 

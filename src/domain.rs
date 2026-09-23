@@ -125,7 +125,7 @@ pub struct RejectedMutation {
     pub github_actor: String,
     pub note: Option<String>,
     pub occurred_at: DateTime<Utc>,
-    pub expected_state_revision: Option<u64>,
+    pub expected_state_revision: u64,
     pub current_state_revision: u64,
     pub changes: Value,
     pub reason: String,

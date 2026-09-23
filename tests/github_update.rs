@@ -340,7 +340,7 @@ fn no_op_field_update_publishes_no_proposal_and_appends_no_history() -> Result<(
 }
 
 #[test]
-fn first_proposal_in_comment_order_wins_and_stale_loser_gets_current_state() -> Result<()> {
+fn first_valid_proposal_wins_and_rejected_mutation_gets_current_state() -> Result<()> {
     let cli = CliHarness::new()?;
     let gh = FakeGh::new()?;
     initialize(&cli, &gh)?;
@@ -518,17 +518,12 @@ fn first_proposal_in_comment_order_wins_and_stale_loser_gets_current_state() -> 
     ])?;
     assert_success(&rejected)?;
     let rejected = json(&rejected)?;
-    assert_eq!(
-        rejected
-            .as_array()
-            .context("Rejected Mutations were not an array")?
-            .len(),
-        2
-    );
-    assert_eq!(rejected[0]["event_id"], "update-invalid");
-    assert_eq!(rejected[0]["reason"], "invalid field mutation proposal");
-    assert_eq!(rejected[1]["event_id"], loser_event_id);
-    assert_eq!(rejected[1]["reason"], "stale State Revision");
+    let rejected = rejected
+        .as_array()
+        .context("Rejected Mutations were not an array")?;
+    assert_eq!(rejected.len(), 1);
+    assert_eq!(rejected[0]["event_id"], loser_event_id);
+    assert_eq!(rejected[0]["reason"], "stale State Revision");
     let rejected_human = cli.run([
         "--database",
         cache.to_str().context("cache path was not UTF-8")?,
@@ -757,6 +752,12 @@ fn accepted_event_survives_projection_failure_and_sync_repairs_it() -> Result<()
         error["error"]["current_values"]["description"],
         "Recovered details"
     );
+    let message = error["error"]["message"]
+        .as_str()
+        .context("missing projection-pending message")?;
+    ensure!(message.contains("title=\"Watch CI\""));
+    ensure!(message.contains("description=Some(\"Recovered details\")"));
+    ensure!(message.contains("Status=pending"));
     let accepted_event_id = error["error"]["event_id"]
         .as_str()
         .context("missing accepted event ID")?;

@@ -489,7 +489,7 @@ fn create_schema(connection: &Connection) -> Result<()> {
                 github_actor            TEXT NOT NULL,
                 note                    TEXT,
                 occurred_at             TEXT NOT NULL,
-                expected_state_revision INTEGER,
+                expected_state_revision INTEGER NOT NULL,
                 current_state_revision  INTEGER NOT NULL,
                 changes_json            TEXT NOT NULL,
                 reason                  TEXT NOT NULL
@@ -724,13 +724,15 @@ fn migrate_rejected_mutations(connection: &Connection) -> Result<()> {
              github_actor            TEXT NOT NULL,
              note                    TEXT,
              occurred_at             TEXT NOT NULL,
-             expected_state_revision INTEGER,
+             expected_state_revision INTEGER NOT NULL,
              current_state_revision  INTEGER NOT NULL,
              changes_json            TEXT NOT NULL,
              reason                  TEXT NOT NULL
          );
          CREATE INDEX idx_rejected_work_item
              ON rejected_mutations(work_item_id, id);
+         UPDATE github_cache_state
+         SET sync_cursor = NULL, etag = NULL, last_successful_sync_at = NULL;
          PRAGMA user_version = 7;
          COMMIT;",
     )?;
@@ -1331,6 +1333,16 @@ mod tests {
         let connection = Connection::open_in_memory()?;
         connection.execute_batch(
             "CREATE TABLE work_items (id INTEGER PRIMARY KEY);
+             CREATE TABLE github_cache_state (
+                 repository TEXT PRIMARY KEY,
+                 sync_cursor TEXT,
+                 etag TEXT,
+                 last_successful_sync_at TEXT
+             );
+             INSERT INTO github_cache_state
+                 (repository, sync_cursor, etag, last_successful_sync_at)
+             VALUES ('octocat/work-tracker-data', 'cursor-6', 'etag-6',
+                     '2026-09-23T00:00:00Z');
              PRAGMA user_version = 6;",
         )?;
 
@@ -1346,6 +1358,12 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(columns, 5);
+        let state: (Option<String>, Option<String>, Option<String>) = connection.query_row(
+            "SELECT sync_cursor, etag, last_successful_sync_at FROM github_cache_state",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(state, (None, None, None));
         Ok(())
     }
 
