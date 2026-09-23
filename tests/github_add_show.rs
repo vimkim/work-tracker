@@ -123,13 +123,15 @@ fn add_creates_a_github_work_item_and_show_reads_the_synchronized_cache() -> Res
     ensure!(calls.contains("\"genesis_comment_id\":9001"));
     ensure!(calls.contains("\"state_revision\":1"));
 
-    let shown_human = cli.run(["show", "41"])?;
+    gh.respond(17, 0, "HTTP/2 304\n\n", "")?;
+    gh.respond(18, 0, "HTTP/2 304\n\n", "")?;
+    let shown_human = cli.run_with_fake_gh(&gh, ["show", "41"])?;
     assert_success(&shown_human)?;
     ensure!(stdout(&shown_human)?.contains("ID:          41"));
     ensure!(stdout(&shown_human)?.contains("Status:      waiting"));
     ensure!(stdout(&shown_human)?.contains("Title:       Watch company CI"));
 
-    let shown_json = cli.run(["--json", "show", "41"])?;
+    let shown_json = cli.run_with_fake_gh(&gh, ["--json", "show", "41"])?;
     assert_success(&shown_json)?;
     assert_eq!(json(&shown_json)?, item);
 

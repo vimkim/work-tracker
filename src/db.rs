@@ -9,10 +9,10 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     domain::{HistoryEntry, Status, WorkItem, normalized_optional, normalized_required},
-    ledger::{Ledger, ListFilter},
+    ledger::{Ledger, ListFilter, ReadHealth, ReadPolicy},
 };
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// SQL list of the statuses that make a Work Item actionable. Keep in sync with
 /// `Status::is_actionable`.
@@ -47,12 +47,18 @@ impl SqliteLedger {
                 migrate_deleted_items_to_archived(&connection)?;
                 migrate_github_creation_recovery(&connection)?;
                 migrate_github_sync_state(&connection)?;
+                migrate_github_freshness_state(&connection)?;
             }
             2 => {
                 migrate_github_creation_recovery(&connection)?;
                 migrate_github_sync_state(&connection)?;
+                migrate_github_freshness_state(&connection)?;
             }
-            3 => migrate_github_sync_state(&connection)?,
+            3 => {
+                migrate_github_sync_state(&connection)?;
+                migrate_github_freshness_state(&connection)?;
+            }
+            4 => migrate_github_freshness_state(&connection)?,
             SCHEMA_VERSION => {}
             version => bail!("unsupported database schema version {version}"),
         }
@@ -160,6 +166,45 @@ impl SqliteLedger {
             .map_err(Into::into)
     }
 
+    pub(crate) fn github_last_successful_sync_at(
+        &self,
+        repository: &str,
+    ) -> Result<Option<DateTime<Utc>>> {
+        let value: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT last_successful_sync_at FROM github_cache_state WHERE repository = ?1",
+                params![repository],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        value
+            .map(|value| {
+                DateTime::parse_from_rfc3339(&value)
+                    .map(|value| value.with_timezone(&Utc))
+                    .with_context(|| {
+                        format!("invalid last successful GitHub synchronization time {value}")
+                    })
+            })
+            .transpose()
+    }
+
+    pub(crate) fn mark_github_sync_success(
+        &self,
+        repository: &str,
+        synchronized_at: DateTime<Utc>,
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO github_cache_state (repository, last_successful_sync_at)
+             VALUES (?1, ?2)
+             ON CONFLICT(repository) DO UPDATE SET
+               last_successful_sync_at = excluded.last_successful_sync_at",
+            params![repository, timestamp(synchronized_at)],
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn finish_github_creation(
         &mut self,
         request_json: &str,
@@ -212,6 +257,7 @@ impl SqliteLedger {
         removed_item_ids: &[i64],
         cursor: Option<DateTime<Utc>>,
         etag: Option<&str>,
+        synchronized_at: DateTime<Utc>,
     ) -> Result<()> {
         let transaction = self
             .connection
@@ -264,8 +310,9 @@ impl SqliteLedger {
             )?;
         }
         transaction.execute(
-            "INSERT INTO github_cache_state (repository, sync_cursor, etag)
-             VALUES (?1, ?2, ?3)
+            "INSERT INTO github_cache_state
+             (repository, sync_cursor, etag, last_successful_sync_at)
+             VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(repository) DO UPDATE SET
                sync_cursor = CASE
                  WHEN excluded.sync_cursor IS NULL THEN github_cache_state.sync_cursor
@@ -273,8 +320,9 @@ impl SqliteLedger {
                  WHEN excluded.sync_cursor > github_cache_state.sync_cursor THEN excluded.sync_cursor
                  ELSE github_cache_state.sync_cursor
                END,
-               etag = excluded.etag",
-            params![repository, cursor.map(timestamp), etag],
+               etag = excluded.etag,
+               last_successful_sync_at = excluded.last_successful_sync_at",
+            params![repository, cursor.map(timestamp), etag, timestamp(synchronized_at)],
         )?;
         transaction.commit()?;
         Ok(())
@@ -329,12 +377,13 @@ fn create_schema(connection: &Connection) -> Result<()> {
             );
 
             CREATE TABLE IF NOT EXISTS github_cache_state (
-                repository  TEXT PRIMARY KEY,
-                sync_cursor TEXT,
-                etag        TEXT
+                repository              TEXT PRIMARY KEY,
+                sync_cursor             TEXT,
+                etag                    TEXT,
+                last_successful_sync_at TEXT
             );
 
-            PRAGMA user_version = 4;
+            PRAGMA user_version = 5;
             ",
     )?;
     Ok(())
@@ -456,7 +505,31 @@ fn migrate_github_sync_state(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_github_freshness_state(connection: &Connection) -> Result<()> {
+    connection.execute_batch("BEGIN IMMEDIATE;")?;
+    let locked_version: i64 =
+        connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if locked_version >= 5 {
+        connection.execute_batch("COMMIT;")?;
+        return Ok(());
+    }
+    if locked_version != 4 {
+        connection.execute_batch("ROLLBACK;")?;
+        bail!("cannot migrate database schema version {locked_version}");
+    }
+    connection.execute_batch(
+        "ALTER TABLE github_cache_state ADD COLUMN last_successful_sync_at TEXT;
+         PRAGMA user_version = 5;
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
 impl Ledger for SqliteLedger {
+    fn prepare_read(&mut self, _policy: ReadPolicy) -> Result<ReadHealth> {
+        Ok(ReadHealth::Local)
+    }
+
     fn create(
         &mut self,
         title: &str,

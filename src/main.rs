@@ -8,7 +8,7 @@ use work_tracker::{
     cli::{self, Cli, Command, InitBackend, ListArgs},
     config::{self, AppConfig},
     domain::Status,
-    github::{GitHub, GitHubError, RepositoryName},
+    github::{GitHub, RepositoryName},
     ledger::{LedgerConfig, ListFilter},
     output, web,
 };
@@ -20,25 +20,18 @@ async fn main() -> ExitCode {
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            if json_output {
-                if let Some(github_error) = error.downcast_ref::<GitHubError>() {
-                    eprintln!(
-                        "{}",
-                        json!({"error": {"code": github_error.code(), "message": format!("{error:#}")}})
-                    );
-                } else {
-                    eprintln!("{}", json!({"error": format!("{error:#}")}));
-                }
-            } else {
-                eprintln!("error: {error:#}");
-            }
+            output::print_error(&error, json_output);
             ExitCode::FAILURE
         }
     }
 }
 
 async fn run(cli: Cli) -> Result<()> {
+    let read_policy = cli.read_policy()?;
     if let Command::Init(args) = &cli.command {
+        if cli.offline {
+            anyhow::bail!("GitHub initialization is unavailable in --offline mode");
+        }
         return match &args.backend {
             InitBackend::Github(args) => init_github(&cli, args.target.as_deref()),
         };
@@ -71,6 +64,9 @@ async fn run(cli: Cli) -> Result<()> {
             (LedgerConfig::sqlite(database), false)
         }
     };
+    if github_backend && cli.offline && is_write_command(&cli.command) {
+        anyhow::bail!("GitHub-backed writes are unavailable in --offline mode");
+    }
     if github_backend
         && !matches!(
             &cli.command,
@@ -86,9 +82,20 @@ async fn run(cli: Cli) -> Result<()> {
 
     if let Command::Serve(args) = &cli.command {
         ledger_config.open()?;
-        return web::serve(ledger_config, &args.bind).await;
+        return web::serve(ledger_config, &args.bind, read_policy).await;
     }
     let mut ledger = ledger_config.open()?;
+    let read_health = if is_read_command(&cli.command) {
+        Some(ledger.prepare_read(read_policy)?)
+    } else {
+        None
+    };
+    if let Some(health) = read_health.as_ref() {
+        if let Some(error) = health.unreadable_error() {
+            return Err(error.into());
+        }
+        output::print_read_warning(health, cli.json);
+    }
     match cli.command {
         Command::Add(args) => {
             let item = ledger.create(
@@ -173,6 +180,24 @@ async fn run(cli: Cli) -> Result<()> {
     }
 }
 
+fn is_read_command(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Show(_) | Command::List(_) | Command::Today(_) | Command::History(_)
+    )
+}
+
+fn is_write_command(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Add(_)
+            | Command::Update(_)
+            | Command::Status(_)
+            | Command::Note(_)
+            | Command::Archive(_)
+    )
+}
+
 fn show_path(cli: &Cli) -> Result<()> {
     if let Some(database) = cli.database.as_ref() {
         if cli.json {
@@ -187,10 +212,14 @@ fn show_path(cli: &Cli) -> Result<()> {
         .as_deref()
         .map(RepositoryName::from_str)
         .transpose()?;
-    let explicit = requested_override
-        .as_ref()
-        .map(|repository| GitHub::new().validate_existing_repository(repository))
-        .transpose()?;
+    let explicit = if cli.offline {
+        requested_override
+    } else {
+        requested_override
+            .as_ref()
+            .map(|repository| GitHub::new().validate_existing_repository(repository))
+            .transpose()?
+    };
     let repository = explicit
         .as_ref()
         .or_else(|| app_config.as_ref().map(|config| &config.default_repository));
