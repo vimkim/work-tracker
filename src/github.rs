@@ -27,6 +27,91 @@ use crate::{
 const PROJECTION_MARKER: &str = "work-tracker:projection";
 const EVENT_MARKER: &str = "work-tracker:event";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GithubIssueState {
+    Open,
+    Closed,
+}
+
+impl GithubIssueState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GithubStateReason {
+    Completed,
+    NotPlanned,
+}
+
+impl GithubStateReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::NotPlanned => "not_planned",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GithubStatusProjection {
+    label: &'static str,
+    state: GithubIssueState,
+    state_reason: Option<GithubStateReason>,
+    locked: bool,
+}
+
+const fn github_status_projection(status: Status) -> GithubStatusProjection {
+    match status {
+        Status::Pending => GithubStatusProjection {
+            label: "work-tracker:status:pending",
+            state: GithubIssueState::Open,
+            state_reason: None,
+            locked: false,
+        },
+        Status::Active => GithubStatusProjection {
+            label: "work-tracker:status:active",
+            state: GithubIssueState::Open,
+            state_reason: None,
+            locked: false,
+        },
+        Status::Waiting => GithubStatusProjection {
+            label: "work-tracker:status:waiting",
+            state: GithubIssueState::Open,
+            state_reason: None,
+            locked: false,
+        },
+        Status::Blocked => GithubStatusProjection {
+            label: "work-tracker:status:blocked",
+            state: GithubIssueState::Open,
+            state_reason: None,
+            locked: false,
+        },
+        Status::Done => GithubStatusProjection {
+            label: "work-tracker:status:done",
+            state: GithubIssueState::Closed,
+            state_reason: Some(GithubStateReason::Completed),
+            locked: false,
+        },
+        Status::Cancelled => GithubStatusProjection {
+            label: "work-tracker:status:cancelled",
+            state: GithubIssueState::Closed,
+            state_reason: Some(GithubStateReason::NotPlanned),
+            locked: false,
+        },
+        Status::Archived => GithubStatusProjection {
+            label: "work-tracker:status:archived",
+            state: GithubIssueState::Closed,
+            state_reason: Some(GithubStateReason::NotPlanned),
+            locked: true,
+        },
+    }
+}
+
 const LABELS: [(&str, &str, &str); 8] = [
     (
         "work-tracker:item",
@@ -299,6 +384,7 @@ pub(crate) struct GitHubLedger {
     cache: SqliteLedger,
     recover_pending_remotely: bool,
     repaired_work_item_ids: Vec<i64>,
+    read_policy: ReadPolicy,
 }
 
 #[derive(Debug, Serialize)]
@@ -662,6 +748,7 @@ impl GitHubLedger {
             cache,
             recover_pending_remotely,
             repaired_work_item_ids: Vec::new(),
+            read_policy: ReadPolicy::PreferFresh,
         })
     }
 
@@ -819,28 +906,16 @@ impl GitHubLedger {
             history_hash: Some(history_hash.clone()),
         };
         let completed_body = projection_body(description.as_deref(), &completed_metadata)?;
-        let status_label = format!("work-tracker:status:{}", status.as_str());
-        let state = if status.is_actionable() {
-            "open"
-        } else {
-            "closed"
-        };
+        let status_projection = github_status_projection(status);
         let mut fields = vec![
             ("title", title.as_str()),
             ("body", completed_body.as_str()),
             ("labels[]", "work-tracker:item"),
-            ("labels[]", status_label.as_str()),
-            ("state", state),
+            ("labels[]", status_projection.label),
+            ("state", status_projection.state.as_str()),
         ];
-        if !status.is_actionable() {
-            fields.push((
-                "state_reason",
-                if status == Status::Done {
-                    "completed"
-                } else {
-                    "not_planned"
-                },
-            ));
+        if let Some(reason) = status_projection.state_reason {
+            fields.push(("state_reason", reason.as_str()));
         }
         self.github.api_empty(
             "PATCH",
@@ -895,6 +970,7 @@ impl GitHubLedger {
             }
             let comments = self.load_comments(issue_number)?;
             let item = self.cache.get(issue_number)?;
+            let status_projection = github_status_projection(item.status);
             let issue = LedgerIssue {
                 number: issue_number,
                 title: Some(item.title.clone()),
@@ -904,16 +980,14 @@ impl GitHubLedger {
                         name: "work-tracker:item".to_owned(),
                     },
                     IssueLabel {
-                        name: format!("work-tracker:status:{}", item.status.as_str()),
+                        name: status_projection.label.to_owned(),
                     },
                 ],
-                state: Some(if item.status.is_actionable() {
-                    "open".to_owned()
-                } else {
-                    "closed".to_owned()
-                }),
-                state_reason: None,
-                locked: item.status == Status::Archived,
+                state: Some(status_projection.state.as_str().to_owned()),
+                state_reason: status_projection
+                    .state_reason
+                    .map(|reason| reason.as_str().to_owned()),
+                locked: status_projection.locked,
                 updated_at: Some(item.updated_at),
                 pull_request: None,
             };
@@ -1268,7 +1342,7 @@ impl GitHubLedger {
     }
 
     fn create_pending_issue(&self, title: &str, body: &str, status: Status) -> Result<LedgerIssue> {
-        let status_label = format!("work-tracker:status:{}", status.as_str());
+        let status_projection = github_status_projection(status);
         self.github.api_json(
             "POST",
             &format!("repos/{}/issues", self.repository),
@@ -1276,7 +1350,7 @@ impl GitHubLedger {
                 ("title", title),
                 ("body", body),
                 ("labels[]", "work-tracker:item"),
-                ("labels[]", status_label.as_str()),
+                ("labels[]", status_projection.label),
             ],
         )
     }
@@ -1777,33 +1851,21 @@ impl GitHubLedger {
             .context("Work Tracker history head omitted State Revision")?;
         let item = materialize_item(issue.number, history)?;
         let body = projection_body(item.description.as_deref(), &metadata)?;
-        let status_label = format!("work-tracker:status:{}", item.status.as_str());
+        let status_projection = github_status_projection(item.status);
         let mut projected_labels = issue
             .labels
             .iter()
             .filter(|label| !is_status_label(&label.name))
             .map(|label| label.name.clone())
             .collect::<Vec<_>>();
-        projected_labels.push(status_label);
-        let state = if item.status.is_actionable() {
-            "open"
-        } else {
-            "closed"
-        };
+        projected_labels.push(status_projection.label.to_owned());
         let mut fields = vec![("title", item.title.as_str())];
         for label in &projected_labels {
             fields.push(("labels[]", label.as_str()));
         }
-        fields.push(("state", state));
-        if !item.status.is_actionable() {
-            fields.push((
-                "state_reason",
-                if item.status == Status::Done {
-                    "completed"
-                } else {
-                    "not_planned"
-                },
-            ));
+        fields.push(("state", status_projection.state.as_str()));
+        if let Some(reason) = status_projection.state_reason {
+            fields.push(("state_reason", reason.as_str()));
         }
         fields.push(("body", body.as_str()));
         self.github.api_empty(
@@ -1815,7 +1877,7 @@ impl GitHubLedger {
     }
 
     fn project_lock_state(&self, issue: &LedgerIssue, status: Status) -> Result<()> {
-        let should_be_locked = status == Status::Archived;
+        let should_be_locked = github_status_projection(status).locked;
         if issue.locked == should_be_locked {
             return Ok(());
         }
@@ -1831,7 +1893,8 @@ impl GitHubLedger {
         issue_number: i64,
         status: Status,
     ) -> Result<(LedgerIssue, ProjectionMetadata)> {
-        if status == Status::Archived {
+        let status_projection = github_status_projection(status);
+        if status_projection.locked {
             self.github
                 .api_empty(
                     "PUT",
@@ -1853,7 +1916,7 @@ impl GitHubLedger {
                 format!("the lock state could not be verified after projection: {error:#}"),
             )
         })?;
-        if verified.locked != (status == Status::Archived) {
+        if verified.locked != status_projection.locked {
             return Err(recovery_validation_failed(
                 issue_number,
                 "the authoritative lock state changed during recovery projection",
@@ -3241,6 +3304,7 @@ impl GitHubLedger {
 
 impl Ledger for GitHubLedger {
     fn prepare_read(&mut self, policy: ReadPolicy) -> Result<ReadHealth> {
+        self.read_policy = policy;
         let repository = self.repository.to_string();
         let last_successful_sync_at = self.cache.github_last_successful_sync_at(&repository)?;
         if policy == ReadPolicy::Offline {
@@ -3439,6 +3503,14 @@ impl Ledger for GitHubLedger {
     }
 
     fn doctor(&mut self, id: i64) -> Result<IntegrityDoctorReport> {
+        if self.read_policy == ReadPolicy::Offline {
+            return self.cache.github_integrity_report(id)?.ok_or_else(|| {
+                crate::ledger::ReadHealthError::cache_unavailable(format!(
+                    "offline doctor has no durable cached integrity diagnosis for Work Item {id}"
+                ))
+                .into()
+            });
+        }
         let (issue, metadata) = self.load_work_item_issue(id)?;
         let comments = self.load_comments(id)?;
         let timeline = self.load_timeline(id)?;
@@ -4837,6 +4909,19 @@ fn projection_visible_text(body: &str) -> Result<&str> {
         .context("missing Work Tracker projection metadata")
 }
 
+fn projection_has_trailing_content(body: &str) -> Result<bool> {
+    let prefix = format!("<!-- {PROJECTION_MARKER}\n");
+    let metadata_start = body
+        .rfind(&prefix)
+        .map(|index| index + prefix.len())
+        .context("missing Work Tracker projection metadata")?;
+    let metadata_end = body[metadata_start..]
+        .find("\n-->")
+        .map(|index| metadata_start + index + "\n-->".len())
+        .context("unterminated Work Tracker projection metadata")?;
+    Ok(metadata_end != body.len())
+}
+
 fn readable_projection_differs(issue: &LedgerIssue, item: &WorkItem) -> Result<bool> {
     let visible_description = projection_visible_text(&issue.body)?;
     let description_differs = match item.description.as_deref() {
@@ -4847,7 +4932,8 @@ fn readable_projection_differs(issue: &LedgerIssue, item: &WorkItem) -> Result<b
         .title
         .as_deref()
         .is_some_and(|title| title != item.title)
-        || description_differs)
+        || description_differs
+        || projection_has_trailing_content(&issue.body)?)
 }
 
 fn validate_completed_issue(issue: &LedgerIssue) -> Result<ProjectionMetadata> {
@@ -4919,20 +5005,14 @@ fn status_projection_differs(issue: &LedgerIssue, status: Status) -> bool {
     let Some(state) = issue.state.as_deref() else {
         return false;
     };
-    if status.is_actionable() {
-        !state.eq_ignore_ascii_case("open")
-    } else {
-        let expected_reason = if status == Status::Done {
-            "completed"
-        } else {
-            "not_planned"
-        };
-        !state.eq_ignore_ascii_case("closed")
-            || issue
+    let projection = github_status_projection(status);
+    !state.eq_ignore_ascii_case(projection.state.as_str())
+        || projection.state_reason.is_some_and(|expected| {
+            issue
                 .state_reason
                 .as_deref()
-                .is_none_or(|reason| !reason.eq_ignore_ascii_case(expected_reason))
-    }
+                .is_none_or(|reason| !reason.eq_ignore_ascii_case(expected.as_str()))
+        })
 }
 
 fn projection_differs(
@@ -4957,18 +5037,18 @@ fn recovery_projection_differs(
 }
 
 fn lock_projection_differs(issue: &LedgerIssue, status: Status) -> bool {
-    issue.locked != (status == Status::Archived)
+    issue.locked != github_status_projection(status).locked
 }
 
 fn status_label_matches(issue: &LedgerIssue, status: Status) -> bool {
-    let expected = format!("work-tracker:status:{}", status.as_str());
+    let expected = github_status_projection(status).label;
     let mut labels = issue
         .labels
         .iter()
         .filter(|label| is_status_label(&label.name));
     labels
         .next()
-        .is_some_and(|label| label.name.eq_ignore_ascii_case(&expected))
+        .is_some_and(|label| label.name.eq_ignore_ascii_case(expected))
         && labels.next().is_none()
 }
 
@@ -5054,6 +5134,73 @@ fn validate_reserved_labels(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_status_has_one_complete_github_projection() {
+        let cases = [
+            (
+                Status::Pending,
+                "work-tracker:status:pending",
+                "open",
+                None,
+                false,
+            ),
+            (
+                Status::Active,
+                "work-tracker:status:active",
+                "open",
+                None,
+                false,
+            ),
+            (
+                Status::Waiting,
+                "work-tracker:status:waiting",
+                "open",
+                None,
+                false,
+            ),
+            (
+                Status::Blocked,
+                "work-tracker:status:blocked",
+                "open",
+                None,
+                false,
+            ),
+            (
+                Status::Done,
+                "work-tracker:status:done",
+                "closed",
+                Some("completed"),
+                false,
+            ),
+            (
+                Status::Cancelled,
+                "work-tracker:status:cancelled",
+                "closed",
+                Some("not_planned"),
+                false,
+            ),
+            (
+                Status::Archived,
+                "work-tracker:status:archived",
+                "closed",
+                Some("not_planned"),
+                true,
+            ),
+        ];
+
+        for (status, label, state, reason, locked) in cases {
+            let projection = github_status_projection(status);
+            assert_eq!(projection.label, label, "{status}");
+            assert_eq!(projection.state.as_str(), state, "{status}");
+            assert_eq!(
+                projection.state_reason.map(GithubStateReason::as_str),
+                reason,
+                "{status}"
+            );
+            assert_eq!(projection.locked, locked, "{status}");
+        }
+    }
 
     #[test]
     fn canonical_event_bytes_and_genesis_hash_match_the_schema_v1_vector() -> Result<()> {

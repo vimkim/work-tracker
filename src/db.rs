@@ -1226,11 +1226,11 @@ impl Ledger for SqliteLedger {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current = get_item_from_transaction(&transaction, id)?
             .with_context(|| format!("work item {id} not found"))?;
+        ensure_mutable(&current)?;
         if current.status == status {
             transaction.commit()?;
             return Ok(current);
         }
-        ensure_mutable(&current)?;
 
         let now = Utc::now();
         let (archived_at, kind) = if status == Status::Archived {
@@ -2360,6 +2360,25 @@ mod tests {
     }
 
     #[test]
+    fn repeated_archived_status_is_rejected_as_an_ordinary_mutation() -> Result<()> {
+        let mut tracker = SqliteLedger::open_in_memory()?;
+        let item = tracker.create("Retain evidence", None, Status::Active, "agent-a", None)?;
+        tracker.set_status(item.id, Status::Archived, "agent-a", None)?;
+
+        let error = tracker
+            .set_status(item.id, Status::Archived, "agent-b", None)
+            .expect_err("Archived Work Items must reject even a repeated Status");
+
+        assert!(
+            error
+                .to_string()
+                .contains("is archived and cannot be modified")
+        );
+        assert_eq!(tracker.history(item.id)?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
     fn archived_item_and_history_survive_reopening_the_database() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("tracker.db");
@@ -2551,16 +2570,6 @@ mod tests {
 
         let mut tracker = SqliteLedger::open(&path)?;
         assert_eq!(tracker.list(ListFilter::All, false, 100)?.len(), 16);
-        Ok(())
-    }
-
-    #[test]
-    fn archiving_twice_is_idempotent() -> Result<()> {
-        let mut tracker = SqliteLedger::open_in_memory()?;
-        let item = tracker.create("Disposable", None, Status::Pending, "agent", None)?;
-        tracker.set_status(item.id, Status::Archived, "agent", None)?;
-        tracker.set_status(item.id, Status::Archived, "agent", None)?;
-        assert_eq!(tracker.history(item.id)?.len(), 2);
         Ok(())
     }
 }

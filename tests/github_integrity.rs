@@ -2023,6 +2023,57 @@ fn seed_edited_integrity(cli: &CliHarness, gh: &FakeGh) -> Result<EditedIntegrit
     })
 }
 
+#[test]
+fn offline_doctor_uses_only_the_durable_cached_diagnosis() -> Result<()> {
+    let cli = CliHarness::new()?;
+    configure_github(&cli)?;
+    let gh = FakeGh::new()?;
+    seed_edited_integrity(&cli, &gh)?;
+    let calls_before = gh.calls()?.lines().count();
+
+    let json_report = cli.run_with_fake_gh(&gh, ["--offline", "--json", "doctor", "41"])?;
+    assert_success(&json_report)?;
+    let report: Value = serde_json::from_slice(&json_report.stdout)?;
+    assert_eq!(report["work_item_id"], 41);
+    assert_eq!(report["integrity_health"], "ledger_integrity_error");
+    assert_eq!(report["first_break"]["kind"], "edited_event");
+    let warning: Value = serde_json::from_slice(&json_report.stderr)?;
+    assert_eq!(warning["warning"]["code"], "ledger_integrity");
+    assert_eq!(gh.calls()?.lines().count(), calls_before);
+
+    let human = cli.run_with_fake_gh(&gh, ["--offline", "doctor", "41"])?;
+    assert_success(&human)?;
+    let rendered = std::str::from_utf8(&human.stdout)?;
+    ensure!(rendered.contains("Work Item:   41"));
+    ensure!(rendered.contains("Integrity health: ledger_integrity_error"));
+    ensure!(stderr(&human)?.contains("LEDGER INTEGRITY ERROR"));
+    assert_eq!(gh.calls()?.lines().count(), calls_before);
+    Ok(())
+}
+
+#[test]
+fn offline_doctor_fails_clearly_when_the_cache_has_no_diagnosis() -> Result<()> {
+    let cli = CliHarness::new()?;
+    configure_github(&cli)?;
+    let gh = FakeGh::new()?;
+
+    let diagnosed = cli.run_with_fake_gh(&gh, ["--offline", "--json", "doctor", "41"])?;
+
+    assert_eq!(diagnosed.status.code(), Some(1));
+    let error: Value = serde_json::from_slice(&diagnosed.stderr)?;
+    assert_eq!(error["error"]["code"], "cache_unavailable");
+    ensure!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("never completed"))
+    );
+    ensure!(
+        gh.calls().is_err(),
+        "offline doctor unexpectedly invoked gh"
+    );
+    Ok(())
+}
+
 fn respond_rebaseline(
     gh: &FakeGh,
     start: usize,

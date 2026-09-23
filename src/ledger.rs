@@ -85,6 +85,13 @@ impl ReadHealthError {
     pub fn kind(&self) -> ReadHealthErrorKind {
         self.kind
     }
+
+    pub(crate) fn cache_unavailable(message: impl Into<String>) -> Self {
+        Self {
+            kind: ReadHealthErrorKind::CacheUnavailable,
+            message: message.into(),
+        }
+    }
 }
 
 impl fmt::Display for ReadHealthError {

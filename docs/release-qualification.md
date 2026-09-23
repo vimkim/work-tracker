@@ -39,12 +39,12 @@ cannot invoke `gh` without explicit opt-in.
 | P-28 | Stale proposals are retained but excluded from effective history. | The same field/Status conflict tests query both `history` and `rejected`. |
 | P-29 | Concurrent notes are both accepted in comment order. | `github_note_history::concurrent_notes_are_both_accepted_in_comment_order_without_advancing_state_revision` |
 | P-30 | Repeating a Status is idempotent. | `github_status::repeated_status_is_idempotent_and_publishes_no_proposal` |
-| P-31 | Projection drift is detected and repaired. | `github_update::stable_event_id_recovers_an_update_whose_publication_response_was_lost` and projection-repair synchronization tests. |
+| P-31 | Projection drift is detected and repaired. | `github_update::stable_event_id_recovers_an_update_whose_publication_response_was_lost` and projection-repair synchronization tests, including visible text appended after the hidden metadata block. |
 | P-32 | Human comments are preserved and ignored as ledger history. | `github_note_history::history_replays_github_comment_order_ignores_discussion_and_populates_the_cache` |
 | P-33 | Edited, deleted, disconnected, and reordered evidence is detected. | `github_integrity` edited/deleted/disconnected/hash-continuity qualification tests. |
 | P-34 | Integrity-broken Work Items remain inspectable. | `github_integrity::edited_event_stays_inspectable_and_doctor_reports_exact_recovery_evidence` |
 | P-35 | Integrity-broken Work Items reject mutation. | `github_note_history::edited_history_raises_ledger_integrity_error_before_note_mutation_or_repair` |
-| P-36 | Doctor diagnoses without mutation. | `github_integrity::doctor_is_read_only_and_does_not_misclassify_projection_drift` |
+| P-36 | Doctor diagnoses without mutation. | `github_integrity::{doctor_is_read_only_and_does_not_misclassify_projection_drift,offline_doctor_uses_only_the_durable_cached_diagnosis}` |
 | P-37 | Exact restore requires a verified copy. | `github_integrity::{exact_recovery_restores_verified_copy_revalidates_and_rebuilds_projection,doctor_never_offers_exact_recovery_for_unverified_cached_evidence}` |
 | P-38 | Rebaseline is explicit, attributed, and retains damaged evidence. | `github_integrity::explicit_rebaseline_retains_untrusted_evidence_and_starts_a_new_hash_root` |
 | P-39 | Integrity repair is never automatic. | `github_sync::unknown_headless_projection_is_inspectable_but_not_automatically_rebaselined` and doctor/recovery CLI parsing tests. |
@@ -52,7 +52,7 @@ cannot invoke `gh` without explicit opt-in.
 | P-41 | Outages fall back with a prominent stale warning. | `cache_freshness::json_show_falls_back_to_cache_with_a_structured_stale_warning` and its human-output companion. |
 | P-42 | JSON data stays on stdout and stale warning on stderr. | `cache_freshness::json_show_falls_back_to_cache_with_a_structured_stale_warning` |
 | P-43 | `--fresh` forbids stale fallback. | `cache_freshness::fresh_read_fails_instead_of_using_cached_data` |
-| P-44 | `--offline` skips the network. | `cache_freshness::offline_read_uses_cache_without_invoking_github` |
+| P-44 | `--offline` skips the network. | `cache_freshness::offline_read_uses_cache_without_invoking_github` and `github_integrity::{offline_doctor_uses_only_the_durable_cached_diagnosis,offline_doctor_fails_clearly_when_the_cache_has_no_diagnosis}` |
 | P-45 | Offline writes fail before local mutation. | `cache_freshness::offline_write_fails_before_invoking_github` |
 | P-46 | Dashboard exposes synchronization and stale state. | `web::tests::both_dashboard_routes_render_fresh_stale_unavailable_and_integrity_states` |
 | P-47 | Dashboard Daily View and item history remain read-only. | `web::tests::{dashboard_routes_read_through_the_ledger,dashboard_rejects_mutating_http_methods}` |

@@ -398,6 +398,8 @@ fn archived_work_items_are_readable_but_immutable() -> Result<()> {
     for args in [
         vec!["update", &id, "--title", "Rewritten"],
         vec!["status", &id, "active"],
+        vec!["status", &id, "archived"],
+        vec!["archive", &id],
         vec!["note", &id, "More context"],
     ] {
         let output = cli.run(args)?;
@@ -434,5 +436,31 @@ fn compiled_cli_separates_json_errors_from_stdout() -> Result<()> {
             .as_str()
             .is_some_and(|message| message.contains("not found"))
     );
+    Ok(())
+}
+
+#[test]
+fn json_domain_validation_errors_have_a_stable_structured_shape() -> Result<()> {
+    let cli = CliHarness::new()?;
+
+    let empty_title = cli.run(["--json", "add", "   "])?;
+    assert_eq!(empty_title.status.code(), Some(1));
+    assert_eq!(stdout(&empty_title)?, "");
+    let error: Value = serde_json::from_slice(&empty_title.stderr)?;
+    assert_eq!(error["error"]["code"], "domain_validation_failed");
+    assert_eq!(error["error"]["message"], "title cannot be empty");
+
+    let added = cli.run(["--json", "add", "Validate notes"])?;
+    assert_success(&added)?;
+    let id = json(&added)?["id"]
+        .as_i64()
+        .context("add output omitted id")?
+        .to_string();
+    let empty_note = cli.run(["--json", "note", &id, "   "])?;
+    assert_eq!(empty_note.status.code(), Some(1));
+    assert_eq!(stdout(&empty_note)?, "");
+    let error: Value = serde_json::from_slice(&empty_note.stderr)?;
+    assert_eq!(error["error"]["code"], "domain_validation_failed");
+    assert_eq!(error["error"]["message"], "message cannot be empty");
     Ok(())
 }

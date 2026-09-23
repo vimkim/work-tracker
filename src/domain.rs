@@ -6,10 +6,31 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[derive(Debug)]
+pub(crate) struct DomainValidationError {
+    message: String,
+}
+
+impl DomainValidationError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for DomainValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for DomainValidationError {}
+
 pub(crate) fn normalized_required(value: &str, field: &str) -> Result<String> {
     let value = value.trim();
     if value.is_empty() {
-        bail!("{field} cannot be empty");
+        return Err(DomainValidationError::new(format!("{field} cannot be empty")).into());
     }
     Ok(value.to_owned())
 }

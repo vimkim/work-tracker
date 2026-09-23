@@ -588,6 +588,71 @@ fn synchronization_completes_a_published_pending_genesis() -> Result<()> {
 }
 
 #[test]
+fn synchronization_repairs_visible_text_appended_after_projection_metadata() -> Result<()> {
+    let cli = CliHarness::new()?;
+    configure_github(&cli)?;
+    let gh = FakeGh::new()?;
+    let event_id = "genesis-body-drift-41";
+    let trusted = trusted_projection_body(
+        "Tracked item",
+        Some("Canonical description"),
+        "active",
+        event_id,
+        9001,
+    )?;
+    let drifted = format!("{trusted}\nUnsupported direct append");
+    gh.respond(
+        1,
+        0,
+        &json!([[{
+            "number": 41,
+            "title": "Tracked item",
+            "body": drifted,
+            "labels": [
+                {"name": "work-tracker:item"},
+                {"name": "work-tracker:status:active"}
+            ],
+            "state": "open",
+            "locked": false,
+            "updated_at": "2026-09-23T09:00:00Z"
+        }]])
+        .to_string(),
+        "",
+    )?;
+    gh.respond(
+        2,
+        0,
+        &json!([[{
+            "id": 9001,
+            "created_at": "2026-09-23T08:59:00Z",
+            "user": {"login": "octocat"},
+            "body": genesis_body(
+                "Tracked item",
+                Some("Canonical description"),
+                "active",
+                event_id,
+            )
+        }]])
+        .to_string(),
+        "",
+    )?;
+    gh.respond(3, 0, "{}", "")?;
+
+    let shown = cli.run_with_fake_gh(&gh, ["--json", "show", "41"])?;
+    assert_success(&shown)?;
+    let warning: Value = serde_json::from_slice(&shown.stderr)?;
+    assert_eq!(warning["warning"]["code"], "github_projection_repaired");
+    let calls = gh.calls()?;
+    let repair = calls
+        .lines()
+        .find(|call| call.contains("\tPATCH\trepos/octocat/work-tracker-data/issues/41"))
+        .context("appended body drift did not trigger projection repair")?;
+    ensure!(repair.contains("body=Canonical description"));
+    ensure!(!repair.contains("Unsupported direct append"));
+    Ok(())
+}
+
+#[test]
 fn synchronization_publishes_pending_genesis_after_disposable_cache_loss() -> Result<()> {
     let cli = CliHarness::new()?;
     configure_github(&cli)?;

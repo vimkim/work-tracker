@@ -97,7 +97,12 @@ async fn run(cli: Cli) -> Result<()> {
         return web::serve(ledger_config, &args.bind, read_policy).await;
     }
     let mut ledger = ledger_config.open()?;
-    let read_health = if is_read_command(&cli.command) {
+    // Online doctor performs its own complete authoritative diagnosis, including timeline
+    // evidence. Offline doctor must pass through the ordinary read preparation so it is
+    // constrained to durable cache state and never invokes GitHub.
+    let prepare_read = is_read_command(&cli.command)
+        && (!matches!(cli.command, Command::Doctor(_)) || cli.offline);
+    let read_health = if prepare_read {
         Some(ledger.prepare_read(read_policy)?)
     } else {
         None
@@ -246,6 +251,7 @@ fn is_read_command(command: &Command) -> bool {
             | Command::Today(_)
             | Command::History(_)
             | Command::Rejected(_)
+            | Command::Doctor(_)
     )
 }
 

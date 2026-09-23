@@ -4,7 +4,10 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::{
-    domain::{HistoryEntry, IntegrityDoctorReport, RecoveryReport, RejectedMutation, WorkItem},
+    domain::{
+        DomainValidationError, HistoryEntry, IntegrityDoctorReport, RecoveryReport,
+        RejectedMutation, WorkItem,
+    },
     github::{GitHubError, GitHubErrorKind},
     ledger::{ReadHealth, ReadHealthError, ReadHealthErrorKind, ReadHealthKind},
 };
@@ -120,6 +123,14 @@ pub fn print_error(error: &Error, json_output: bool) {
             "{}",
             json!({"error": {
                 "code": read_health_error_code(read_error.kind()),
+                "message": format!("{error:#}"),
+            }})
+        );
+    } else if error.downcast_ref::<DomainValidationError>().is_some() {
+        eprintln!(
+            "{}",
+            json!({"error": {
+                "code": "domain_validation_failed",
                 "message": format!("{error:#}"),
             }})
         );

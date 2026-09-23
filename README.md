@@ -64,6 +64,8 @@ JSON data stays on standard output and a structured warning is written to standa
 - Add `--fresh` when stale data is unacceptable. The command fails nonzero instead of falling back.
 - Add `--offline` to deliberately skip GitHub and inspect the cache. The output is explicitly
   marked offline/stale, and it fails until that machine has completed one successful sync.
+- `--offline doctor ID` never contacts GitHub. It reports the durable cached integrity diagnosis
+  for that Work Item, or fails clearly when the cache has no diagnosis to review.
 - GitHub-backed writes always require GitHub. `--offline` rejects a write before changing the
   cache, and authentication, permission, validation, rate-limit, network, and service failures are
   reported separately.
@@ -95,7 +97,7 @@ work-tracker doctor 41
 work-tracker --json doctor 41
 ```
 
-The report includes GitHub comment, event, and Actor identities; expected and observed hashes; any cached exact copy; relevant timeline evidence; and whether exact restoration or only an explicit Rebaseline is eligible.
+The report includes GitHub comment, event, and Actor identities; expected and observed hashes; any cached exact copy; relevant timeline evidence; and whether exact restoration or only an explicit Rebaseline is eligible. Use `--offline doctor ID` to review the last durable diagnosis without making any network request.
 
 Recovery is never automatic. Keep the diagnosis available for review, then choose exactly one
 eligible operation:
@@ -199,7 +201,7 @@ work-tracker show 1 --json
 work-tracker --database /srv/work-tracker/team.db list --json
 ```
 
-`WORK_TRACKER_DB` selects the shared database without repeating `--database`. Successful commands exit with status 0. Command validation uses exit status 2; runtime and lookup errors use exit status 1 and emit `{"error":"..."}` to standard error when `--json` is enabled.
+`WORK_TRACKER_DB` selects the shared database without repeating `--database`. Successful commands exit with status 0. Command-line validation uses exit status 2 and code `cli_validation_failed`; runtime domain validation uses exit status 1 and code `domain_validation_failed`. Both emit `{"error":{"code":"...","message":"..."}}` to standard error when `--json` is enabled. Other runtime and lookup failures also exit with status 1; GitHub and cache failures retain their specialized structured codes.
 
 For multiple agents, point every process at the same database file on the same Linux host. SQLite serializes writes, waits up to five seconds for a busy writer, and keeps reads responsive through WAL mode. Do not put the database on a filesystem that does not support SQLite locking semantics.
 
