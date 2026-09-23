@@ -1670,7 +1670,7 @@ impl GitHubLedger {
         let deletion = Self::correlated_deletion(metadata, &timeline_evidence);
         let first_unreadable_comment = comments
             .iter()
-            .filter(|comment| has_metadata(&comment.body, EVENT_MARKER))
+            .filter(|comment| is_projected_or_structured_event(metadata, comment))
             .find(|comment| parse_event(&comment.body).is_err());
         let is_unknown_schema = error
             .downcast_ref::<GitHubError>()
@@ -1707,7 +1707,7 @@ impl GitHubLedger {
             trusted_event_count: 0,
             untrusted_event_count: comments
                 .iter()
-                .filter(|comment| has_metadata(&comment.body, EVENT_MARKER))
+                .filter(|comment| is_projected_or_structured_event(metadata, comment))
                 .count(),
             timeline_evidence,
             eligible_repair_modes: vec![RepairMode::Rebaseline],
@@ -2493,15 +2493,12 @@ impl GitHubLedger {
         self.project_history_head(&reloaded_issue, metadata, &replayed.accepted)?;
         let evidence = event_evidence(&reloaded_comments, &replayed.accepted);
         let trusted_event_count = replayed.accepted.len();
-        self.cache.complete_github_recovery(
-            &self.repository.to_string(),
-            &GithubCacheItem {
-                item: item.clone(),
-                history: replayed.cache_history(),
-                rejected: replayed.rejected,
-                evidence,
-            },
-        )?;
+        self.cache.complete_github_recovery(&GithubCacheItem {
+            item: item.clone(),
+            history: replayed.cache_history(),
+            rejected: replayed.rejected,
+            evidence,
+        })?;
         Ok(RecoveryReport {
             work_item_id: issue_number,
             outcome: RecoveryOutcome::ExactRestoration,
@@ -2554,7 +2551,12 @@ impl GitHubLedger {
             .into());
         }
         let has_cached_item = self.cache.get(issue_number).is_ok();
-        let reviewed = reviewed_item_from_issue(&issue, &comments);
+        let reviewed = reviewed_item_from_issue(&issue, &comments).map_err(|error| {
+            recovery_still_blocked(
+                issue_number,
+                format!("the live GitHub state cannot be reviewed safely: {error:#}"),
+            )
+        })?;
         diagnosis.archived = reviewed.status == Status::Archived;
         let cached_history = if has_cached_item {
             self.cache.history(issue_number)?
@@ -2583,7 +2585,7 @@ impl GitHubLedger {
             let matching = prior_evidence
                 .iter()
                 .find(|evidence| evidence.github_comment_id == comment.id);
-            if matching.is_none() && !has_metadata(&comment.body, EVENT_MARKER) {
+            if matching.is_none() && !is_projected_or_structured_event(&metadata, comment) {
                 continue;
             }
             if matching.is_some_and(|evidence| evidence.body == comment.body) {
@@ -2732,15 +2734,12 @@ impl GitHubLedger {
         let trusted_event_count = replayed.accepted.len();
         let untrusted_event_count = replayed.untrusted.len();
         let evidence = event_evidence(&comments, &replayed.accepted);
-        self.cache.complete_github_recovery(
-            &self.repository.to_string(),
-            &GithubCacheItem {
-                item,
-                history: replayed.cache_history(),
-                rejected: replayed.rejected,
-                evidence,
-            },
-        )?;
+        self.cache.complete_github_recovery(&GithubCacheItem {
+            item,
+            history: replayed.cache_history(),
+            rejected: replayed.rejected,
+            evidence,
+        })?;
         Ok(RecoveryReport {
             work_item_id: issue_number,
             outcome: RecoveryOutcome::Rebaseline,
@@ -3608,20 +3607,24 @@ fn materialize_item(issue_number: i64, history: &[HistoryEntry]) -> Result<WorkI
     })
 }
 
-fn reviewed_item_from_issue(issue: &LedgerIssue, comments: &[LedgerComment]) -> WorkItem {
+fn reviewed_item_from_issue(issue: &LedgerIssue, comments: &[LedgerComment]) -> Result<WorkItem> {
     let status = if issue.locked {
         Status::Archived
     } else {
-        issue
-            .labels
-            .iter()
-            .find_map(|label| {
-                label
-                    .name
-                    .strip_prefix("work-tracker:status:")
-                    .and_then(|status| Status::from_str(status).ok())
-            })
-            .unwrap_or(Status::Pending)
+        let mut statuses = issue.labels.iter().filter_map(|label| {
+            LABELS[1..]
+                .iter()
+                .find(|(canonical, _, _)| label.name.eq_ignore_ascii_case(canonical))
+                .and_then(|(canonical, _, _)| canonical.rsplit(':').next())
+                .and_then(|status| Status::from_str(status).ok())
+        });
+        let status = statuses
+            .next()
+            .context("unlocked issue has no valid Work Tracker status label")?;
+        if statuses.next().is_some() {
+            bail!("unlocked issue has multiple Work Tracker status labels");
+        }
+        status
     };
     let observed_at = comments
         .iter()
@@ -3634,7 +3637,7 @@ fn reviewed_item_from_issue(issue: &LedgerIssue, comments: &[LedgerComment]) -> 
     let description =
         (!matches!(visible, "" | "_No description provided._")).then(|| visible.to_owned());
     let archived_at = (status == Status::Archived).then_some(updated_at);
-    WorkItem {
+    Ok(WorkItem {
         id: issue.number,
         title: issue
             .title
@@ -3648,7 +3651,7 @@ fn reviewed_item_from_issue(issue: &LedgerIssue, comments: &[LedgerComment]) -> 
         deleted_at: archived_at,
         purge_after: None,
         ledger_integrity_error: true,
-    }
+    })
 }
 
 fn extract_metadata<'a>(body: &'a str, marker: &str) -> Result<&'a str> {
@@ -3666,6 +3669,15 @@ fn extract_metadata<'a>(body: &'a str, marker: &str) -> Result<&'a str> {
 
 fn has_metadata(body: &str, marker: &str) -> bool {
     body.contains(&format!("<!-- {marker}\n"))
+}
+
+fn is_projected_or_structured_event(
+    metadata: &ProjectionMetadata,
+    comment: &LedgerComment,
+) -> bool {
+    has_metadata(&comment.body, EVENT_MARKER)
+        || metadata.genesis_comment_id == Some(comment.id)
+        || metadata.head_comment_id == Some(comment.id)
 }
 
 fn event_comment_body(event: &CanonicalEvent) -> Result<String> {

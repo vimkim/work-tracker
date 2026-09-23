@@ -3,6 +3,7 @@ mod support;
 use std::fs;
 
 use anyhow::{Context, Result, ensure};
+use rusqlite::Connection;
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -284,25 +285,41 @@ fn explicit_rebaseline_retains_untrusted_evidence_and_starts_a_new_hash_root() -
     assert_eq!(report["trusted_event_count"], 1);
     assert_eq!(report["untrusted_event_count"], 1);
 
-    let history = cli.run_with_fake_gh(&gh, ["--offline", "--json", "history", "41"])?;
-    assert_success(&history)?;
-    let entries: Value = serde_json::from_slice(&history.stdout)?;
-    assert_eq!(entries.as_array().map(Vec::len), Some(2));
-    assert_eq!(entries[0]["trust"], "untrusted");
-    assert_eq!(entries[0]["event_id"], "genesis-integrity-41");
-    assert_eq!(entries[1]["kind"], "rebaseline");
-    assert_eq!(entries[1]["actor"], "reviewer-a");
-    assert_eq!(entries[1]["note"], "reviewed projection");
-    assert_eq!(entries[1]["trust"], "trusted");
-    ensure!(entries[1]["previous_history_hash"].is_null());
-    assert_eq!(entries[1]["changes"]["title"], "Original title");
-    assert_eq!(entries[1]["changes"]["status"], "active");
+    let connection = Connection::open(cli.github_cache_path("octocat", "work-tracker-data"))?;
+    let mut statement = connection.prepare(
+        "SELECT event_id, kind, actor, note, changes_json, previous_history_hash, evidence_trust
+         FROM history_entries WHERE work_item_id = 41 ORDER BY id",
+    )?;
+    let entries = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].0.as_deref(), Some("genesis-integrity-41"));
+    assert_eq!(entries[0].6, "untrusted");
+    assert_eq!(entries[1].1, "rebaseline");
+    assert_eq!(entries[1].2, "reviewer-a");
+    assert_eq!(entries[1].3.as_deref(), Some("reviewed projection"));
+    assert!(entries[1].5.is_none());
+    assert_eq!(entries[1].6, "trusted");
+    let rebaseline_changes: Value = serde_json::from_str(&entries[1].4)?;
+    assert_eq!(rebaseline_changes["title"], "Original title");
+    assert_eq!(rebaseline_changes["status"], "active");
     assert_eq!(
-        entries[1]["changes"]["integrity_context"]["integrity_health"],
+        rebaseline_changes["integrity_context"]["integrity_health"],
         "ledger_integrity_error"
     );
     ensure!(
-        entries[1]["changes"]["prior_evidence"][0]["body"]
+        rebaseline_changes["prior_evidence"][0]["body"]
             .as_str()
             .is_some_and(|body| body.contains("genesis-integrity-41"))
     );
@@ -360,6 +377,113 @@ fn doctor_diagnosis_can_be_rebaselined_without_a_prior_cached_latch() -> Result<
     assert_eq!(
         serde_json::from_slice::<Value>(&recovered.stdout)?["outcome"],
         "rebaseline"
+    );
+    Ok(())
+}
+
+#[test]
+fn rebaseline_without_cached_evidence_retains_a_projected_markerless_comment() -> Result<()> {
+    let cli = CliHarness::new()?;
+    configure_github(&cli)?;
+    let gh = FakeGh::new()?;
+    let original_event = event("Original title");
+    let projection = projection(&hash(&original_event, 9001)?);
+    let corrupt_issue = issue(&projection, "2026-09-23T01:02:04Z", false);
+    let damaged_body = "damaged genesis body with no event marker";
+    respond_rebaseline(
+        &gh,
+        1,
+        &corrupt_issue,
+        &[remote_comment(damaged_body)],
+        &json!([]),
+        "2026-09-23T04:02:03Z",
+    )?;
+
+    let recovered = cli.run_with_fake_gh(
+        &gh,
+        [
+            "--json",
+            "recover",
+            "41",
+            "--mode",
+            "rebaseline",
+            "--actor",
+            "reviewer-a",
+            "--reason",
+            "reviewed projected markerless evidence",
+        ],
+    )?;
+    assert_success(&recovered)?;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&recovered.stdout)?["untrusted_event_count"],
+        1
+    );
+    let connection = Connection::open(cli.github_cache_path("octocat", "work-tracker-data"))?;
+    let retained: String = connection.query_row(
+        "SELECT changes_json FROM history_entries
+         WHERE work_item_id = 41 AND evidence_trust = 'untrusted'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        serde_json::from_str::<Value>(&retained)?["retained_body"],
+        damaged_body
+    );
+    Ok(())
+}
+
+#[test]
+fn rebaseline_blocks_an_unlocked_issue_with_no_live_status_label() -> Result<()> {
+    assert_rebaseline_blocks_ambiguous_status(json!([{"name": "work-tracker:item"}]))
+}
+
+#[test]
+fn rebaseline_blocks_an_unlocked_issue_with_multiple_live_status_labels() -> Result<()> {
+    assert_rebaseline_blocks_ambiguous_status(json!([
+        {"name": "work-tracker:item"},
+        {"name": "work-tracker:status:active"},
+        {"name": "work-tracker:status:blocked"}
+    ]))
+}
+
+fn assert_rebaseline_blocks_ambiguous_status(labels: Value) -> Result<()> {
+    let cli = CliHarness::new()?;
+    configure_github(&cli)?;
+    let gh = FakeGh::new()?;
+    let original_event = event("Original title");
+    let original_comment = comment(&original_event)?;
+    let invalid_projection = projection("disconnected-projection-head");
+    let mut corrupt_issue = issue(&invalid_projection, "2026-09-23T01:02:04Z", false);
+    corrupt_issue["labels"] = labels;
+    respond_rebaseline(
+        &gh,
+        1,
+        &corrupt_issue,
+        &[remote_comment(&original_comment)],
+        &json!([]),
+        "2026-09-23T04:02:03Z",
+    )?;
+
+    let recovered = cli.run_with_fake_gh(
+        &gh,
+        [
+            "--json",
+            "recover",
+            "41",
+            "--mode",
+            "rebaseline",
+            "--actor",
+            "reviewer-a",
+            "--reason",
+            "reviewed ambiguous status",
+        ],
+    )?;
+    ensure!(!recovered.status.success());
+    let error: Value = serde_json::from_slice(&recovered.stderr)?;
+    assert_eq!(error["error"]["code"], "github_recovery_still_blocked");
+    ensure!(
+        !gh.calls()?
+            .contains("\tPOST\trepos/octocat/work-tracker-data/issues/41/comments")
     );
     Ok(())
 }

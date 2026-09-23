@@ -15,7 +15,7 @@ use crate::{
     ledger::{Ledger, ListFilter, ReadHealth, ReadPolicy},
 };
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 /// SQL list of the statuses that make a Work Item actionable. Keep in sync with
 /// `Status::is_actionable`.
@@ -54,6 +54,7 @@ impl SqliteLedger {
                 migrate_github_freshness_state(&connection)?;
                 migrate_rejected_mutations(&connection)?;
                 migrate_integrity_evidence(&connection)?;
+                migrate_work_item_scoped_history_identity(&connection)?;
             }
             2 => {
                 migrate_github_creation_recovery(&connection)?;
@@ -62,6 +63,7 @@ impl SqliteLedger {
                 migrate_github_freshness_state(&connection)?;
                 migrate_rejected_mutations(&connection)?;
                 migrate_integrity_evidence(&connection)?;
+                migrate_work_item_scoped_history_identity(&connection)?;
             }
             3 => {
                 migrate_github_sync_state(&connection)?;
@@ -69,23 +71,31 @@ impl SqliteLedger {
                 migrate_github_freshness_state(&connection)?;
                 migrate_rejected_mutations(&connection)?;
                 migrate_integrity_evidence(&connection)?;
+                migrate_work_item_scoped_history_identity(&connection)?;
             }
             4 => {
                 migrate_trusted_history(&connection)?;
                 migrate_github_freshness_state(&connection)?;
                 migrate_rejected_mutations(&connection)?;
                 migrate_integrity_evidence(&connection)?;
+                migrate_work_item_scoped_history_identity(&connection)?;
             }
             5 => {
                 migrate_legacy_schema_5(&connection)?;
                 migrate_rejected_mutations(&connection)?;
                 migrate_integrity_evidence(&connection)?;
+                migrate_work_item_scoped_history_identity(&connection)?;
             }
             6 => {
                 migrate_rejected_mutations(&connection)?;
                 migrate_integrity_evidence(&connection)?;
+                migrate_work_item_scoped_history_identity(&connection)?;
             }
-            7 => migrate_integrity_evidence(&connection)?,
+            7 => {
+                migrate_integrity_evidence(&connection)?;
+                migrate_work_item_scoped_history_identity(&connection)?;
+            }
+            8 => migrate_work_item_scoped_history_identity(&connection)?,
             SCHEMA_VERSION => {}
             version => bail!("unsupported database schema version {version}"),
         }
@@ -437,11 +447,7 @@ impl SqliteLedger {
         Ok(())
     }
 
-    pub(crate) fn complete_github_recovery(
-        &mut self,
-        repository: &str,
-        item: &GithubCacheItem,
-    ) -> Result<()> {
+    pub(crate) fn complete_github_recovery(&mut self, item: &GithubCacheItem) -> Result<()> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -449,13 +455,6 @@ impl SqliteLedger {
         transaction.execute(
             "DELETE FROM github_integrity_errors WHERE work_item_id = ?1",
             params![item.item.id],
-        )?;
-        transaction.execute(
-            "INSERT INTO github_cache_state (repository, last_successful_sync_at)
-             VALUES (?1, ?2)
-             ON CONFLICT(repository) DO UPDATE SET
-               last_successful_sync_at = excluded.last_successful_sync_at",
-            params![repository, timestamp(Utc::now())],
         )?;
         transaction.commit()?;
         Ok(())
@@ -641,7 +640,7 @@ fn create_schema(connection: &Connection) -> Result<()> {
             );
 
             CREATE TABLE IF NOT EXISTS history_entries (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                id            INTEGER NOT NULL,
                 work_item_id  INTEGER NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
                 kind          TEXT NOT NULL,
                 actor         TEXT NOT NULL CHECK (length(trim(actor)) > 0),
@@ -653,7 +652,8 @@ fn create_schema(connection: &Connection) -> Result<()> {
                 previous_history_hash TEXT,
                 history_hash  TEXT,
                 state_revision INTEGER
-                ,evidence_trust TEXT NOT NULL DEFAULT 'trusted'
+                ,evidence_trust TEXT NOT NULL DEFAULT 'trusted',
+                PRIMARY KEY (work_item_id, id)
             );
 
             CREATE INDEX IF NOT EXISTS idx_work_items_status_updated
@@ -704,7 +704,7 @@ fn create_schema(connection: &Connection) -> Result<()> {
                 report_json  TEXT NOT NULL
             );
 
-            PRAGMA user_version = 8;
+            PRAGMA user_version = 9;
             ",
     )?;
     Ok(())
@@ -981,6 +981,53 @@ fn migrate_integrity_evidence(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_work_item_scoped_history_identity(connection: &Connection) -> Result<()> {
+    connection.execute_batch("BEGIN IMMEDIATE;")?;
+    let locked_version: i64 =
+        connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if locked_version >= 9 {
+        connection.execute_batch("COMMIT;")?;
+        return Ok(());
+    }
+    if locked_version != 8 {
+        connection.execute_batch("ROLLBACK;")?;
+        bail!("cannot migrate database schema version {locked_version}");
+    }
+    connection.execute_batch(
+        "CREATE TABLE history_entries_v9 (
+             id                    INTEGER NOT NULL,
+             work_item_id          INTEGER NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+             kind                  TEXT NOT NULL,
+             actor                 TEXT NOT NULL CHECK (length(trim(actor)) > 0),
+             note                  TEXT,
+             occurred_at           TEXT NOT NULL,
+             changes_json          TEXT NOT NULL,
+             event_id              TEXT,
+             github_actor          TEXT,
+             previous_history_hash TEXT,
+             history_hash          TEXT,
+             state_revision        INTEGER,
+             evidence_trust        TEXT NOT NULL DEFAULT 'trusted',
+             PRIMARY KEY (work_item_id, id)
+         );
+         INSERT INTO history_entries_v9
+             (id, work_item_id, kind, actor, note, occurred_at, changes_json,
+              event_id, github_actor, previous_history_hash, history_hash,
+              state_revision, evidence_trust)
+         SELECT id, work_item_id, kind, actor, note, occurred_at, changes_json,
+                event_id, github_actor, previous_history_hash, history_hash,
+                state_revision, evidence_trust
+         FROM history_entries;
+         DROP TABLE history_entries;
+         ALTER TABLE history_entries_v9 RENAME TO history_entries;
+         CREATE INDEX idx_history_work_item
+             ON history_entries(work_item_id, id);
+         PRAGMA user_version = 9;
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
 fn table_has_column(connection: &Connection, table: &str, column: &str) -> Result<bool> {
     connection
         .query_row(
@@ -1211,7 +1258,7 @@ impl Ledger for SqliteLedger {
             .with_context(|| format!("work item {id} not found"))?;
         ensure_mutable(&current)?;
         let now = Utc::now();
-        insert_history(
+        let history_id = insert_history(
             &transaction,
             id,
             "noted",
@@ -1224,7 +1271,6 @@ impl Ledger for SqliteLedger {
             "UPDATE work_items SET updated_at = ?1 WHERE id = ?2",
             params![timestamp(now), id],
         )?;
-        let history_id = transaction.last_insert_rowid();
         transaction.commit()?;
         self.history(id)?
             .into_iter()
@@ -1300,12 +1346,18 @@ fn insert_history(
     note: Option<String>,
     occurred_at: DateTime<Utc>,
     changes: &Value,
-) -> Result<()> {
+) -> Result<i64> {
+    let id = transaction.query_row(
+        "SELECT COALESCE(MAX(id), 0) + 1 FROM history_entries",
+        [],
+        |row| row.get(0),
+    )?;
     transaction.execute(
         "INSERT INTO history_entries
-         (work_item_id, kind, actor, note, occurred_at, changes_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+         (id, work_item_id, kind, actor, note, occurred_at, changes_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
+            id,
             work_item_id,
             kind,
             actor,
@@ -1314,7 +1366,7 @@ fn insert_history(
             serde_json::to_string(changes)?
         ],
     )?;
-    Ok(())
+    Ok(id)
 }
 
 fn get_item(connection: &Connection, id: i64) -> Result<Option<WorkItem>> {
@@ -1458,6 +1510,74 @@ fn conversion_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn github_cache_item(work_item_id: i64, history_id: i64) -> GithubCacheItem {
+        let occurred_at = Utc
+            .with_ymd_and_hms(2026, 9, 23, 1, 2, 3)
+            .single()
+            .expect("valid fixture timestamp");
+        GithubCacheItem {
+            item: WorkItem {
+                id: work_item_id,
+                title: format!("Work item {work_item_id}"),
+                description: None,
+                status: Status::Active,
+                created_at: occurred_at,
+                updated_at: occurred_at,
+                archived_at: None,
+                deleted_at: None,
+                purge_after: None,
+                ledger_integrity_error: false,
+            },
+            history: vec![HistoryEntry {
+                id: history_id,
+                work_item_id,
+                event_id: None,
+                kind: "untrusted_evidence".to_owned(),
+                actor: "reviewer-a".to_owned(),
+                github_actor: Some("octocat".to_owned()),
+                note: None,
+                occurred_at,
+                changes: json!({"retained_body": "damaged"}),
+                previous_history_hash: None,
+                history_hash: None,
+                state_revision: None,
+                trust: EvidenceTrust::Untrusted,
+            }],
+            rejected: Vec::new(),
+            evidence: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn recovery_evidence_identity_is_scoped_to_its_work_item() -> Result<()> {
+        let mut tracker = SqliteLedger::open_in_memory()?;
+        tracker.replace_github_item(&github_cache_item(41, -9002))?;
+        tracker.replace_github_item(&github_cache_item(42, -9002))?;
+
+        assert_eq!(tracker.history(41)?.len(), 1);
+        assert_eq!(tracker.history(42)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn completing_one_recovery_preserves_repository_sync_freshness() -> Result<()> {
+        let mut tracker = SqliteLedger::open_in_memory()?;
+        let repository = "octocat/work-tracker-data";
+        let synchronized_at = Utc
+            .with_ymd_and_hms(2026, 9, 23, 1, 0, 0)
+            .single()
+            .expect("valid fixture timestamp");
+        tracker.mark_github_sync_success(repository, synchronized_at)?;
+
+        tracker.complete_github_recovery(&github_cache_item(41, -9001))?;
+
+        assert_eq!(
+            tracker.github_last_successful_sync_at(repository)?,
+            Some(synchronized_at)
+        );
+        Ok(())
+    }
 
     #[test]
     fn trusted_history_migration_invalidates_the_v4_incremental_cursor() -> Result<()> {
@@ -1682,6 +1802,54 @@ mod tests {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         assert_eq!(state, (None, None, None));
+        Ok(())
+    }
+
+    #[test]
+    fn schema_8_scopes_history_identity_to_each_work_item() -> Result<()> {
+        let connection = Connection::open_in_memory()?;
+        connection.execute_batch(
+            "CREATE TABLE work_items (id INTEGER PRIMARY KEY);
+             INSERT INTO work_items VALUES (41), (42);
+             CREATE TABLE history_entries (
+                 id INTEGER PRIMARY KEY,
+                 work_item_id INTEGER NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+                 kind TEXT NOT NULL,
+                 actor TEXT NOT NULL,
+                 note TEXT,
+                 occurred_at TEXT NOT NULL,
+                 changes_json TEXT NOT NULL,
+                 event_id TEXT,
+                 github_actor TEXT,
+                 previous_history_hash TEXT,
+                 history_hash TEXT,
+                 state_revision INTEGER,
+                 evidence_trust TEXT NOT NULL DEFAULT 'trusted'
+             );
+             INSERT INTO history_entries
+                 (id, work_item_id, kind, actor, occurred_at, changes_json, evidence_trust)
+             VALUES (-9002, 41, 'untrusted_evidence', 'reviewer-a',
+                     '2026-09-23T00:00:00Z', '{}', 'untrusted');
+             PRAGMA user_version = 8;",
+        )?;
+
+        migrate_work_item_scoped_history_identity(&connection)?;
+        connection.execute(
+            "INSERT INTO history_entries
+                 (id, work_item_id, kind, actor, occurred_at, changes_json, evidence_trust)
+             VALUES (-9002, 42, 'untrusted_evidence', 'reviewer-a',
+                     '2026-09-23T00:00:00Z', '{}', 'untrusted')",
+            [],
+        )?;
+
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        assert_eq!(version, 9);
+        let retained: i64 = connection.query_row(
+            "SELECT count(*) FROM history_entries WHERE id = -9002",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(retained, 2);
         Ok(())
     }
 
