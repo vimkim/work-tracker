@@ -1,6 +1,6 @@
 # Work Tracker
 
-Work Tracker is a small, agent-friendly status ledger for parallel and long-running work. A Rust CLI and read-only HTML dashboard share one SQLite database, so a human or agent can recover the current state and the context that led there.
+Work Tracker is a small, agent-friendly Status ledger for parallel and long-running Work Items. A Rust CLI and read-only HTML dashboard preserve Work Item Status and the History Entries that led there. A private GitHub Issues ledger can be initialized explicitly for cross-machine use; the existing SQLite ledger remains available while the GitHub-backed command set is introduced.
 
 ## What it provides
 
@@ -33,7 +33,20 @@ just uninstall
 
 ## Quick start
 
-The database is created automatically at `$XDG_DATA_HOME/work-tracker/work-tracker.db`, or at `~/.local/share/work-tracker/work-tracker.db` when `XDG_DATA_HOME` is unset.
+Initialize a private GitHub ledger using the account already authenticated by `gh`:
+
+```bash
+work-tracker init github
+# defaults to <authenticated-user>/work-tracker-data
+```
+
+Pass `OWNER/REPO` to create or validate a different private repository. The first successful initialization becomes the default; later explicit repositories act as per-command overrides and do not rewrite it. `work-tracker path` reports the selected repository and local cache, and `--repository OWNER/REPO` selects an override.
+
+Initialization stores repository configuration but no GitHub token. It creates the repository only after the explicit command, validates existing repositories before use, and is safe to repeat.
+
+### Local SQLite ledger
+
+The database is created automatically at `$XDG_DATA_HOME/work-tracker/work-tracker.db`, or at `~/.local/share/work-tracker/work-tracker.db` when `XDG_DATA_HOME` is unset. After a GitHub default is configured, pass `--database PATH` to select this explicit local backend.
 
 ```bash
 work-tracker add "Watch company CI" \
@@ -64,6 +77,7 @@ If neither is set, the CLI uses the current `USER`, then `unknown` as a last res
 
 | Command | Purpose |
 |---|---|
+| `init github [OWNER/REPO]` | Create or validate a private GitHub Issues ledger and its local cache |
 | `add` | Create a Work Item, initially `pending` unless selected otherwise |
 | `show ID` | Show one item, including an Archived Work Item |
 | `list` | List actionable items; `--all` adds done and cancelled, `--status` selects one status |
@@ -73,7 +87,7 @@ If neither is set, the CLI uses the current `USER`, then `unknown` as a last res
 | `note ID MESSAGE` | Preserve context without changing status |
 | `archive ID` | Permanently archive an item while retaining its history |
 | `history ID` | Show the complete immutable history |
-| `path` | Show the SQLite database path |
+| `path` | Show the selected repository/cache or SQLite database path |
 | `serve` | Host the read-only dashboard |
 
 The statuses are `pending`, `active`, `waiting`, `blocked`, `done`, `cancelled`, and `archived`. The first four are actionable: they are what `list` shows by default, and they remain in the Daily View even when they were not updated today.

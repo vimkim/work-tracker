@@ -16,12 +16,26 @@ use crate::domain::Status;
 )]
 pub struct Cli {
     /// SQLite database path. Defaults to the platform user data directory.
-    #[arg(long, global = true, env = "WORK_TRACKER_DB")]
+    #[arg(
+        long,
+        global = true,
+        env = "WORK_TRACKER_DB",
+        conflicts_with = "repository"
+    )]
     pub database: Option<PathBuf>,
 
     /// Emit machine-readable JSON.
     #[arg(long, global = true)]
     pub json: bool,
+
+    /// Use this GitHub ledger for the current command without changing the default.
+    #[arg(
+        long,
+        global = true,
+        value_name = "OWNER/REPO",
+        conflicts_with = "database"
+    )]
+    pub repository: Option<String>,
 
     #[command(subcommand)]
     pub command: Command,
@@ -29,6 +43,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Initialize an authoritative ledger backend.
+    Init(InitArgs),
     /// Create a work item.
     Add(AddArgs),
     /// Show one work item, including an Archived Work Item.
@@ -52,6 +68,25 @@ pub enum Command {
     Path,
     /// Host the read-only HTML dashboard.
     Serve(ServeArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct InitArgs {
+    #[command(subcommand)]
+    pub backend: InitBackend,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum InitBackend {
+    /// Create or validate a private GitHub Issues ledger.
+    Github(InitGithubArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct InitGithubArgs {
+    /// Repository to initialize. Defaults to <authenticated-user>/work-tracker-data.
+    #[arg(value_name = "OWNER/REPO", conflicts_with = "repository")]
+    pub target: Option<String>,
 }
 
 #[derive(Debug, Args)]

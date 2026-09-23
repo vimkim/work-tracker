@@ -15,7 +15,7 @@ Work Tracker preserves the current status and context of long-running work acros
 
 ## Invariants
 
-- SQLite is the single source of truth. Do not add a second writable store.
+- GitHub Issues is the authoritative ledger after explicit GitHub initialization; SQLite remains the single source of truth only for the explicit local backend and is otherwise a disposable cache. See ADR 0002.
 - Every effective mutation and standalone note appends a History Entry in the same transaction.
 - Repeating an already-applied status is idempotent and does not append history.
 - Archived Work Items are immutable and retained indefinitely with their history.
