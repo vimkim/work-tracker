@@ -944,6 +944,247 @@ fn stable_event_id_recovers_an_update_whose_publication_response_was_lost() -> R
 }
 
 #[test]
+fn stable_event_retry_recovers_after_confirmation_read_failure() -> Result<()> {
+    let cli = CliHarness::new()?;
+    let gh = FakeGh::new()?;
+    initialize(&cli, &gh)?;
+    let (projection, genesis) = create_item(&cli, &gh)?;
+    let event_id = "update-confirmation-failed-41";
+    let update = updated_comment(
+        event_id,
+        "agent-b",
+        "octocat",
+        1,
+        None,
+        serde_json::json!({
+            "title": {"from": "Watch CI", "to": "Confirmed on retry"}
+        }),
+    );
+    let issue = serde_json::json!({
+        "number": 41,
+        "title": "Watch CI",
+        "body": projection,
+        "labels": [
+            {"name": "work-tracker:item"},
+            {"name": "work-tracker:status:pending"}
+        ]
+    });
+    let genesis_comment = serde_json::json!({
+        "id": 9001,
+        "created_at": "2026-09-23T01:02:04Z",
+        "user": {"login": "octocat"},
+        "body": genesis
+    });
+    let update_comment = serde_json::json!({
+        "id": 9002,
+        "created_at": "2026-09-23T01:03:04Z",
+        "user": {"login": "octocat"},
+        "body": update
+    });
+
+    gh.respond(17, 0, r#"{"login":"octocat"}"#, "")?;
+    gh.respond(18, 0, &issue.to_string(), "")?;
+    gh.respond(
+        19,
+        0,
+        &serde_json::json!([[genesis_comment]]).to_string(),
+        "",
+    )?;
+    gh.respond(
+        20,
+        0,
+        r#"{"id":9002,"created_at":"2026-09-23T01:03:04Z","user":{"login":"octocat"}}"#,
+        "",
+    )?;
+    gh.respond(21, 1, "", "gh: service unavailable (HTTP 503)\n")?;
+    let failed = cli.run_with_fake_gh(
+        &gh,
+        [
+            "--json",
+            "update",
+            "41",
+            "--title",
+            "Confirmed on retry",
+            "--event-id",
+            event_id,
+            "--actor",
+            "agent-b",
+        ],
+    )?;
+    ensure!(!failed.status.success());
+    assert_eq!(failed.stdout, b"");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&failed.stderr)?["error"]["code"],
+        "github_service_failure"
+    );
+
+    gh.respond(22, 0, r#"{"login":"octocat"}"#, "")?;
+    gh.respond(23, 0, &issue.to_string(), "")?;
+    gh.respond(
+        24,
+        0,
+        &serde_json::json!([[genesis_comment, update_comment]]).to_string(),
+        "",
+    )?;
+    gh.respond(25, 0, "{}", "")?;
+    let recovered = cli.run_with_fake_gh(
+        &gh,
+        [
+            "--json",
+            "update",
+            "41",
+            "--title",
+            "Confirmed on retry",
+            "--event-id",
+            event_id,
+            "--actor",
+            "agent-b",
+        ],
+    )?;
+    assert_success(&recovered)?;
+    assert_eq!(json(&recovered)?["title"], "Confirmed on retry");
+    assert_eq!(
+        gh.calls()?
+            .matches("\tPOST\trepos/octocat/work-tracker-data/issues/41/comments")
+            .count(),
+        2,
+        "retry published a duplicate after confirmation failure"
+    );
+    Ok(())
+}
+
+#[test]
+fn retry_racing_another_accepted_mutation_converges_without_duplicate_history() -> Result<()> {
+    let cli = CliHarness::new()?;
+    let gh = FakeGh::new()?;
+    initialize(&cli, &gh)?;
+    let (projection, genesis) = create_item(&cli, &gh)?;
+    let event_id = "update-lost-before-race";
+    let first_update = updated_comment(
+        event_id,
+        "agent-b",
+        "octocat",
+        1,
+        None,
+        serde_json::json!({
+            "title": {"from": "Watch CI", "to": "First result"}
+        }),
+    );
+    let racing_update = updated_comment(
+        "update-racer",
+        "agent-c",
+        "other-user",
+        2,
+        None,
+        serde_json::json!({
+            "title": {"from": "First result", "to": "Racer result"}
+        }),
+    );
+    let issue = serde_json::json!({
+        "number": 41,
+        "title": "Watch CI",
+        "body": projection,
+        "labels": [
+            {"name": "work-tracker:item"},
+            {"name": "work-tracker:status:pending"}
+        ]
+    });
+    let genesis_comment = serde_json::json!({
+        "id": 9001,
+        "created_at": "2026-09-23T01:02:04Z",
+        "user": {"login": "octocat"},
+        "body": genesis
+    });
+    let first_comment = serde_json::json!({
+        "id": 9002,
+        "created_at": "2026-09-23T01:03:04Z",
+        "user": {"login": "octocat"},
+        "body": first_update
+    });
+    let racing_comment = serde_json::json!({
+        "id": 9003,
+        "created_at": "2026-09-23T01:04:04Z",
+        "user": {"login": "other-user"},
+        "body": racing_update
+    });
+
+    gh.respond(17, 0, r#"{"login":"octocat"}"#, "")?;
+    gh.respond(18, 0, &issue.to_string(), "")?;
+    gh.respond(
+        19,
+        0,
+        &serde_json::json!([[genesis_comment]]).to_string(),
+        "",
+    )?;
+    gh.respond(20, 1, "", "gh: connection reset after upload\n")?;
+    let uncertain = cli.run_with_fake_gh(
+        &gh,
+        [
+            "--json",
+            "update",
+            "41",
+            "--title",
+            "First result",
+            "--event-id",
+            event_id,
+            "--actor",
+            "agent-b",
+        ],
+    )?;
+    ensure!(!uncertain.status.success());
+
+    gh.respond(21, 0, r#"{"login":"octocat"}"#, "")?;
+    gh.respond(22, 0, &issue.to_string(), "")?;
+    gh.respond(
+        23,
+        0,
+        &serde_json::json!([[genesis_comment, first_comment, racing_comment]]).to_string(),
+        "",
+    )?;
+    gh.respond(24, 0, "{}", "")?;
+    let recovered = cli.run_with_fake_gh(
+        &gh,
+        [
+            "--json",
+            "update",
+            "41",
+            "--title",
+            "First result",
+            "--event-id",
+            event_id,
+            "--actor",
+            "agent-b",
+        ],
+    )?;
+    assert_success(&recovered)?;
+    assert_eq!(json(&recovered)?["title"], "Racer result");
+
+    let cache = cli.github_cache_path("octocat", "work-tracker-data");
+    let history = cli.run([
+        "--json",
+        "--database",
+        cache.to_str().context("cache path was not UTF-8")?,
+        "history",
+        "41",
+    ])?;
+    assert_success(&history)?;
+    let history = json(&history)?;
+    let history = history.as_array().context("history was not an array")?;
+    assert_eq!(history.len(), 3);
+    assert_eq!(history[1]["event_id"], event_id);
+    assert_eq!(history[2]["event_id"], "update-racer");
+    assert_eq!(history[2]["state_revision"], 3);
+    assert_eq!(
+        gh.calls()?
+            .matches("\tPOST\trepos/octocat/work-tracker-data/issues/41/comments")
+            .count(),
+        2,
+        "retry published a duplicate mutation proposal"
+    );
+    Ok(())
+}
+
+#[test]
 fn update_requires_successful_online_preflight_before_reading_or_recording_state() -> Result<()> {
     let cli = CliHarness::new()?;
     let gh = FakeGh::new()?;

@@ -2,7 +2,6 @@ use std::process::ExitCode;
 use std::str::FromStr;
 
 use anyhow::Result;
-use clap::Parser;
 use serde_json::json;
 use work_tracker::{
     cli::{self, Cli, Command, InitBackend, ListArgs},
@@ -15,7 +14,13 @@ use work_tracker::{
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match cli::parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            output::print_cli_error(error.error(), error.json_output());
+            return ExitCode::from(error.exit_code());
+        }
+    };
     let json_output = cli.json;
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,

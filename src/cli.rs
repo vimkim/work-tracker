@@ -1,5 +1,6 @@
 use std::{
     env,
+    ffi::OsString,
     path::{Path, PathBuf},
 };
 
@@ -50,6 +51,41 @@ pub struct Cli {
 
     #[command(subcommand)]
     pub command: Command,
+}
+
+pub struct ParseFailure {
+    error: clap::Error,
+    json_output: bool,
+}
+
+impl ParseFailure {
+    pub fn error(&self) -> &clap::Error {
+        &self.error
+    }
+
+    pub fn json_output(&self) -> bool {
+        self.json_output
+    }
+
+    pub fn exit_code(&self) -> u8 {
+        u8::try_from(self.error.exit_code()).unwrap_or(1)
+    }
+}
+
+pub fn parse() -> std::result::Result<Cli, ParseFailure> {
+    parse_from(env::args_os())
+}
+
+fn parse_from(
+    arguments: impl IntoIterator<Item = OsString>,
+) -> std::result::Result<Cli, ParseFailure> {
+    let arguments = arguments.into_iter().collect::<Vec<_>>();
+    let json_output = arguments
+        .iter()
+        .skip(1)
+        .take_while(|argument| argument.as_os_str() != "--")
+        .any(|argument| argument == "--json");
+    Cli::try_parse_from(arguments).map_err(|error| ParseFailure { error, json_output })
 }
 
 #[derive(Debug, Subcommand)]
@@ -414,5 +450,34 @@ mod tests {
         assert_eq!(rebaseline.actor.actor.as_deref(), Some("reviewer"));
         assert_eq!(rebaseline.reason.as_deref(), Some("reviewed current state"));
         Ok(())
+    }
+
+    #[test]
+    fn parse_failure_retains_json_mode_and_clap_exit_code() {
+        let failure = parse_from([
+            OsString::from("work-tracker"),
+            OsString::from("--json"),
+            OsString::from("list"),
+            OsString::from("--all"),
+            OsString::from("--status"),
+            OsString::from("done"),
+        ])
+        .expect_err("conflicting arguments must fail");
+        assert!(failure.json_output());
+        assert_eq!(failure.exit_code(), 2);
+        assert!(failure.error().use_stderr());
+    }
+
+    #[test]
+    fn json_text_after_the_argument_delimiter_does_not_select_json_diagnostics() {
+        let failure = parse_from([
+            OsString::from("work-tracker"),
+            OsString::from("add"),
+            OsString::from("--"),
+            OsString::from("--json"),
+            OsString::from("unexpected"),
+        ])
+        .expect_err("extra positional input must fail");
+        assert!(!failure.json_output());
     }
 }

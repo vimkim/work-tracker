@@ -295,6 +295,10 @@ mod tests {
         let index_body = to_bytes(index.into_body(), usize::MAX).await?;
         let index_body = String::from_utf8(index_body.to_vec())?;
         assert!(index_body.contains("Watch &lt;CI&gt;"));
+        assert!(
+            !index_body.contains("Retained evidence"),
+            "Daily View must exclude the Archived Work Item"
+        );
 
         let detail = app
             .clone()
@@ -322,6 +326,40 @@ mod tests {
         assert!(archived_body.contains("Retained evidence"));
         assert!(archived_body.contains("status-archived\">archived"));
         assert!(archived_body.contains("superseded"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dashboard_rejects_mutating_http_methods() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let config = LedgerConfig::sqlite(directory.path().join("tracker.db"));
+        let mut ledger = config.open()?;
+        let item = ledger.create("Read only", None, Status::Pending, "agent-a", None)?;
+        drop(ledger);
+        let app = router(config.clone(), ReadPolicy::PreferFresh);
+
+        for (method, uri) in [
+            ("POST", "/".to_owned()),
+            ("PUT", format!("/items/{}", item.id)),
+            ("PATCH", format!("/items/{}", item.id)),
+            ("DELETE", format!("/items/{}", item.id)),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .body(Body::empty())?,
+                )
+                .await?;
+            assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        }
+
+        let ledger = config.open()?;
+        let unchanged = ledger.get(item.id)?;
+        assert_eq!(unchanged.title, "Read only");
+        assert_eq!(unchanged.status, Status::Pending);
         Ok(())
     }
 

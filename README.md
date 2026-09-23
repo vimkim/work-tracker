@@ -33,7 +33,18 @@ just uninstall
 
 ## Quick start
 
-Initialize a private GitHub ledger using the account already authenticated by `gh`:
+Work Tracker delegates GitHub authentication to the GitHub CLI and never stores a token. Install
+`gh`, authenticate the account that will own or access the data repository, and verify the active
+account before initialization:
+
+```bash
+gh auth login
+gh auth status
+```
+
+The account needs permission to create a private repository when the default repository does not
+exist, or push permission plus Issues access for an existing repository. Initialize a private
+GitHub ledger only after confirming that account:
 
 ```bash
 work-tracker init github
@@ -43,6 +54,19 @@ work-tracker init github
 Pass `OWNER/REPO` to create or validate a different private repository. The first successful initialization becomes the default; later explicit repositories act as per-command overrides and do not rewrite it. `work-tracker path` reports the selected repository and local cache, and `--repository OWNER/REPO` selects an override.
 
 Initialization stores repository configuration but no GitHub token. It creates the repository only after the explicit command, validates existing repositories before use, and is safe to repeat.
+
+### Fresh, stale, and offline reads
+
+Normal GitHub-backed reads synchronize first. If GitHub has a network or service outage after at
+least one successful synchronization, they return cached data with a prominent stale warning.
+JSON data stays on standard output and a structured warning is written to standard error.
+
+- Add `--fresh` when stale data is unacceptable. The command fails nonzero instead of falling back.
+- Add `--offline` to deliberately skip GitHub and inspect the cache. The output is explicitly
+  marked offline/stale, and it fails until that machine has completed one successful sync.
+- GitHub-backed writes always require GitHub. `--offline` rejects a write before changing the
+  cache, and authentication, permission, validation, rate-limit, network, and service failures are
+  reported separately.
 
 ### GitHub retries and repair
 
@@ -57,6 +81,13 @@ GitHub writes are convergent. For `add`, `update`, `status`, `note`, and `archiv
 | Cache batch commit is interrupted | The item/history changes and synchronization cursor roll back together; the next synchronization replays the batch. |
 | A projection field is edited directly on GitHub | Synchronization repairs it and emits `github_projection_repaired`; unstructured comments are left untouched. |
 
+A field or Status race is different from an interrupted request. The first valid proposal in
+GitHub comment order wins. A losing command exits nonzero with a **Rejected Mutation** containing
+the expected and current State Revisions and the current values. Inspect `show`, `history`, and
+`rejected`; if the change is still appropriate, submit a new proposal with a new event ID based on
+the refreshed state. Reusing the losing event ID returns the same rejected result—it does not turn
+the old proposal into a new mutation.
+
 Structured event edits, deletions, unknown event schemas, and broken history heads are never repaired automatically. The affected Work Item remains inspectable with an integrity warning, trusted and untrusted History Entries are labelled, and every mutation of that item is refused before publication. Diagnose the first break without modifying GitHub:
 
 ```bash
@@ -66,11 +97,37 @@ work-tracker --json doctor 41
 
 The report includes GitHub comment, event, and Actor identities; expected and observed hashes; any cached exact copy; relevant timeline evidence; and whether exact restoration or only an explicit Rebaseline is eligible.
 
+Recovery is never automatic. Keep the diagnosis available for review, then choose exactly one
+eligible operation:
+
+```bash
+# Only when doctor reports an exact verified cached copy.
+work-tracker recover 41 --mode restore-exact-copy
+
+# When exact restoration is impossible, after reviewing the live issue state and damaged evidence.
+work-tracker recover 41 --mode rebaseline \
+  --actor operator-name \
+  --reason "reviewed the live projection and retained damaged evidence"
+```
+
+Exact restoration refuses an unverified copy. A Rebaseline records the Actor and reason, retains
+the damaged evidence as untrusted, and starts a new verified chain at the reviewed live state.
+Either operation fails closed if evidence changes during recovery. Archived Work Items remain
+archived and locked throughout recovery.
+
 In `--json` mode, GitHub authentication, permission, validation, rate-limit, network, service, and unknown API failures have distinct error codes on standard error. Successful data remains on standard output, including when a warning is emitted.
 
 ### Local SQLite ledger
 
 The database is created automatically at `$XDG_DATA_HOME/work-tracker/work-tracker.db`, or at `~/.local/share/work-tracker/work-tracker.db` when `XDG_DATA_HOME` is unset. After a GitHub default is configured, pass `--database PATH` to select this explicit local backend.
+
+An existing local ledger is never uploaded during GitHub initialization. Continue to inspect it
+explicitly, including after configuring a GitHub default:
+
+```bash
+work-tracker --database /path/to/legacy.db list --all
+work-tracker --database /path/to/legacy.db show 17
+```
 
 ```bash
 work-tracker add "Watch company CI" \
@@ -182,3 +239,20 @@ The skill teaches agents to create a Work Item before long-running work, record 
 ## Development
 
 See `AGENTS.md` for architecture and invariants, and `docs/adr/` for recorded decisions. `CLAUDE.md` is a symlink to the same guidance so both agent environments receive one canonical instruction file.
+
+### Opt-in live GitHub smoke
+
+Ordinary tests use an isolated fake `gh` executable and never contact a real repository. A separate
+live procedure is available only for release qualification. It creates a uniquely named
+**disposable private repository**, verifies privacy before recording a Work Item, exercises the
+GitHub-backed lifecycle and a cache rebuild, then deletes only that guarded disposable repository:
+
+```bash
+WORK_TRACKER_GITHUB_SMOKE=1 just smoke-github
+# Optional owner or organization with private-repository create/delete permission:
+WORK_TRACKER_GITHUB_SMOKE=1 just smoke-github my-org
+```
+
+The active `gh` account must be allowed to create private repositories and delete the disposable
+repository (typically the `repo` and `delete_repo` scopes for classic tokens). Do not point this
+procedure at an existing repository. It is intentionally absent from `just check`.

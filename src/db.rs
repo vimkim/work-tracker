@@ -1133,7 +1133,7 @@ impl Ledger for SqliteLedger {
     }
 
     fn daily_view(&mut self, include_archived: bool) -> Result<Vec<WorkItem>> {
-        let (start, end) = local_day_bounds(Utc::now())?;
+        let (start, end) = local_day_bounds(daily_view_now()?)?;
         let mut statement = self.connection.prepare(&format!(
             "SELECT id, title, description, status, created_at, updated_at, archived_at
              FROM work_items
@@ -1334,6 +1334,22 @@ fn timestamp(value: DateTime<Utc>) -> String {
     value.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
+fn daily_view_now() -> Result<DateTime<Utc>> {
+    #[cfg(debug_assertions)]
+    match std::env::var("WORK_TRACKER_TEST_NOW") {
+        Ok(value) => {
+            return DateTime::parse_from_rfc3339(&value)
+                .map(|value| value.with_timezone(&Utc))
+                .with_context(|| "WORK_TRACKER_TEST_NOW must be an RFC 3339 timestamp");
+        }
+        Err(std::env::VarError::NotPresent) => {}
+        Err(std::env::VarError::NotUnicode(_)) => {
+            bail!("WORK_TRACKER_TEST_NOW must be valid UTF-8");
+        }
+    }
+    Ok(Utc::now())
+}
+
 fn local_day_bounds(now: DateTime<Utc>) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
     let local_date = now.with_timezone(&Local).date_naive();
     let start_naive = local_date.and_time(NaiveTime::MIN);
@@ -1525,6 +1541,7 @@ fn conversion_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::ensure;
 
     fn github_cache_item(work_item_id: i64, history_id: i64) -> GithubCacheItem {
         let occurred_at = Utc
@@ -1562,6 +1579,404 @@ mod tests {
             rejected: Vec::new(),
             evidence: Vec::new(),
         }
+    }
+
+    fn complete_github_cache_item(work_item_id: i64, history_id: i64) -> GithubCacheItem {
+        complete_github_cache_item_with_title(
+            work_item_id,
+            history_id,
+            format!("Work item {work_item_id}"),
+        )
+    }
+
+    fn complete_github_cache_item_with_title(
+        work_item_id: i64,
+        history_id: i64,
+        title: String,
+    ) -> GithubCacheItem {
+        let mut cached = github_cache_item(work_item_id, history_id);
+        let occurred_at = cached.item.updated_at;
+        cached.item.title.clone_from(&title);
+        cached.history[0].event_id = Some(format!("event-{work_item_id}"));
+        cached.history[0].kind = "created".to_owned();
+        cached.history[0].actor = "agent-a".to_owned();
+        cached.history[0].changes = json!({
+            "title": title,
+            "description": null,
+            "status": "active",
+        });
+        cached.history[0].history_hash = Some("verified-hash".to_owned());
+        cached.history[0].state_revision = Some(1);
+        cached.history[0].trust = EvidenceTrust::Trusted;
+        cached.rejected.push(RejectedMutation {
+            id: history_id + 100,
+            work_item_id,
+            event_id: format!("rejected-{work_item_id}"),
+            actor: "agent-b".to_owned(),
+            github_actor: "octocat".to_owned(),
+            note: Some("stale proposal".to_owned()),
+            occurred_at,
+            expected_state_revision: 0,
+            current_state_revision: 1,
+            changes: json!({"title": {"from": cached.item.title, "to": "Stale title"}}),
+        });
+        cached.evidence.push(GithubEventEvidence {
+            comment_id: history_id,
+            event_id: Some(format!("event-{work_item_id}")),
+            github_actor: "octocat".to_owned(),
+            body: "exact structured event body".to_owned(),
+            history_hash: Some("verified-hash".to_owned()),
+        });
+        cached
+    }
+
+    fn assert_complete_github_cache_item(
+        tracker: &mut SqliteLedger,
+        work_item_id: i64,
+        title: &str,
+        history_id: i64,
+        context: &str,
+    ) -> Result<()> {
+        assert_eq!(tracker.get(work_item_id)?.title, title, "{context}");
+        let history = tracker.history(work_item_id)?;
+        let expected_event_id = format!("event-{work_item_id}");
+        assert_eq!(history.len(), 1, "{context}");
+        assert_eq!(history[0].id, history_id, "{context}");
+        assert_eq!(history[0].kind, "created", "{context}");
+        assert_eq!(
+            history[0].event_id.as_deref(),
+            Some(expected_event_id.as_str()),
+            "{context}"
+        );
+        assert_eq!(
+            history[0].changes,
+            json!({"title": title, "description": null, "status": "active"}),
+            "{context}"
+        );
+        assert_eq!(
+            history[0].history_hash.as_deref(),
+            Some("verified-hash"),
+            "{context}"
+        );
+        assert_eq!(history[0].state_revision, Some(1), "{context}");
+        assert_eq!(history[0].trust, EvidenceTrust::Trusted, "{context}");
+        let rejected = tracker.rejected_mutations(work_item_id)?;
+        assert_eq!(rejected.len(), 1, "{context}");
+        assert_eq!(rejected[0].id, history_id + 100, "{context}");
+        assert_eq!(
+            rejected[0].event_id,
+            format!("rejected-{work_item_id}"),
+            "{context}"
+        );
+        assert_eq!(
+            rejected[0].changes,
+            json!({"title": {"from": title, "to": "Stale title"}}),
+            "{context}"
+        );
+        let evidence: (i64, Option<String>, String, String, Option<String>) =
+            tracker.connection.query_row(
+                "SELECT comment_id, event_id, github_actor, body, history_hash
+                 FROM github_event_evidence WHERE work_item_id = ?1",
+                [work_item_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )?;
+        assert_eq!(
+            evidence,
+            (
+                history_id,
+                Some(format!("event-{work_item_id}")),
+                "octocat".to_owned(),
+                "exact structured event body".to_owned(),
+                Some("verified-hash".to_owned()),
+            ),
+            "{context}"
+        );
+        Ok(())
+    }
+
+    fn exact_cache_database_snapshot(
+        tracker: &SqliteLedger,
+    ) -> Result<Vec<(String, Vec<Vec<String>>)>> {
+        let tables = [
+            ("work_items", "id"),
+            ("history_entries", "work_item_id, id"),
+            ("rejected_mutations", "work_item_id, id"),
+            ("github_event_evidence", "work_item_id, comment_id"),
+            ("github_integrity_errors", "work_item_id"),
+            ("pending_github_creations", "request_json"),
+            ("github_cache_state", "repository"),
+            ("sqlite_sequence", "name"),
+        ];
+        let mut snapshot = Vec::with_capacity(tables.len());
+        for (table, order) in tables {
+            let mut statement = tracker
+                .connection
+                .prepare(&format!("SELECT * FROM {table} ORDER BY {order}"))?;
+            let column_count = statement.column_count();
+            let rows = statement
+                .query_map([], |row| {
+                    (0..column_count)
+                        .map(|index| {
+                            let value = match row.get_ref(index)? {
+                                rusqlite::types::ValueRef::Null => "null".to_owned(),
+                                rusqlite::types::ValueRef::Integer(value) => {
+                                    format!("integer:{value}")
+                                }
+                                rusqlite::types::ValueRef::Real(value) => {
+                                    format!("real:{:016x}", value.to_bits())
+                                }
+                                rusqlite::types::ValueRef::Text(value) => {
+                                    format!("text:{value:?}")
+                                }
+                                rusqlite::types::ValueRef::Blob(value) => {
+                                    format!("blob:{value:?}")
+                                }
+                            };
+                            Ok(value)
+                        })
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            snapshot.push((table.to_owned(), rows));
+        }
+        Ok(snapshot)
+    }
+
+    fn seed_cache_failure_state(
+        tracker: &mut SqliteLedger,
+        repository: &str,
+        request_json: &str,
+        old_sync: DateTime<Utc>,
+        with_cache_state: bool,
+    ) -> Result<()> {
+        let old_item = complete_github_cache_item(41, 9001);
+        let old_current_item =
+            complete_github_cache_item_with_title(42, 9002, "Old cached Work Item 42".to_owned());
+        if with_cache_state {
+            tracker.replace_github_cache_batch(
+                repository,
+                &[old_item, old_current_item],
+                GithubCacheCleanup {
+                    removed_item_ids: &[],
+                    completed_creation_requests: &[],
+                },
+                Some(old_sync),
+                Some("old-etag"),
+                old_sync,
+            )?;
+        } else {
+            tracker.replace_github_item(&old_item)?;
+            tracker.replace_github_item(&old_current_item)?;
+        }
+        tracker.begin_github_creation(request_json, "pending-event")?;
+        Ok(())
+    }
+
+    #[test]
+    fn cache_batch_failure_at_each_step_rolls_back_and_retry_converges() -> Result<()> {
+        let repository = "octocat/work-tracker-data";
+        let request_json = r#"{"title":"pending"}"#;
+        let old_sync = Utc
+            .with_ymd_and_hms(2026, 9, 23, 1, 0, 0)
+            .single()
+            .expect("valid fixture timestamp");
+        let new_sync = Utc
+            .with_ymd_and_hms(2026, 9, 23, 2, 0, 0)
+            .single()
+            .expect("valid fixture timestamp");
+        let triggers = [
+            (
+                "removed Work Item",
+                "CREATE TRIGGER interrupt_cache_step BEFORE DELETE ON work_items
+                 WHEN OLD.id = 41 BEGIN SELECT RAISE(ABORT, 'removed item'); END;",
+                true,
+            ),
+            (
+                "current Work Item",
+                "CREATE TRIGGER interrupt_cache_step BEFORE INSERT ON work_items
+                 WHEN NEW.id = 42 BEGIN SELECT RAISE(ABORT, 'current item'); END;",
+                true,
+            ),
+            (
+                "accepted history cleanup",
+                "CREATE TRIGGER interrupt_cache_step BEFORE DELETE ON history_entries
+                 WHEN OLD.work_item_id = 42 BEGIN SELECT RAISE(ABORT, 'history cleanup'); END;",
+                true,
+            ),
+            (
+                "accepted history replacement",
+                "CREATE TRIGGER interrupt_cache_step BEFORE INSERT ON history_entries
+                 WHEN NEW.work_item_id = 42 BEGIN SELECT RAISE(ABORT, 'history'); END;",
+                true,
+            ),
+            (
+                "Rejected Mutation cleanup",
+                "CREATE TRIGGER interrupt_cache_step BEFORE DELETE ON rejected_mutations
+                 WHEN OLD.work_item_id = 42 BEGIN SELECT RAISE(ABORT, 'rejected cleanup'); END;",
+                true,
+            ),
+            (
+                "Rejected Mutation replacement",
+                "CREATE TRIGGER interrupt_cache_step BEFORE INSERT ON rejected_mutations
+                 WHEN NEW.work_item_id = 42 BEGIN SELECT RAISE(ABORT, 'rejected'); END;",
+                true,
+            ),
+            (
+                "exact event evidence cleanup",
+                "CREATE TRIGGER interrupt_cache_step BEFORE DELETE ON github_event_evidence
+                 WHEN OLD.work_item_id = 42 BEGIN SELECT RAISE(ABORT, 'evidence cleanup'); END;",
+                true,
+            ),
+            (
+                "exact event evidence replacement",
+                "CREATE TRIGGER interrupt_cache_step BEFORE INSERT ON github_event_evidence
+                 WHEN NEW.work_item_id = 42 BEGIN SELECT RAISE(ABORT, 'evidence'); END;",
+                true,
+            ),
+            (
+                "completed creation cleanup",
+                "CREATE TRIGGER interrupt_cache_step BEFORE DELETE ON pending_github_creations
+                 BEGIN SELECT RAISE(ABORT, 'pending creation'); END;",
+                true,
+            ),
+            (
+                "freshness metadata update",
+                "CREATE TRIGGER interrupt_cache_step BEFORE UPDATE ON github_cache_state
+                 BEGIN SELECT RAISE(ABORT, 'freshness'); END;",
+                true,
+            ),
+            (
+                "freshness metadata insert",
+                "CREATE TRIGGER interrupt_cache_step BEFORE INSERT ON github_cache_state
+                 BEGIN SELECT RAISE(ABORT, 'freshness insert'); END;",
+                false,
+            ),
+        ];
+
+        for (step, trigger, with_cache_state) in triggers {
+            let mut tracker = SqliteLedger::open_in_memory()?;
+            seed_cache_failure_state(
+                &mut tracker,
+                repository,
+                request_json,
+                old_sync,
+                with_cache_state,
+            )?;
+            let before_failure = exact_cache_database_snapshot(&tracker)?;
+            tracker.connection.execute_batch(trigger)?;
+
+            let new_item = complete_github_cache_item(42, 9102);
+            let failed = tracker.replace_github_cache_batch(
+                repository,
+                std::slice::from_ref(&new_item),
+                GithubCacheCleanup {
+                    removed_item_ids: &[41],
+                    completed_creation_requests: &[request_json.to_owned()],
+                },
+                Some(new_sync),
+                Some("new-etag"),
+                new_sync,
+            );
+            ensure!(failed.is_err(), "{step} failure was not injected");
+            assert_eq!(
+                exact_cache_database_snapshot(&tracker)?,
+                before_failure,
+                "{step} did not roll the complete cache database back exactly"
+            );
+            ensure!(
+                tracker.get(41).is_ok(),
+                "{step} partially removed old state"
+            );
+            ensure!(
+                tracker.get(42).is_ok(),
+                "{step} removed the prior current state"
+            );
+            assert_complete_github_cache_item(&mut tracker, 41, "Work item 41", 9001, step)?;
+            assert_complete_github_cache_item(
+                &mut tracker,
+                42,
+                "Old cached Work Item 42",
+                9002,
+                step,
+            )?;
+            ensure!(
+                tracker.pending_github_creation(request_json)?.is_some(),
+                "{step} partially cleared pending creation"
+            );
+            assert_eq!(
+                tracker.github_sync_cursor(repository)?,
+                with_cache_state.then_some(old_sync),
+                "{step}"
+            );
+
+            tracker
+                .connection
+                .execute_batch("DROP TRIGGER interrupt_cache_step;")?;
+            let mut expected = SqliteLedger::open_in_memory()?;
+            seed_cache_failure_state(
+                &mut expected,
+                repository,
+                request_json,
+                old_sync,
+                with_cache_state,
+            )?;
+            expected.replace_github_cache_batch(
+                repository,
+                std::slice::from_ref(&new_item),
+                GithubCacheCleanup {
+                    removed_item_ids: &[41],
+                    completed_creation_requests: &[request_json.to_owned()],
+                },
+                Some(new_sync),
+                Some("new-etag"),
+                new_sync,
+            )?;
+            let expected_after_retry = exact_cache_database_snapshot(&expected)?;
+            tracker.replace_github_cache_batch(
+                repository,
+                std::slice::from_ref(&new_item),
+                GithubCacheCleanup {
+                    removed_item_ids: &[41],
+                    completed_creation_requests: &[request_json.to_owned()],
+                },
+                Some(new_sync),
+                Some("new-etag"),
+                new_sync,
+            )?;
+            assert_eq!(
+                exact_cache_database_snapshot(&tracker)?,
+                expected_after_retry,
+                "{step} retry did not converge to the exact expected cache database"
+            );
+            ensure!(
+                tracker.get(41).is_err(),
+                "{step} retry retained removed state"
+            );
+            assert_complete_github_cache_item(&mut tracker, 42, "Work item 42", 9102, step)?;
+            ensure!(
+                tracker.pending_github_creation(request_json)?.is_none(),
+                "{step}"
+            );
+            assert_eq!(
+                tracker.github_sync_cursor(repository)?,
+                Some(new_sync),
+                "{step}"
+            );
+            assert_eq!(
+                tracker.github_last_successful_sync_at(repository)?,
+                Some(new_sync),
+                "{step}"
+            );
+        }
+        Ok(())
     }
 
     #[test]

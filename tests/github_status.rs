@@ -2,7 +2,7 @@ mod support;
 
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
-use support::{CliHarness, FakeGh, assert_success};
+use support::{CliHarness, FakeGh, assert_success, stderr};
 
 const PRIVATE_REPOSITORY: &str = r#"{"full_name":"octocat/work-tracker-data","private":true,"has_issues":true,"permissions":{"admin":true,"push":true}}"#;
 
@@ -527,6 +527,112 @@ fn accepted_status_survives_projection_failure_and_sync_repairs_it() -> Result<(
 }
 
 #[test]
+fn accepted_done_survives_close_projection_failure_and_sync_repairs_it() -> Result<()> {
+    let scenario = StatusScenario::new()?;
+    let cli = &scenario.cli;
+    let gh = &scenario.gh;
+    let done = status_comment(
+        "{{LAST_EVENT_ID}}",
+        "pending",
+        "done",
+        "agent-b",
+        "octocat",
+        1,
+        None,
+    );
+    let issue = scenario.issue(&[]);
+    let genesis_comment = scenario.script_initial_load(&[])?;
+    let done_entry = serde_json::json!({
+        "id":9002,"created_at":"2026-09-23T01:03:04Z","user":{"login":"octocat"},"body":done
+    });
+    gh.respond(
+        20,
+        0,
+        r#"{"id":9002,"created_at":"2026-09-23T01:03:04Z","user":{"login":"octocat"}}"#,
+        "",
+    )?;
+    gh.respond(
+        21,
+        0,
+        &serde_json::json!([[genesis_comment, done_entry]]).to_string(),
+        "",
+    )?;
+    gh.respond(22, 1, "", "gh: service unavailable (HTTP 503)\n")?;
+
+    let failed =
+        cli.run_with_fake_gh(gh, ["--json", "status", "41", "done", "--actor", "agent-b"])?;
+    ensure!(!failed.status.success());
+    assert_eq!(failed.stdout, b"");
+    let error: Value = serde_json::from_slice(&failed.stderr)?;
+    assert_eq!(error["error"]["code"], "github_projection_pending");
+    assert_eq!(error["error"]["accepted"], true);
+    assert_eq!(error["error"]["effective"], true);
+    assert_eq!(error["error"]["current_values"]["status"], "done");
+    let failed_calls = gh.calls()?;
+    let failed_close = failed_calls
+        .rfind("\tPATCH\trepos/octocat/work-tracker-data/issues/41")
+        .map(|index| &failed_calls[index..])
+        .context("missing failed close projection")?;
+    ensure!(failed_close.contains("\t--field\tlabels[]=work-tracker:status:done"));
+    ensure!(failed_close.contains("\t--field\tstate=closed"));
+    ensure!(failed_close.contains("\t--field\tstate_reason=completed"));
+    let event_id = error["error"]["event_id"]
+        .as_str()
+        .context("missing event ID")?;
+
+    let done = status_comment(event_id, "pending", "done", "agent-b", "octocat", 1, None);
+    let done_entry = serde_json::json!({
+        "id":9002,"created_at":"2026-09-23T01:03:04Z","user":{"login":"octocat"},"body":done
+    });
+    gh.respond(
+        23,
+        0,
+        &serde_json::json!([[
+            {
+                "number":41,
+                "title":"Watch CI",
+                "body":issue["body"],
+                "labels":issue["labels"],
+                "state":"open",
+                "updated_at":"2026-09-23T01:03:04Z"
+            }
+        ]])
+        .to_string(),
+        "",
+    )?;
+    gh.respond(
+        24,
+        0,
+        &serde_json::json!([[genesis_comment, done_entry]]).to_string(),
+        "",
+    )?;
+    gh.respond(25, 0, "{}", "")?;
+
+    let recovered = cli.run_with_fake_gh(gh, ["--json", "history", "41"])?;
+    assert_success(&recovered)?;
+    let history = json(&recovered)?;
+    assert_eq!(history.as_array().context("history array")?.len(), 2);
+    assert_eq!(history[1]["event_id"], event_id);
+    assert_eq!(history[1]["state_revision"], 2);
+    let calls = gh.calls()?;
+    assert_eq!(
+        calls
+            .matches("\tPOST\trepos/octocat/work-tracker-data/issues/41/comments")
+            .count(),
+        2,
+        "close recovery must not publish a duplicate Status proposal"
+    );
+    let repair = calls
+        .rfind("\tPATCH\trepos/octocat/work-tracker-data/issues/41")
+        .map(|index| &calls[index..])
+        .context("missing close projection repair")?;
+    ensure!(repair.contains("\t--field\tlabels[]=work-tracker:status:done"));
+    ensure!(repair.contains("\t--field\tstate=closed"));
+    ensure!(repair.contains("\t--field\tstate_reason=completed"));
+    Ok(())
+}
+
+#[test]
 fn stable_event_id_recovers_a_status_whose_publication_response_was_lost() -> Result<()> {
     let scenario = StatusScenario::new()?;
     let cli = &scenario.cli;
@@ -580,7 +686,7 @@ fn stable_event_id_recovers_a_status_whose_publication_response_was_lost() -> Re
 }
 
 #[test]
-fn first_valid_status_wins_and_loser_gets_the_structured_conflict() -> Result<()> {
+fn first_valid_status_wins_and_loser_gets_the_human_conflict() -> Result<()> {
     let scenario = StatusScenario::new()?;
     let cli = &scenario.cli;
     let gh = &scenario.gh;
@@ -629,7 +735,6 @@ fn first_valid_status_wins_and_loser_gets_the_structured_conflict() -> Result<()
     let rejected = cli.run_with_fake_gh(
         gh,
         [
-            "--json",
             "status",
             "41",
             "blocked",
@@ -641,11 +746,11 @@ fn first_valid_status_wins_and_loser_gets_the_structured_conflict() -> Result<()
     )?;
     ensure!(!rejected.status.success());
     assert_eq!(rejected.stdout, b"");
-    let error: Value = serde_json::from_slice(&rejected.stderr)?;
-    assert_eq!(error["error"]["code"], "github_rejected_mutation");
-    assert_eq!(error["error"]["expected_state_revision"], 1);
-    assert_eq!(error["error"]["current_state_revision"], 2);
-    assert_eq!(error["error"]["current_values"]["status"], "waiting");
+    let error = stderr(&rejected)?;
+    ensure!(error.starts_with("error: Rejected Mutation"));
+    ensure!(error.contains("expected State Revision 1"));
+    ensure!(error.contains("current State Revision is 2"));
+    ensure!(error.contains("Status=waiting"));
 
     let cache = cli.github_cache_path("octocat", "work-tracker-data");
     let history = cli.run([

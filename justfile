@@ -37,3 +37,7 @@ uninstall:
 # Run the read-only dashboard on all network interfaces
 serve bind="0.0.0.0:8787":
     cargo run -- serve --bind {{bind}}
+
+# Run the opt-in live smoke against a disposable private GitHub repository
+smoke-github owner="":
+    ./scripts/github-live-smoke.sh {{owner}}

@@ -72,6 +72,7 @@ impl CliHarness {
         &self,
         fake: &FakeGh,
         timezone: &str,
+        now: &str,
         args: I,
     ) -> Result<Output>
     where
@@ -86,6 +87,7 @@ impl CliHarness {
             .env("XDG_DATA_HOME", &self.data)
             .env("USER", "harness-agent")
             .env("TZ", timezone)
+            .env("WORK_TRACKER_TEST_NOW", now)
             .env("PATH", fake.bin_dir())
             .env("FAKE_GH_ROOT", fake.root())
             .output()

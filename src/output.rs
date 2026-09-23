@@ -9,6 +9,20 @@ use crate::{
     ledger::{ReadHealth, ReadHealthError, ReadHealthErrorKind, ReadHealthKind},
 };
 
+pub fn print_cli_error(error: &clap::Error, json_output: bool) {
+    if json_output && error.use_stderr() {
+        eprintln!(
+            "{}",
+            json!({"error": {
+                "code": "cli_validation_failed",
+                "message": error.to_string(),
+            }})
+        );
+    } else if let Err(print_error) = error.print() {
+        eprintln!("error: failed to print command-line diagnostic: {print_error}");
+    }
+}
+
 pub fn print_json(value: &impl Serialize) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())

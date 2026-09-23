@@ -22,13 +22,10 @@ fn configure_github(cli: &CliHarness) -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn exact_recovery_restores_verified_copy_revalidates_and_rebuilds_projection() -> Result<()> {
-    let cli = CliHarness::new()?;
-    configure_github(&cli)?;
-    let gh = FakeGh::new()?;
-    let scenario = seed_edited_integrity(&cli, &gh)?;
-
+fn respond_successful_exact_recovery(
+    gh: &FakeGh,
+    scenario: &EditedIntegrityScenario,
+) -> Result<()> {
     gh.respond(5, 0, &scenario.corrupt_issue.to_string(), "")?;
     gh.respond(
         6,
@@ -58,6 +55,16 @@ fn exact_recovery_restores_verified_copy_revalidates_and_rebuilds_projection() -
         &json!([[remote_comment(&scenario.original_comment)]]).to_string(),
         "",
     )?;
+    Ok(())
+}
+
+#[test]
+fn exact_recovery_restores_verified_copy_revalidates_and_rebuilds_projection() -> Result<()> {
+    let cli = CliHarness::new()?;
+    configure_github(&cli)?;
+    let gh = FakeGh::new()?;
+    let scenario = seed_edited_integrity(&cli, &gh)?;
+    respond_successful_exact_recovery(&gh, &scenario)?;
     let recovered = cli.run_with_fake_gh(
         &gh,
         ["--json", "recover", "41", "--mode", "restore-exact-copy"],
@@ -77,6 +84,25 @@ fn exact_recovery_restores_verified_copy_revalidates_and_rebuilds_projection() -
         calls.contains("\tPATCH\trepos/octocat/work-tracker-data/issues/comments/9001\t--field")
     );
     ensure!(!calls.contains("\tPOST\trepos/octocat/work-tracker-data/issues/41/comments"));
+    Ok(())
+}
+
+#[test]
+fn exact_recovery_has_a_human_success_contract() -> Result<()> {
+    let cli = CliHarness::new()?;
+    configure_github(&cli)?;
+    let gh = FakeGh::new()?;
+    let scenario = seed_edited_integrity(&cli, &gh)?;
+    respond_successful_exact_recovery(&gh, &scenario)?;
+
+    let recovered = cli.run_with_fake_gh(&gh, ["recover", "41", "--mode", "restore-exact-copy"])?;
+    assert_success(&recovered)?;
+    assert_eq!(stderr(&recovered)?, "");
+    let human = std::str::from_utf8(&recovered.stdout)?;
+    ensure!(human.contains("Work Item:   41"));
+    ensure!(human.contains("Recovery:    exact_restoration"));
+    ensure!(human.contains("Validation:  full history revalidated"));
+    ensure!(human.contains("Projection:  rebuilt"));
     Ok(())
 }
 
