@@ -2,7 +2,6 @@ use std::process::ExitCode;
 use std::str::FromStr;
 
 use anyhow::Result;
-use serde_json::json;
 use work_tracker::{
     cli::{self, Cli, Command, InitBackend, ListArgs},
     config::{self, AppConfig},
@@ -269,11 +268,7 @@ fn is_write_command(command: &Command) -> bool {
 
 fn show_path(cli: &Cli) -> Result<()> {
     if let Some(database) = cli.database.as_ref() {
-        if cli.json {
-            return output::print_json(&json!({"backend": "sqlite", "database": database}));
-        }
-        println!("{}", database.display());
-        return Ok(());
+        return output::print_sqlite_path(database, cli.json);
     }
     let app_config = AppConfig::load(&config::config_path()?)?;
     let requested_override = cli
@@ -294,25 +289,11 @@ fn show_path(cli: &Cli) -> Result<()> {
         .or_else(|| app_config.as_ref().map(|config| &config.default_repository));
     if let Some(repository) = repository {
         let cache = config::github_cache_path(repository)?;
-        if cli.json {
-            return output::print_json(&json!({
-                "backend": "github",
-                "repository": repository,
-                "cache": cache,
-                "database": cache,
-            }));
-        }
-        println!("Repository: {repository}");
-        println!("Cache:      {}", cache.display());
-        return Ok(());
+        return output::print_github_path(repository, &cache, cli.json);
     }
 
     let database = cli::database_path(None)?;
-    if cli.json {
-        return output::print_json(&json!({"backend": "sqlite", "database": database}));
-    }
-    println!("{}", database.display());
-    Ok(())
+    output::print_sqlite_path(&database, cli.json)
 }
 
 fn init_github(cli: &Cli, positional_repository: Option<&str>) -> Result<()> {
@@ -342,29 +323,14 @@ fn init_github(cli: &Cli, positional_repository: Option<&str>) -> Result<()> {
         AppConfig::new(repository.full_name.clone()).save(&config_path)?;
     }
 
-    let result = json!({
-        "backend": "github",
-        "repository": repository.full_name,
-        "private": repository.private,
-        "created": created,
-        "default": is_default,
-        "cache": cache,
-    });
-    if cli.json {
-        output::print_json(&result)
-    } else {
-        println!(
-            "GitHub ledger: {}",
-            result["repository"].as_str().unwrap_or_default()
-        );
-        println!("Private:       yes");
-        println!(
-            "Default:       {}",
-            if is_default { "yes" } else { "no (override)" }
-        );
-        println!("Cache:         {}", cache.display());
-        Ok(())
-    }
+    output::print_github_initialization(
+        &repository.full_name,
+        repository.private,
+        created,
+        is_default,
+        &cache,
+        cli.json,
+    )
 }
 
 fn list_filter(args: &ListArgs) -> ListFilter {

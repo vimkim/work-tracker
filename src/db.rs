@@ -9,8 +9,8 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     domain::{
-        EvidenceTrust, HistoryEntry, IntegrityDoctorReport, RejectedMutation, Status, WorkItem,
-        normalized_optional, normalized_required,
+        DomainValidationError, EvidenceTrust, HistoryEntry, IntegrityDoctorReport,
+        RejectedMutation, Status, WorkItem, normalized_optional, normalized_required,
     },
     ledger::{Ledger, ListFilter, ReadHealth, ReadPolicy},
 };
@@ -1071,7 +1071,10 @@ impl Ledger for SqliteLedger {
         let title = normalized_required(title, "title")?;
         let actor = normalized_required(actor, "actor")?;
         if status == Status::Archived {
-            bail!("a work item cannot be created with archived status");
+            return Err(DomainValidationError::new(
+                "a work item cannot be created with archived status",
+            )
+            .into());
         }
         let description = normalized_optional(description);
         let now = Utc::now();
@@ -1325,7 +1328,11 @@ impl Ledger for SqliteLedger {
 
 fn ensure_mutable(item: &WorkItem) -> Result<()> {
     if item.status == Status::Archived {
-        bail!("work item {} is archived and cannot be modified", item.id);
+        return Err(DomainValidationError::new(format!(
+            "work item {} is archived and cannot be modified",
+            item.id
+        ))
+        .into());
     }
     Ok(())
 }

@@ -450,6 +450,17 @@ fn json_domain_validation_errors_have_a_stable_structured_shape() -> Result<()> 
     assert_eq!(error["error"]["code"], "domain_validation_failed");
     assert_eq!(error["error"]["message"], "title cannot be empty");
 
+    let archived_creation =
+        cli.run(["--json", "add", "Already archived", "--status", "archived"])?;
+    assert_eq!(archived_creation.status.code(), Some(1));
+    assert_eq!(stdout(&archived_creation)?, "");
+    let error: Value = serde_json::from_slice(&archived_creation.stderr)?;
+    assert_eq!(error["error"]["code"], "domain_validation_failed");
+    assert_eq!(
+        error["error"]["message"],
+        "a work item cannot be created with archived status"
+    );
+
     let added = cli.run(["--json", "add", "Validate notes"])?;
     assert_success(&added)?;
     let id = json(&added)?["id"]

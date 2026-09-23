@@ -465,7 +465,13 @@ fn repository_override_rejects_path_traversal() -> Result<()> {
     let failed = cli.run(["--json", "--repository", "../../escape", "path"])?;
     ensure!(!failed.status.success());
     assert_eq!(stdout(&failed)?, "");
-    ensure!(stderr(&failed)?.contains("valid OWNER/REPO"));
+    let diagnostic: Value = serde_json::from_slice(&failed.stderr)?;
+    assert_eq!(diagnostic["error"]["code"], "domain_validation_failed");
+    ensure!(
+        diagnostic["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("valid OWNER/REPO"))
+    );
     ensure!(!cli.github_cache_path("..", "escape").exists());
     Ok(())
 }

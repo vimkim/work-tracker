@@ -17,9 +17,10 @@ use uuid::Uuid;
 use crate::{
     db::{GithubCacheCleanup, GithubCacheItem, GithubEventEvidence, SqliteLedger},
     domain::{
-        EvidenceTrust, HistoryEntry, IntegrityBreak, IntegrityBreakKind, IntegrityDoctorReport,
-        IntegrityHealth, ObservedIntegrityEvidence, RecoveryOutcome, RecoveryReport,
-        RejectedMutation, RepairMode, Status, WorkItem, normalized_optional, normalized_required,
+        DomainValidationError, EvidenceTrust, HistoryEntry, IntegrityBreak, IntegrityBreakKind,
+        IntegrityDoctorReport, IntegrityHealth, ObservedIntegrityEvidence, RecoveryOutcome,
+        RecoveryReport, RejectedMutation, RepairMode, Status, WorkItem, normalized_optional,
+        normalized_required,
     },
     ledger::{Ledger, ListFilter, ReadHealth, ReadHealthErrorKind, ReadPolicy},
 };
@@ -191,7 +192,9 @@ impl FromStr for RepositoryName {
 
     fn from_str(value: &str) -> Result<Self> {
         let Some((owner, name)) = value.split_once('/') else {
-            bail!("repository must use a valid OWNER/REPO name");
+            return Err(
+                DomainValidationError::new("repository must use a valid OWNER/REPO name").into(),
+            );
         };
         if owner.is_empty()
             || name.is_empty()
@@ -203,7 +206,9 @@ impl FromStr for RepositoryName {
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
         {
-            bail!("repository must use a valid OWNER/REPO name");
+            return Err(
+                DomainValidationError::new("repository must use a valid OWNER/REPO name").into(),
+            );
         }
         Ok(Self {
             owner: owner.to_owned(),
@@ -764,7 +769,10 @@ impl GitHubLedger {
         let title = normalized_required(title, "title")?;
         let actor = normalized_required(actor, "actor")?;
         if status == Status::Archived {
-            bail!("a work item cannot be created with archived status");
+            return Err(DomainValidationError::new(
+                "a work item cannot be created with archived status",
+            )
+            .into());
         }
         let description = normalized_optional(description);
         let note = normalized_optional(note);
@@ -1952,7 +1960,10 @@ impl GitHubLedger {
     fn prepare_mutation(&self, issue_number: i64) -> Result<PreparedMutation> {
         let prepared = self.load_prepared_mutation(issue_number)?;
         if prepared.current.status == Status::Archived {
-            bail!("work item {issue_number} is archived and cannot be modified");
+            return Err(DomainValidationError::new(format!(
+                "work item {issue_number} is archived and cannot be modified"
+            ))
+            .into());
         }
         Ok(prepared)
     }
@@ -2370,7 +2381,10 @@ impl GitHubLedger {
             legacy_genesis.as_ref(),
         )?;
         if materialize_item(issue_number, history)?.status == Status::Archived {
-            bail!("work item {issue_number} is archived and cannot be modified");
+            return Err(DomainValidationError::new(format!(
+                "work item {issue_number} is archived and cannot be modified"
+            ))
+            .into());
         }
         let repairs_preexisting_drift = projection_differs(
             &issue,

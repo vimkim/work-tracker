@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use anyhow::{Error, Result};
 use chrono::{Local, Utc};
 use serde::Serialize;
@@ -8,7 +10,7 @@ use crate::{
         DomainValidationError, HistoryEntry, IntegrityDoctorReport, RecoveryReport,
         RejectedMutation, WorkItem,
     },
-    github::{GitHubError, GitHubErrorKind},
+    github::{GitHubError, GitHubErrorKind, RepositoryName},
     ledger::{ReadHealth, ReadHealthError, ReadHealthErrorKind, ReadHealthKind},
 };
 
@@ -29,6 +31,63 @@ pub fn print_cli_error(error: &clap::Error, json_output: bool) {
 pub fn print_json(value: &impl Serialize) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
+}
+
+pub fn print_sqlite_path(database: &Path, json_output: bool) -> Result<()> {
+    if json_output {
+        print_json(&json!({"backend": "sqlite", "database": database}))
+    } else {
+        println!("{}", database.display());
+        Ok(())
+    }
+}
+
+pub fn print_github_path(
+    repository: &RepositoryName,
+    cache: &Path,
+    json_output: bool,
+) -> Result<()> {
+    if json_output {
+        print_json(&json!({
+            "backend": "github",
+            "repository": repository,
+            "cache": cache,
+            "database": cache,
+        }))
+    } else {
+        println!("Repository: {repository}");
+        println!("Cache:      {}", cache.display());
+        Ok(())
+    }
+}
+
+pub fn print_github_initialization(
+    repository: &RepositoryName,
+    private: bool,
+    created: bool,
+    is_default: bool,
+    cache: &Path,
+    json_output: bool,
+) -> Result<()> {
+    if json_output {
+        print_json(&json!({
+            "backend": "github",
+            "repository": repository,
+            "private": private,
+            "created": created,
+            "default": is_default,
+            "cache": cache,
+        }))
+    } else {
+        println!("GitHub ledger: {repository}");
+        println!("Private:       {}", if private { "yes" } else { "no" });
+        println!(
+            "Default:       {}",
+            if is_default { "yes" } else { "no (override)" }
+        );
+        println!("Cache:         {}", cache.display());
+        Ok(())
+    }
 }
 
 pub fn print_read_warning(health: &ReadHealth, json_output: bool) {
