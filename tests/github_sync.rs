@@ -2,13 +2,14 @@ mod support;
 
 use std::fs;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use chrono::{Duration, FixedOffset, TimeZone, Utc};
 use rusqlite::Connection;
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use support::{CliHarness, FakeGh, assert_success, stderr};
+use uuid::Uuid;
 
 fn configure_github(cli: &CliHarness) -> Result<()> {
     let path = cli.config_path();
@@ -181,8 +182,173 @@ fn genesis_body(title: &str, description: Option<&str>, status: &str, event_id: 
     )
 }
 
+fn pending_projection_body(
+    description: Option<&str>,
+    event_id: &str,
+    creation_fingerprint: &str,
+    pending_genesis_event: Option<Value>,
+) -> String {
+    let visible = description.unwrap_or("_No description provided._");
+    let creation_event_id_supplied = pending_genesis_event.is_some();
+    format!(
+        "{visible}\n\n<!-- work-tracker:projection\n{}\n-->",
+        json!({
+            "schema_version": 1,
+            "kind": "work_item",
+            "event_id": event_id,
+            "creation_fingerprint": creation_fingerprint,
+            "creation_event_id_supplied": creation_event_id_supplied,
+            "pending_genesis_event_id": event_id,
+            "pending_genesis_event": pending_genesis_event,
+            "genesis_comment_id": null,
+            "state_revision": 0,
+            "head_event_id": null,
+            "head_comment_id": null,
+            "history_hash": null
+        })
+    )
+}
+
 fn json_stdout(output: &std::process::Output) -> Result<Value> {
     serde_json::from_slice(&output.stdout).context("stdout was not valid JSON")
+}
+
+#[test]
+fn synchronization_completes_a_published_pending_genesis() -> Result<()> {
+    let cli = CliHarness::new()?;
+    configure_github(&cli)?;
+    let gh = FakeGh::new()?;
+    let event_id = "genesis-interrupted-41";
+    gh.respond(
+        1,
+        0,
+        &json!([[{
+            "number": 41,
+            "title": "Interrupted creation",
+            "body": pending_projection_body(
+                Some("Recover me"),
+                event_id,
+                "creation-interrupted",
+                None,
+            ),
+            "labels": [
+                {"name": "work-tracker:item"},
+                {"name": "work-tracker:status:active"}
+            ],
+            "state": "open",
+            "locked": false,
+            "updated_at": "2026-09-23T09:00:00Z"
+        }]])
+        .to_string(),
+        "",
+    )?;
+    gh.respond(
+        2,
+        0,
+        &json!([[{
+            "id": 9001,
+            "created_at": "2026-09-23T08:59:00Z",
+            "user": {"login": "octocat"},
+            "body": genesis_body("Interrupted creation", Some("Recover me"), "active", event_id)
+        }]])
+        .to_string(),
+        "",
+    )?;
+    gh.respond(3, 0, "{}", "")?;
+
+    let shown = cli.run_with_fake_gh(&gh, ["--json", "show", "41"])?;
+    assert_success(&shown)?;
+    let item = json_stdout(&shown)?;
+    assert_eq!(item["title"], "Interrupted creation");
+    assert_eq!(item["description"], "Recover me");
+    assert_eq!(item["status"], "active");
+    let warning: Value = serde_json::from_slice(&shown.stderr)?;
+    assert_eq!(warning["warning"]["code"], "github_projection_repaired");
+    assert_eq!(warning["warning"]["work_item_ids"], json!([41]));
+    let calls = gh.calls()?;
+    ensure!(calls.contains("\tPATCH\trepos/octocat/work-tracker-data/issues/41"));
+    ensure!(calls.contains("\"pending_genesis_event_id\":null"));
+    ensure!(calls.contains("\"genesis_comment_id\":9001"));
+    Ok(())
+}
+
+#[test]
+fn synchronization_publishes_pending_genesis_after_disposable_cache_loss() -> Result<()> {
+    let cli = CliHarness::new()?;
+    configure_github(&cli)?;
+    let event_id = "genesis-local-pending-41";
+    let request_json = r#"{"title":"Pending publication","description":"Publish me","status":"active","actor":"agent-a","note":"creation context","event_id":"genesis-local-pending-41"}"#;
+    let creation_fingerprint = format!(
+        "creation-{}",
+        Uuid::new_v5(&Uuid::NAMESPACE_OID, request_json.as_bytes())
+    );
+    let pending_event = json!({
+        "schema_version": 1,
+        "event_id": event_id,
+        "kind": "created",
+        "actor": "agent-a",
+        "github_actor": "octocat",
+        "note": "creation context",
+        "changes": {
+            "title": "Pending publication",
+            "description": "Publish me",
+            "status": "active"
+        }
+    });
+
+    let gh = FakeGh::new()?;
+    gh.respond(
+        1,
+        0,
+        &json!([[{
+            "number": 41,
+            "title": "Pending publication",
+            "body": pending_projection_body(
+                Some("Publish me"),
+                event_id,
+                &creation_fingerprint,
+                Some(pending_event),
+            ),
+            "labels": [
+                {"name": "work-tracker:item"},
+                {"name": "work-tracker:status:active"}
+            ],
+            "state": "open",
+            "locked": false,
+            "updated_at": "2026-09-23T09:00:00Z"
+        }]])
+        .to_string(),
+        "",
+    )?;
+    gh.respond(2, 0, "[[]]", "")?;
+    gh.respond(3, 0, r#"{"login":"octocat"}"#, "")?;
+    gh.respond(
+        4,
+        0,
+        r#"{"id":9001,"created_at":"2026-09-23T08:59:00Z","user":{"login":"octocat"}}"#,
+        "",
+    )?;
+    gh.respond(5, 0, "{}", "")?;
+
+    let shown = cli.run_with_fake_gh(&gh, ["--json", "show", "41"])?;
+    assert_success(&shown)?;
+    assert_eq!(json_stdout(&shown)?["title"], "Pending publication");
+    let calls = gh.calls()?;
+    assert_eq!(
+        calls
+            .matches("\tPOST\trepos/octocat/work-tracker-data/issues/41/comments")
+            .count(),
+        1
+    );
+    ensure!(calls.contains(event_id));
+    let connection = Connection::open(cli.github_cache_path("octocat", "work-tracker-data"))?;
+    let pending: i64 = connection.query_row(
+        "SELECT count(*) FROM pending_github_creations WHERE event_id = ?1",
+        [event_id],
+        |row| row.get(0),
+    )?;
+    assert_eq!(pending, 0);
+    Ok(())
 }
 
 #[test]

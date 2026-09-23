@@ -103,13 +103,15 @@ async fn run(cli: Cli) -> Result<()> {
     }
     match cli.command {
         Command::Add(args) => {
-            let item = ledger.create(
+            let item = ledger.create_with_event_id(
                 &args.title,
                 args.description.as_deref(),
                 args.status,
                 &args.actor.resolved(),
                 args.note.as_deref(),
+                args.event_id.as_deref(),
             )?;
+            output::print_projection_repair_warning(&ledger.take_projection_repairs(), cli.json);
             show_item(&item, cli.json)
         }
         Command::Show(args) => show_item(&ledger.get(args.id)?, cli.json),
@@ -136,22 +138,26 @@ async fn run(cli: Cli) -> Result<()> {
             } else {
                 args.description.as_deref().map(Some)
             };
-            let item = ledger.update(
+            let item = ledger.update_with_event_id(
                 args.id,
                 args.title.as_deref(),
                 description,
                 &args.actor.resolved(),
                 args.note.as_deref(),
+                args.event_id.as_deref(),
             )?;
+            output::print_projection_repair_warning(&ledger.take_projection_repairs(), cli.json);
             show_item(&item, cli.json)
         }
         Command::Status(args) => {
-            let item = ledger.set_status(
+            let item = ledger.set_status_with_event_id(
                 args.id,
                 args.status,
                 &args.actor.resolved(),
                 args.note.as_deref(),
+                args.event_id.as_deref(),
             )?;
+            output::print_projection_repair_warning(&ledger.take_projection_repairs(), cli.json);
             show_item(&item, cli.json)
         }
         Command::Note(args) => {
@@ -161,6 +167,7 @@ async fn run(cli: Cli) -> Result<()> {
                 &args.actor.resolved(),
                 args.event_id.as_deref(),
             )?;
+            output::print_projection_repair_warning(&ledger.take_projection_repairs(), cli.json);
             if cli.json {
                 output::print_json(&entry)
             } else {
@@ -169,12 +176,14 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Archive(args) => {
-            let item = ledger.set_status(
+            let item = ledger.set_status_with_event_id(
                 args.id,
                 Status::Archived,
                 &args.actor.resolved(),
                 args.note.as_deref(),
+                args.event_id.as_deref(),
             )?;
+            output::print_projection_repair_warning(&ledger.take_projection_repairs(), cli.json);
             show_item(&item, cli.json)
         }
         Command::History(args) => {

@@ -303,6 +303,70 @@ fn github_failure_categories_have_distinct_json_diagnostics() -> Result<()> {
 }
 
 #[test]
+fn github_transport_failures_keep_actionable_json_categories() -> Result<()> {
+    let cases = [
+        (
+            "gh: Validation Failed (HTTP 422)\n",
+            "github_validation_failed",
+            "Validation Failed",
+        ),
+        (
+            "gh: API rate limit exceeded (HTTP 429)\n",
+            "github_rate_limited",
+            "rate limit exceeded",
+        ),
+        (
+            "gh: error connecting to api.github.com\n",
+            "github_network_failure",
+            "error connecting",
+        ),
+        (
+            "gh: GitHub service unavailable (HTTP 503)\n",
+            "github_service_failure",
+            "service unavailable",
+        ),
+    ];
+
+    for (gh_stderr, code, message) in cases {
+        let cli = CliHarness::new()?;
+        let gh = FakeGh::new()?;
+        gh.respond(1, 1, "", gh_stderr)?;
+        let failed = cli.run_with_fake_gh(&gh, ["--json", "init", "github", "octocat/data"])?;
+        assert_json_error(&failed, code, message)?;
+        ensure!(!cli.config_path().exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn github_transport_failures_remain_distinguishable_in_human_diagnostics() -> Result<()> {
+    for (gh_stderr, expected) in [
+        ("gh: Validation Failed (HTTP 422)\n", "Validation Failed"),
+        (
+            "gh: API rate limit exceeded (HTTP 429)\n",
+            "rate limit exceeded",
+        ),
+        (
+            "gh: error connecting to api.github.com\n",
+            "error connecting",
+        ),
+        (
+            "gh: GitHub service unavailable (HTTP 503)\n",
+            "service unavailable",
+        ),
+    ] {
+        let cli = CliHarness::new()?;
+        let gh = FakeGh::new()?;
+        gh.respond(1, 1, "", gh_stderr)?;
+        let failed = cli.run_with_fake_gh(&gh, ["init", "github", "octocat/data"])?;
+        ensure!(!failed.status.success());
+        ensure!(stderr(&failed)?.starts_with("error: GitHub API request failed:"));
+        ensure!(stderr(&failed)?.contains(expected));
+    }
+    Ok(())
+}
+
+#[test]
 fn human_diagnostics_distinguish_visibility_permission_and_compatibility() -> Result<()> {
     let cases = [
         (

@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    db::{GithubCacheItem, SqliteLedger},
+    db::{GithubCacheCleanup, GithubCacheItem, SqliteLedger},
     domain::{
         HistoryEntry, RejectedMutation, Status, WorkItem, normalized_optional, normalized_required,
     },
@@ -178,6 +178,10 @@ enum GhFailureKind {
     NotFound,
     Unauthenticated,
     PermissionDenied,
+    ValidationFailed,
+    RateLimited,
+    NetworkFailure,
+    ServiceFailure,
     Other,
 }
 
@@ -194,6 +198,10 @@ pub enum GitHubErrorKind {
     Unauthenticated,
     PermissionDenied,
     NotFound,
+    ValidationFailed,
+    RateLimited,
+    NetworkFailure,
+    ServiceFailure,
     ApiFailure,
     LedgerIntegrity,
     UnknownEventSchema,
@@ -203,6 +211,7 @@ pub enum GitHubErrorKind {
     IncompatibleRepository,
     RejectedMutation,
     ProjectionPending,
+    ArchivedImmutable,
 }
 
 impl GitHubError {
@@ -230,7 +239,11 @@ impl GitHubError {
     fn is_availability_failure(&self) -> bool {
         matches!(
             self.kind,
-            GitHubErrorKind::ApiFailure | GitHubErrorKind::CliMissing
+            GitHubErrorKind::ApiFailure
+                | GitHubErrorKind::CliMissing
+                | GitHubErrorKind::RateLimited
+                | GitHubErrorKind::NetworkFailure
+                | GitHubErrorKind::ServiceFailure
         )
     }
 }
@@ -274,6 +287,7 @@ pub(crate) struct GitHubLedger {
     github: GitHub,
     cache: SqliteLedger,
     recover_pending_remotely: bool,
+    repaired_work_item_ids: Vec<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -283,6 +297,18 @@ struct CreationRequest<'a> {
     status: Status,
     actor: &'a str,
     note: Option<&'a str>,
+    event_id: Option<&'a str>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecoverableCreationRequest {
+    title: String,
+    description: Option<String>,
+    status: Status,
+    actor: String,
+    note: Option<String>,
+    #[serde(default)]
+    event_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,7 +317,11 @@ struct ProjectionMetadata {
     kind: String,
     event_id: String,
     creation_fingerprint: String,
+    #[serde(default)]
+    creation_event_id_supplied: bool,
     pending_genesis_event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_genesis_event: Option<CanonicalEvent>,
     genesis_comment_id: Option<i64>,
     state_revision: u64,
     #[serde(default)]
@@ -477,6 +507,13 @@ struct PreparedMutation {
     projection_needs_update: bool,
 }
 
+struct ProjectionRepair {
+    issue: LedgerIssue,
+    metadata: ProjectionMetadata,
+    history: Vec<HistoryEntry>,
+    report_to_caller: bool,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LegacyGenesisEvent {
@@ -563,6 +600,7 @@ impl GitHubLedger {
             github: GitHub::with_executable(executable),
             cache,
             recover_pending_remotely,
+            repaired_work_item_ids: Vec::new(),
         })
     }
 
@@ -573,6 +611,7 @@ impl GitHubLedger {
         status: Status,
         actor: &str,
         note: Option<&str>,
+        requested_event_id: Option<&str>,
     ) -> Result<WorkItem> {
         let title = normalized_required(title, "title")?;
         let actor = normalized_required(actor, "actor")?;
@@ -581,6 +620,9 @@ impl GitHubLedger {
         }
         let description = normalized_optional(description);
         let note = normalized_optional(note);
+        let requested_event_id = requested_event_id
+            .map(|value| normalized_required(value, "event ID"))
+            .transpose()?;
         let github_actor = self.github.authenticated_user()?;
         let request = CreationRequest {
             title: &title,
@@ -588,58 +630,41 @@ impl GitHubLedger {
             status,
             actor: &actor,
             note: note.as_deref(),
+            event_id: requested_event_id.as_deref(),
         };
         let request_json = serde_json::to_string(&request)?;
         let creation_fingerprint = creation_fingerprint(&request_json);
         let existing = self.cache.pending_github_creation(&request_json)?;
         let (event_id, known_issue, retrying, recovered_issue) = if let Some(pending) = existing {
             (pending.event_id, pending.issue_number, true, None)
-        } else if self.recover_pending_remotely {
-            if let Some((issue, metadata)) =
-                self.find_pending_issue_by_fingerprint(&creation_fingerprint, status)?
-            {
+        } else if self.recover_pending_remotely && requested_event_id.is_some() {
+            if let Some((issue, metadata)) = self.find_creation_by_event_id(
+                requested_event_id.as_deref().expect("checked above"),
+                &creation_fingerprint,
+                status,
+            )? {
                 self.cache
                     .begin_github_creation(&request_json, &metadata.event_id)?;
-                (metadata.event_id, Some(issue.number), true, Some(issue))
+                (
+                    metadata.event_id.clone(),
+                    Some(issue.number),
+                    true,
+                    Some((issue, metadata)),
+                )
             } else {
-                let event_id = new_event_id("genesis");
+                let event_id = requested_event_id
+                    .clone()
+                    .unwrap_or_else(|| new_event_id("genesis"));
                 self.cache.begin_github_creation(&request_json, &event_id)?;
                 (event_id, None, false, None)
             }
         } else {
-            let event_id = new_event_id("genesis");
+            let event_id = requested_event_id
+                .clone()
+                .unwrap_or_else(|| new_event_id("genesis"));
             self.cache.begin_github_creation(&request_json, &event_id)?;
             (event_id, None, false, None)
         };
-        let pending_metadata = ProjectionMetadata {
-            schema_version: 1,
-            kind: "work_item".to_owned(),
-            event_id: event_id.clone(),
-            creation_fingerprint: creation_fingerprint.clone(),
-            pending_genesis_event_id: Some(event_id.clone()),
-            genesis_comment_id: None,
-            state_revision: 0,
-            head_event_id: None,
-            head_comment_id: None,
-            history_hash: None,
-        };
-        let pending_body = projection_body(description.as_deref(), &pending_metadata)?;
-
-        let issue = if let Some(issue) = recovered_issue {
-            issue
-        } else if let Some(issue_number) = known_issue {
-            self.load_pending_issue(issue_number, &event_id, &creation_fingerprint, status)?
-        } else if retrying {
-            match self.find_pending_issue(&event_id, &creation_fingerprint, status)? {
-                Some(issue) => issue,
-                None => self.create_pending_issue(&title, &pending_body, status)?,
-            }
-        } else {
-            self.create_pending_issue(&title, &pending_body, status)?
-        };
-        self.cache
-            .remember_github_issue(&request_json, issue.number)?;
-
         let event = CanonicalEvent {
             schema_version: 1,
             event_id: event_id.clone(),
@@ -654,6 +679,51 @@ impl GitHubLedger {
             }),
             expected_state_revision: None,
         };
+        let pending_metadata = ProjectionMetadata {
+            schema_version: 1,
+            kind: "work_item".to_owned(),
+            event_id: event_id.clone(),
+            creation_fingerprint: creation_fingerprint.clone(),
+            creation_event_id_supplied: requested_event_id.is_some(),
+            pending_genesis_event_id: Some(event_id.clone()),
+            pending_genesis_event: Some(event.clone()),
+            genesis_comment_id: None,
+            state_revision: 0,
+            head_event_id: None,
+            head_comment_id: None,
+            history_hash: None,
+        };
+        let pending_body = projection_body(description.as_deref(), &pending_metadata)?;
+
+        let (issue, issue_metadata) = if let Some(recovered) = recovered_issue {
+            recovered
+        } else if let Some(issue_number) = known_issue {
+            self.load_creation_issue(issue_number, &event_id, &creation_fingerprint, status)?
+        } else if retrying {
+            match self.find_pending_issue(&event_id, &creation_fingerprint, status)? {
+                Some(issue) => {
+                    let metadata = parse_projection(&issue.body)
+                        .map_err(|_| metadata_collision(issue.number))?;
+                    (issue, metadata)
+                }
+                None => (
+                    self.create_pending_issue(&title, &pending_body, status)?,
+                    pending_metadata.clone(),
+                ),
+            }
+        } else {
+            (
+                self.create_pending_issue(&title, &pending_body, status)?,
+                pending_metadata.clone(),
+            )
+        };
+        self.cache
+            .remember_github_issue(&request_json, issue.number)?;
+
+        if issue_metadata.pending_genesis_event_id.is_none() {
+            return self.recover_completed_creation(&request_json, issue, issue_metadata, &event);
+        }
+
         let comment = if retrying {
             self.find_genesis_comment(issue.number, &event)?
                 .map(Ok)
@@ -678,7 +748,9 @@ impl GitHubLedger {
             kind: "work_item".to_owned(),
             event_id: event_id.clone(),
             creation_fingerprint,
+            creation_event_id_supplied: requested_event_id.is_some(),
             pending_genesis_event_id: None,
+            pending_genesis_event: None,
             genesis_comment_id: Some(comment.id),
             state_revision: 1,
             head_event_id: Some(event_id.clone()),
@@ -745,7 +817,7 @@ impl GitHubLedger {
         Ok(item)
     }
 
-    fn synchronize(&mut self) -> Result<DateTime<Utc>> {
+    fn synchronize(&mut self) -> Result<(DateTime<Utc>, Vec<i64>)> {
         let repository = self.repository.to_string();
         let previous_cursor = self.cache.github_sync_cursor(&repository)?;
         let previous_etag = self.cache.github_sync_etag(&repository)?;
@@ -768,13 +840,14 @@ impl GitHubLedger {
                 let synchronized_at = Utc::now();
                 self.cache
                     .mark_github_sync_success(&repository, synchronized_at)?;
-                return Ok(synchronized_at);
+                return Ok((synchronized_at, Vec::new()));
             }
             ConditionalResult::Modified { values, etag } => (values, etag),
         };
         let mut synchronized = Vec::new();
         let mut projection_updates = Vec::new();
         let mut removed_item_ids = Vec::new();
+        let mut completed_creation_requests = Vec::new();
         let mut cursor = None;
         for issue in issues {
             let issue_updated_at = issue.updated_at.ok_or_else(|| {
@@ -794,15 +867,15 @@ impl GitHubLedger {
                 .labels
                 .iter()
                 .any(|label| label.name.eq_ignore_ascii_case("work-tracker:item"));
-            let has_metadata = issue.body.contains(PROJECTION_MARKER);
-            if !has_item_label && !has_metadata {
+            let has_projection_metadata = issue.body.contains(PROJECTION_MARKER);
+            if !has_item_label && !has_projection_metadata {
                 removed_item_ids.push(issue.number);
                 continue;
             }
-            if has_item_label != has_metadata {
+            if has_item_label != has_projection_metadata {
                 return Err(metadata_collision(issue.number).into());
             }
-            let metadata =
+            let mut metadata =
                 parse_projection(&issue.body).map_err(|_| metadata_collision(issue.number))?;
             if metadata.schema_version != 1
                 || metadata.kind != "work_item"
@@ -810,28 +883,104 @@ impl GitHubLedger {
             {
                 return Err(metadata_collision(issue.number).into());
             }
-            if metadata.pending_genesis_event_id.is_some() {
-                continue;
-            }
-            let comments: Vec<LedgerComment> = self.github.api_paginated_json(
+            let mut comments: Vec<LedgerComment> = self.github.api_paginated_json(
                 "GET",
                 &format!(
                     "repos/{}/issues/{}/comments?per_page=100",
                     self.repository, issue.number
                 ),
             )?;
+            let pending_genesis = metadata.pending_genesis_event_id.is_some();
+            if pending_genesis
+                && !comments
+                    .iter()
+                    .any(|comment| has_metadata(&comment.body, EVENT_MARKER))
+            {
+                let local_request_json = self
+                    .cache
+                    .pending_github_creation_request(&metadata.event_id)?;
+                let mut event = if let Some(event) = metadata.pending_genesis_event.clone() {
+                    validate_pending_genesis_intent(issue.number, &metadata, &event)?;
+                    event
+                } else if let Some(request_json) = local_request_json.as_deref() {
+                    pending_event_from_request(&metadata, request_json)?
+                } else {
+                    return Err(GitHubError::new(
+                        GitHubErrorKind::ProjectionPending,
+                        format!(
+                            "GitHub issue #{} has an incomplete pending creation whose original intent is unavailable; retry the original add command to complete it",
+                            issue.number
+                        ),
+                    )
+                    .with_details(json!({
+                        "event_id": metadata.event_id,
+                        "projection_pending": true,
+                        "instruction": "retry the original add command with the same title, description, Status, Actor, and note",
+                    }))
+                    .into());
+                };
+                event.github_actor = self.github.authenticated_user()?;
+                let values: GenesisValues = serde_json::from_value(event.changes.clone())
+                    .context("invalid pending genesis changes")?;
+                validate_status_label(&issue, values.status)?;
+                let mut comment = self.publish_genesis(issue.number, &event)?;
+                comment.body = event_comment_body(&event)?;
+                comments.push(comment);
+                if let Some(request_json) = local_request_json {
+                    completed_creation_requests.push(request_json);
+                }
+            } else if pending_genesis
+                && let Some(request_json) = self
+                    .cache
+                    .pending_github_creation_request(&metadata.event_id)?
+            {
+                completed_creation_requests.push(request_json);
+            }
             let replayed = replay_trusted_history(issue.number, &comments)?;
             let history = &replayed.accepted;
-            let legacy_genesis = self.cache.legacy_github_genesis_evidence(issue.number)?;
-            let projection_needs_update = projection_head_needs_update(
-                issue.number,
-                &metadata,
-                history,
-                legacy_genesis.as_ref(),
-            )?;
+            let projection_needs_update = if pending_genesis {
+                let genesis = history.first().ok_or_else(|| {
+                    ledger_integrity_error(issue.number, "pending creation has no genesis entry")
+                })?;
+                if genesis.kind != EventKind::Created.as_str()
+                    || genesis.event_id.as_deref() != Some(metadata.event_id.as_str())
+                {
+                    return Err(ledger_integrity_error(
+                        issue.number,
+                        "published genesis does not match the pending creation",
+                    )
+                    .into());
+                }
+                metadata.pending_genesis_event_id = None;
+                metadata.genesis_comment_id = Some(genesis.id);
+                metadata.state_revision = 1;
+                true
+            } else {
+                let legacy_genesis = self.cache.legacy_github_genesis_evidence(issue.number)?;
+                projection_head_needs_update(
+                    issue.number,
+                    &metadata,
+                    history,
+                    legacy_genesis.as_ref(),
+                )?
+            };
             let item = materialize_item(issue.number, history)?;
             if projection_differs(&issue, &item, projection_needs_update)? {
-                projection_updates.push((issue, metadata, history.clone()));
+                let legacy_head_bootstrap = !pending_genesis
+                    && metadata.head_event_id.is_none()
+                    && metadata.head_comment_id.is_none()
+                    && metadata.history_hash.is_none();
+                let visible_or_status_drift = readable_projection_differs(&issue, &item)?
+                    || status_projection_differs(&issue, item.status)
+                    || lock_projection_differs(&issue, item.status);
+                projection_updates.push(ProjectionRepair {
+                    issue,
+                    metadata,
+                    history: history.clone(),
+                    report_to_caller: pending_genesis
+                        || !legacy_head_bootstrap
+                        || visible_or_status_drift,
+                });
             }
             synchronized.push(GithubCacheItem {
                 item,
@@ -839,36 +988,81 @@ impl GitHubLedger {
                 rejected: replayed.rejected,
             });
         }
-        for (issue, metadata, history) in projection_updates {
-            self.project_history_head(&issue, metadata, &history)?;
+        let repaired_work_item_ids = projection_updates
+            .iter()
+            .filter(|repair| repair.report_to_caller)
+            .map(|repair| repair.issue.number)
+            .collect::<Vec<_>>();
+        for repair in projection_updates {
+            self.project_history_head(&repair.issue, repair.metadata, &repair.history)?;
         }
         let advanced = cursor.is_some_and(|cursor| previous_cursor.is_none_or(|old| cursor > old));
         let synchronized_at = Utc::now();
         self.cache.replace_github_cache_batch(
             &repository,
             &synchronized,
-            &removed_item_ids,
+            GithubCacheCleanup {
+                removed_item_ids: &removed_item_ids,
+                completed_creation_requests: &completed_creation_requests,
+            },
             cursor,
             (!advanced).then_some(response_etag.as_deref()).flatten(),
             synchronized_at,
         )?;
-        Ok(synchronized_at)
+        Ok((synchronized_at, repaired_work_item_ids))
     }
 
-    fn load_pending_issue(
+    fn load_creation_issue(
         &self,
         issue_number: i64,
         event_id: &str,
         creation_fingerprint: &str,
         status: Status,
-    ) -> Result<LedgerIssue> {
+    ) -> Result<(LedgerIssue, ProjectionMetadata)> {
         let issue: LedgerIssue = self.github.api_json(
             "GET",
             &format!("repos/{}/issues/{issue_number}", self.repository),
             &[],
         )?;
-        validate_pending_issue(&issue, event_id, creation_fingerprint, status)?;
-        Ok(issue)
+        let metadata = validate_creation_issue(&issue, event_id, creation_fingerprint, status)?;
+        Ok((issue, metadata))
+    }
+
+    fn recover_completed_creation(
+        &mut self,
+        request_json: &str,
+        issue: LedgerIssue,
+        metadata: ProjectionMetadata,
+        event: &CanonicalEvent,
+    ) -> Result<WorkItem> {
+        let comments = self.load_comments(issue.number)?;
+        let replayed = replay_trusted_history(issue.number, &comments)?;
+        let genesis = replayed
+            .accepted
+            .first()
+            .context("completed creation has no genesis entry")?;
+        let mut expected = event.clone();
+        expected.github_actor = genesis
+            .github_actor
+            .clone()
+            .context("completed genesis omitted GitHub Actor")?;
+        validate_retry(genesis, &expected)?;
+        let projection_needs_update =
+            projection_head_needs_update(issue.number, &metadata, &replayed.accepted, None)?;
+        let item = materialize_item(issue.number, &replayed.accepted)?;
+        if projection_differs(&issue, &item, projection_needs_update)? {
+            self.project_history_head(&issue, metadata, &replayed.accepted)?;
+            self.repaired_work_item_ids.push(issue.number);
+        }
+        self.cache.finish_github_creation_recovery(
+            request_json,
+            &GithubCacheItem {
+                item: item.clone(),
+                history: replayed.accepted,
+                rejected: replayed.rejected,
+            },
+        )?;
+        Ok(item)
     }
 
     fn create_pending_issue(&self, title: &str, body: &str, status: Status) -> Result<LedgerIssue> {
@@ -899,14 +1093,14 @@ impl GitHubLedger {
         .map(|found| found.map(|(issue, _)| issue))
     }
 
-    fn find_pending_issue_by_fingerprint(
+    fn find_creation_by_event_id(
         &self,
+        event_id: &str,
         fingerprint: &str,
         status: Status,
     ) -> Result<Option<(LedgerIssue, ProjectionMetadata)>> {
-        self.find_pending_issue_by(status, fingerprint, |metadata| {
-            metadata.pending_genesis_event_id.as_deref() == Some(metadata.event_id.as_str())
-                && metadata.creation_fingerprint == fingerprint
+        self.find_pending_issue_by(status, event_id, |metadata| {
+            metadata.event_id == event_id && metadata.creation_fingerprint == fingerprint
         })
     }
 
@@ -942,7 +1136,9 @@ impl GitHubLedger {
                 return Err(metadata_collision(issue.number).into());
             }
             if matches(&metadata) {
-                validate_status_label(&issue, status)?;
+                if metadata.pending_genesis_event_id.is_some() {
+                    validate_status_label(&issue, status)?;
+                }
                 if found.is_some() {
                     return Err(GitHubError::new(
                         GitHubErrorKind::MetadataCollision,
@@ -1115,7 +1311,7 @@ impl GitHubLedger {
     }
 
     fn load_prepared_mutation(&self, issue_number: i64) -> Result<PreparedMutation> {
-        let (mut issue, metadata) = self.load_work_item_issue(issue_number)?;
+        let (issue, metadata) = self.load_work_item_issue(issue_number)?;
         let comments = self.load_comments(issue_number)?;
         let replayed = replay_trusted_history(issue_number, &comments)?;
         let legacy_genesis = self.cache.legacy_github_genesis_evidence(issue_number)?;
@@ -1126,10 +1322,6 @@ impl GitHubLedger {
             legacy_genesis.as_ref(),
         )?;
         let current = materialize_item(issue_number, &replayed.accepted)?;
-        if issue.locked && current.status != Status::Archived {
-            self.project_lock_state(&issue, current.status)?;
-            issue.locked = false;
-        }
         Ok(PreparedMutation {
             issue,
             metadata,
@@ -1155,8 +1347,10 @@ impl GitHubLedger {
             current,
             projection_needs_update,
         } = prepared;
-        if projection_differs(&issue, &current, projection_needs_update)? {
+        let repaired_projection = projection_differs(&issue, &current, projection_needs_update)?;
+        if repaired_projection {
             self.project_history_head(&issue, metadata, &replayed.accepted)?;
+            self.repaired_work_item_ids.push(issue.number);
         }
         self.cache.replace_github_item(&GithubCacheItem {
             item: current.clone(),
@@ -1177,6 +1371,11 @@ impl GitHubLedger {
             .operation_name()
             .context("non-mutation event passed to mutation workflow")?;
         let event_id = event.event_id.clone();
+        let repairs_preexisting_drift = projection_differs(
+            &prepared.issue,
+            &prepared.current,
+            prepared.projection_needs_update,
+        )?;
         let expected_state_revision = event
             .expected_state_revision
             .context("mutation proposal omitted expected State Revision")?;
@@ -1213,6 +1412,9 @@ impl GitHubLedger {
         let projection_error = self
             .project_history_head(&prepared.issue, prepared.metadata, &history)
             .err();
+        if projection_error.is_none() && repairs_preexisting_drift {
+            self.repaired_work_item_ids.push(issue_number);
+        }
         if let Some(entry) = entry {
             validate_retry(&entry, &event)?;
             if let Some(error) = projection_error.as_ref() {
@@ -1276,29 +1478,102 @@ impl GitHubLedger {
         status: Status,
         actor: &str,
         note: Option<&str>,
+        requested_event_id: Option<&str>,
     ) -> Result<WorkItem> {
         let actor = normalized_required(actor, "actor")?;
         let note = normalized_optional(note);
+        let requested_event_id = requested_event_id
+            .map(|value| normalized_required(value, "event ID"))
+            .transpose()?;
         let github_actor = self.github.authenticated_user()?;
         let prepared = if status == Status::Archived {
             self.load_prepared_mutation(issue_number)?
         } else {
             self.prepare_mutation(issue_number)?
         };
+        if let Some(event_id) = requested_event_id.as_deref()
+            && let Some(existing) = prepared
+                .replayed
+                .accepted
+                .iter()
+                .find(|entry| entry.event_id.as_deref() == Some(event_id))
+        {
+            if existing.kind
+                != if status == Status::Archived {
+                    EventKind::Archived.as_str()
+                } else {
+                    EventKind::StatusChanged.as_str()
+                }
+                || existing.actor != actor
+                || existing.github_actor.as_deref() != Some(github_actor.as_str())
+                || existing.note != note
+                || !retry_status_matches(&existing.changes, status)
+            {
+                return Err(GitHubError::new(
+                    GitHubErrorKind::MetadataCollision,
+                    format!("event ID {event_id} was already used for different content"),
+                )
+                .into());
+            }
+            return self.finish_noop_mutation(prepared);
+        }
+        if let Some(event_id) = requested_event_id.as_deref()
+            && let Some(existing) = prepared
+                .replayed
+                .rejected
+                .iter()
+                .find(|mutation| mutation.event_id == event_id)
+                .cloned()
+        {
+            if existing.actor != actor
+                || existing.github_actor != github_actor
+                || existing.note != note
+                || !retry_status_matches(&existing.changes, status)
+            {
+                return Err(GitHubError::new(
+                    GitHubErrorKind::MetadataCollision,
+                    format!("event ID {event_id} was already used for different content"),
+                )
+                .into());
+            }
+            let current = self.finish_noop_mutation(prepared)?;
+            return Err(retried_rejected_mutation_error(&existing, &current).into());
+        }
         if prepared.current.status == Status::Archived {
-            // Archival is stricter than ordinary Status idempotency: ticket #11
-            // requires every repeated archive attempt to be rejected. Read
-            // synchronization repairs any accepted-but-incomplete projection.
-            bail!("work item {issue_number} is archived and cannot be modified");
+            let repaired = projection_differs(
+                &prepared.issue,
+                &prepared.current,
+                prepared.projection_needs_update,
+            )?;
+            if repaired {
+                self.finish_noop_mutation(prepared)?;
+            }
+            return Err(GitHubError::new(
+                GitHubErrorKind::ArchivedImmutable,
+                if repaired {
+                    format!(
+                        "work item {issue_number} is archived and cannot be modified; its GitHub projection drift was repaired from accepted history"
+                    )
+                } else {
+                    format!("work item {issue_number} is archived and cannot be modified")
+                },
+            )
+            .with_details(json!({
+                "work_item_id": issue_number,
+                "projection_repaired": repaired,
+            }))
+            .into());
         }
         if prepared.current.status == status {
             return self.finish_noop_mutation(prepared);
         }
 
-        let event_id = new_event_id(if status == Status::Archived {
-            "archive"
-        } else {
-            "status"
+        let event_id = requested_event_id.unwrap_or_else(|| {
+            new_event_id(if status == Status::Archived {
+                "archive"
+            } else {
+                "status"
+            })
         });
         let expected_state_revision = prepared
             .replayed
@@ -1335,17 +1610,76 @@ impl GitHubLedger {
         description: Option<Option<&str>>,
         actor: &str,
         note: Option<&str>,
+        requested_event_id: Option<&str>,
     ) -> Result<WorkItem> {
         let actor = normalized_required(actor, "actor")?;
         let note = normalized_optional(note);
+        let requested_event_id = requested_event_id
+            .map(|value| normalized_required(value, "event ID"))
+            .transpose()?;
+        let requested_title = title
+            .map(|value| normalized_required(value, "title"))
+            .transpose()?;
+        let requested_description = description.map(normalized_optional);
         let github_actor = self.github.authenticated_user()?;
         let prepared = self.prepare_mutation(issue_number)?;
-        let new_title = match title {
-            Some(value) => normalized_required(value, "title")?,
+        if let Some(event_id) = requested_event_id.as_deref()
+            && let Some(existing) = prepared
+                .replayed
+                .accepted
+                .iter()
+                .find(|entry| entry.event_id.as_deref() == Some(event_id))
+        {
+            if existing.kind != EventKind::Updated.as_str()
+                || existing.actor != actor
+                || existing.github_actor.as_deref() != Some(github_actor.as_str())
+                || existing.note != note
+                || !retry_fields_match(
+                    &existing.changes,
+                    requested_title.as_ref(),
+                    requested_description.as_ref(),
+                )
+            {
+                return Err(GitHubError::new(
+                    GitHubErrorKind::MetadataCollision,
+                    format!("event ID {event_id} was already used for different content"),
+                )
+                .into());
+            }
+            return self.finish_noop_mutation(prepared);
+        }
+        if let Some(event_id) = requested_event_id.as_deref()
+            && let Some(existing) = prepared
+                .replayed
+                .rejected
+                .iter()
+                .find(|mutation| mutation.event_id == event_id)
+                .cloned()
+        {
+            if existing.actor != actor
+                || existing.github_actor != github_actor
+                || existing.note != note
+                || !retry_fields_match(
+                    &existing.changes,
+                    requested_title.as_ref(),
+                    requested_description.as_ref(),
+                )
+            {
+                return Err(GitHubError::new(
+                    GitHubErrorKind::MetadataCollision,
+                    format!("event ID {event_id} was already used for different content"),
+                )
+                .into());
+            }
+            let current = self.finish_noop_mutation(prepared)?;
+            return Err(retried_rejected_mutation_error(&existing, &current).into());
+        }
+        let new_title = match requested_title {
+            Some(value) => value,
             None => prepared.current.title.clone(),
         };
-        let new_description = match description {
-            Some(value) => normalized_optional(value),
+        let new_description = match requested_description {
+            Some(value) => value,
             None => prepared.current.description.clone(),
         };
         let mut changes = FieldChanges::default();
@@ -1365,7 +1699,7 @@ impl GitHubLedger {
             return self.finish_noop_mutation(prepared);
         }
 
-        let event_id = new_event_id("update");
+        let event_id = requested_event_id.unwrap_or_else(|| new_event_id("update"));
         let expected_state_revision = prepared
             .replayed
             .accepted
@@ -1404,10 +1738,20 @@ impl GitHubLedger {
         let replayed = replay_trusted_history(issue_number, &comments)?;
         let history = &replayed.accepted;
         let legacy_genesis = self.cache.legacy_github_genesis_evidence(issue_number)?;
-        projection_head_needs_update(issue_number, &metadata, history, legacy_genesis.as_ref())?;
+        let projection_needs_update = projection_head_needs_update(
+            issue_number,
+            &metadata,
+            history,
+            legacy_genesis.as_ref(),
+        )?;
         if materialize_item(issue_number, history)?.status == Status::Archived {
             bail!("work item {issue_number} is archived and cannot be modified");
         }
+        let repairs_preexisting_drift = projection_differs(
+            &issue,
+            &materialize_item(issue_number, history)?,
+            projection_needs_update,
+        )?;
         let event = CanonicalEvent {
             schema_version: 1,
             event_id: event_id.clone(),
@@ -1425,6 +1769,9 @@ impl GitHubLedger {
         {
             validate_retry(&existing, &event)?;
             self.project_history_head(&issue, metadata, history)?;
+            if repairs_preexisting_drift {
+                self.repaired_work_item_ids.push(issue_number);
+            }
             let item = materialize_item(issue_number, history)?;
             self.cache.replace_github_item(&GithubCacheItem {
                 item,
@@ -1453,6 +1800,9 @@ impl GitHubLedger {
             .cloned()
             .context("published note was not reconstructed from GitHub")?;
         self.project_history_head(&issue, metadata, history)?;
+        if repairs_preexisting_drift {
+            self.repaired_work_item_ids.push(issue_number);
+        }
         let item = materialize_item(issue_number, history)?;
         self.cache.replace_github_item(&GithubCacheItem {
             item,
@@ -1483,7 +1833,10 @@ impl Ledger for GitHubLedger {
         }
 
         match self.synchronize() {
-            Ok(synchronized_at) => Ok(ReadHealth::Fresh { synchronized_at }),
+            Ok((synchronized_at, repaired_work_item_ids)) => Ok(ReadHealth::Fresh {
+                synchronized_at,
+                repaired_work_item_ids,
+            }),
             Err(error) if policy == ReadPolicy::Fresh => Err(error),
             Err(error) => {
                 let github_error = error.downcast_ref::<GitHubError>();
@@ -1520,7 +1873,19 @@ impl Ledger for GitHubLedger {
         actor: &str,
         note: Option<&str>,
     ) -> Result<WorkItem> {
-        self.create_work_item(title, description, status, actor, note)
+        self.create_work_item(title, description, status, actor, note, None)
+    }
+
+    fn create_with_event_id(
+        &mut self,
+        title: &str,
+        description: Option<&str>,
+        status: Status,
+        actor: &str,
+        note: Option<&str>,
+        event_id: Option<&str>,
+    ) -> Result<WorkItem> {
+        self.create_work_item(title, description, status, actor, note, event_id)
     }
 
     fn get(&self, id: i64) -> Result<WorkItem> {
@@ -1548,7 +1913,19 @@ impl Ledger for GitHubLedger {
         actor: &str,
         note: Option<&str>,
     ) -> Result<WorkItem> {
-        self.update_fields(id, title, description, actor, note)
+        self.update_fields(id, title, description, actor, note, None)
+    }
+
+    fn update_with_event_id(
+        &mut self,
+        id: i64,
+        title: Option<&str>,
+        description: Option<Option<&str>>,
+        actor: &str,
+        note: Option<&str>,
+        event_id: Option<&str>,
+    ) -> Result<WorkItem> {
+        self.update_fields(id, title, description, actor, note, event_id)
     }
 
     fn set_status(
@@ -1558,7 +1935,18 @@ impl Ledger for GitHubLedger {
         actor: &str,
         note: Option<&str>,
     ) -> Result<WorkItem> {
-        self.transition_status(id, status, actor, note)
+        self.transition_status(id, status, actor, note, None)
+    }
+
+    fn set_status_with_event_id(
+        &mut self,
+        id: i64,
+        status: Status,
+        actor: &str,
+        note: Option<&str>,
+        event_id: Option<&str>,
+    ) -> Result<WorkItem> {
+        self.transition_status(id, status, actor, note, event_id)
     }
 
     fn add_note(
@@ -1577,6 +1965,10 @@ impl Ledger for GitHubLedger {
 
     fn rejected_mutations(&mut self, id: i64) -> Result<Vec<RejectedMutation>> {
         self.cache.rejected_mutations(id)
+    }
+
+    fn take_projection_repairs(&mut self) -> Vec<i64> {
+        std::mem::take(&mut self.repaired_work_item_ids)
     }
 }
 
@@ -1635,8 +2027,7 @@ impl GitHub {
                         ) || failure
                             .stderr
                             .to_ascii_lowercase()
-                            .contains("already exists")
-                            || failure.stderr.to_ascii_lowercase().contains("http 422") =>
+                            .contains("already exists") =>
                     {
                         return Err(GitHubError::new(
                             GitHubErrorKind::PermissionDenied,
@@ -1942,7 +2333,31 @@ impl GitHub {
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
             let lower = stderr.to_ascii_lowercase();
-            let kind = if lower.contains("http 404") || lower.contains("not found") {
+            let kind = if lower.contains("rate limit")
+                || lower.contains("secondary rate limit")
+                || lower.contains("http 429")
+            {
+                GhFailureKind::RateLimited
+            } else if lower.contains("http 422") || lower.contains("validation failed") {
+                GhFailureKind::ValidationFailed
+            } else if lower.contains("http 500")
+                || lower.contains("http 502")
+                || lower.contains("http 503")
+                || lower.contains("http 504")
+                || lower.contains("service unavailable")
+                || lower.contains("bad gateway")
+                || lower.contains("gateway timeout")
+            {
+                GhFailureKind::ServiceFailure
+            } else if lower.contains("error connecting")
+                || lower.contains("could not resolve host")
+                || lower.contains("connection refused")
+                || lower.contains("connection reset")
+                || lower.contains("network is unreachable")
+                || lower.contains("tls handshake timeout")
+            {
+                GhFailureKind::NetworkFailure
+            } else if lower.contains("http 404") || lower.contains("not found") {
                 GhFailureKind::NotFound
             } else if lower.contains("not logged")
                 || lower.contains("authentication")
@@ -2009,6 +2424,10 @@ fn classify_failure(failure: GhFailure) -> GitHubError {
         GhFailureKind::Unauthenticated => GitHubErrorKind::Unauthenticated,
         GhFailureKind::PermissionDenied => GitHubErrorKind::PermissionDenied,
         GhFailureKind::NotFound => GitHubErrorKind::NotFound,
+        GhFailureKind::ValidationFailed => GitHubErrorKind::ValidationFailed,
+        GhFailureKind::RateLimited => GitHubErrorKind::RateLimited,
+        GhFailureKind::NetworkFailure => GitHubErrorKind::NetworkFailure,
+        GhFailureKind::ServiceFailure => GitHubErrorKind::ServiceFailure,
         GhFailureKind::Other => GitHubErrorKind::ApiFailure,
     };
     GitHubError::new(
@@ -2026,6 +2445,66 @@ fn creation_fingerprint(request_json: &str) -> String {
         "creation-{}",
         Uuid::new_v5(&Uuid::NAMESPACE_OID, request_json.as_bytes())
     )
+}
+
+fn pending_event_from_request(
+    metadata: &ProjectionMetadata,
+    request_json: &str,
+) -> Result<CanonicalEvent> {
+    if creation_fingerprint(request_json) != metadata.creation_fingerprint {
+        bail!("pending creation request does not match its remote fingerprint");
+    }
+    let request: RecoverableCreationRequest =
+        serde_json::from_str(request_json).context("invalid pending GitHub creation request")?;
+    if request.event_id.as_deref()
+        != metadata
+            .creation_event_id_supplied
+            .then_some(metadata.event_id.as_str())
+    {
+        bail!("pending creation request has a conflicting event identity");
+    }
+    Ok(CanonicalEvent {
+        schema_version: 1,
+        event_id: metadata.event_id.clone(),
+        kind: EventKind::Created,
+        actor: request.actor,
+        github_actor: String::new(),
+        note: request.note,
+        changes: json!({
+            "title": request.title,
+            "description": request.description,
+            "status": request.status,
+        }),
+        expected_state_revision: None,
+    })
+}
+
+fn validate_pending_genesis_intent(
+    issue_number: i64,
+    metadata: &ProjectionMetadata,
+    event: &CanonicalEvent,
+) -> Result<()> {
+    let values: GenesisValues = serde_json::from_value(event.changes.clone())
+        .map_err(|_| metadata_collision(issue_number))?;
+    let request_json = serde_json::to_string(&CreationRequest {
+        title: &values.title,
+        description: values.description.as_deref(),
+        status: values.status,
+        actor: &event.actor,
+        note: event.note.as_deref(),
+        event_id: metadata
+            .creation_event_id_supplied
+            .then_some(event.event_id.as_str()),
+    })?;
+    if event.schema_version != 1
+        || event.event_id != metadata.event_id
+        || event.kind != EventKind::Created
+        || event.expected_state_revision.is_some()
+        || creation_fingerprint(&request_json) != metadata.creation_fingerprint
+    {
+        return Err(metadata_collision(issue_number).into());
+    }
+    Ok(())
 }
 
 fn projection_body(description: Option<&str>, metadata: &ProjectionMetadata) -> Result<String> {
@@ -2295,6 +2774,67 @@ fn rejected_mutation(
     }
 }
 
+fn retried_rejected_mutation_error(mutation: &RejectedMutation, current: &WorkItem) -> GitHubError {
+    GitHubError::new(
+        GitHubErrorKind::RejectedMutation,
+        format!(
+            "Rejected Mutation for work item {}: expected State Revision {}, current State Revision is {}; current values are title={:?}, description={:?}, Status={}; this stable event ID already records the rejected result",
+            mutation.work_item_id,
+            mutation.expected_state_revision,
+            mutation.current_state_revision,
+            current.title,
+            current.description,
+            current.status,
+        ),
+    )
+    .with_details(json!({
+        "kind": "rejected_mutation",
+        "event_id": mutation.event_id,
+        "expected_state_revision": mutation.expected_state_revision,
+        "current_state_revision": mutation.current_state_revision,
+        "current_values": {
+            "title": current.title,
+            "description": current.description,
+            "status": current.status,
+        },
+        "instruction": "refresh current values, decide whether the change is still appropriate, and retry with a new event ID only when submitting a new proposal",
+        "projection_pending": false,
+    }))
+}
+
+fn retry_status_matches(changes: &Value, requested: Status) -> bool {
+    serde_json::from_value::<StatusChanges>(changes.clone())
+        .is_ok_and(|changes| changes.status.to == requested)
+}
+
+fn retry_fields_match(
+    changes: &Value,
+    requested_title: Option<&String>,
+    requested_description: Option<&Option<String>>,
+) -> bool {
+    serde_json::from_value::<FieldChanges>(changes.clone()).is_ok_and(|changes| {
+        let title_matches = requested_title.map_or_else(
+            || changes.title.is_none(),
+            |requested| {
+                changes
+                    .title
+                    .as_ref()
+                    .is_some_and(|change| &change.to == requested)
+            },
+        );
+        let description_matches = requested_description.map_or_else(
+            || changes.description.is_none(),
+            |requested| {
+                changes
+                    .description
+                    .as_ref()
+                    .is_some_and(|change| &change.to == requested)
+            },
+        );
+        title_matches && description_matches
+    })
+}
+
 fn materialize_at_revision(
     issue_number: i64,
     history: &[HistoryEntry],
@@ -2462,35 +3002,15 @@ fn validate_completed_issue(issue: &LedgerIssue) -> Result<ProjectionMetadata> {
     {
         return Err(metadata_collision(issue.number).into());
     }
-    status_from_issue(issue)?;
     Ok(metadata)
 }
 
-fn status_from_issue(issue: &LedgerIssue) -> Result<Status> {
-    let statuses = issue
-        .labels
-        .iter()
-        .filter_map(|label| {
-            LABELS[1..]
-                .iter()
-                .find(|(name, _, _)| label.name.eq_ignore_ascii_case(name))
-                .map(|(name, _, _)| name.trim_start_matches("work-tracker:status:"))
-        })
-        .collect::<Vec<_>>();
-    if statuses.len() != 1 {
-        return Err(metadata_collision(issue.number).into());
-    }
-    statuses[0]
-        .parse()
-        .map_err(|_| metadata_collision(issue.number).into())
-}
-
-fn validate_pending_issue(
+fn validate_creation_issue(
     issue: &LedgerIssue,
     event_id: &str,
     creation_fingerprint: &str,
     status: Status,
-) -> Result<()> {
+) -> Result<ProjectionMetadata> {
     let has_item_label = issue
         .labels
         .iter()
@@ -2507,7 +3027,10 @@ fn validate_pending_issue(
     {
         return Err(metadata_collision(issue.number).into());
     }
-    validate_status_label(issue, status)
+    if metadata.pending_genesis_event_id.is_some() {
+        validate_status_label(issue, status)?;
+    }
+    Ok(metadata)
 }
 
 fn has_valid_projection_stage(metadata: &ProjectionMetadata) -> bool {

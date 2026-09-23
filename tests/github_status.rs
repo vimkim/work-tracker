@@ -527,6 +527,59 @@ fn accepted_status_survives_projection_failure_and_sync_repairs_it() -> Result<(
 }
 
 #[test]
+fn stable_event_id_recovers_a_status_whose_publication_response_was_lost() -> Result<()> {
+    let scenario = StatusScenario::new()?;
+    let cli = &scenario.cli;
+    let gh = &scenario.gh;
+    let event_id = "status-retry-41";
+    let issue = scenario.issue(&[]);
+    let genesis = scenario.genesis_comment();
+    let status = serde_json::json!({
+        "id":9002,
+        "created_at":"2026-09-23T01:03:04Z",
+        "user":{"login":"octocat"},
+        "body":status_comment(event_id, "pending", "active", "agent-b", "octocat", 1, None)
+    });
+    let args = [
+        "--json",
+        "status",
+        "41",
+        "active",
+        "--event-id",
+        event_id,
+        "--actor",
+        "agent-b",
+    ];
+
+    gh.respond(17, 0, r#"{"login":"octocat"}"#, "")?;
+    gh.respond(18, 0, &issue.to_string(), "")?;
+    gh.respond(19, 0, &serde_json::json!([[genesis]]).to_string(), "")?;
+    gh.respond(20, 1, "", "gh: connection reset after upload\n")?;
+    ensure!(!cli.run_with_fake_gh(gh, args)?.status.success());
+
+    gh.respond(21, 0, r#"{"login":"octocat"}"#, "")?;
+    gh.respond(22, 0, &issue.to_string(), "")?;
+    gh.respond(
+        23,
+        0,
+        &serde_json::json!([[genesis, status]]).to_string(),
+        "",
+    )?;
+    gh.respond(24, 0, "{}", "")?;
+    let recovered = cli.run_with_fake_gh(gh, args)?;
+    assert_success(&recovered)?;
+    assert_eq!(json(&recovered)?["status"], "active");
+    assert_eq!(
+        gh.calls()?
+            .matches("\tPOST\trepos/octocat/work-tracker-data/issues/41/comments")
+            .count(),
+        2,
+        "the retry must not publish after the uncertain Status POST"
+    );
+    Ok(())
+}
+
+#[test]
 fn first_valid_status_wins_and_loser_gets_the_structured_conflict() -> Result<()> {
     let scenario = StatusScenario::new()?;
     let cli = &scenario.cli;

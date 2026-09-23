@@ -110,6 +110,17 @@ impl SqliteLedger {
             .map_err(Into::into)
     }
 
+    pub(crate) fn pending_github_creation_request(&self, event_id: &str) -> Result<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT request_json FROM pending_github_creations WHERE event_id = ?1",
+                params![event_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub(crate) fn begin_github_creation(&self, request_json: &str, event_id: &str) -> Result<()> {
         self.connection.execute(
             "INSERT INTO pending_github_creations (request_json, event_id)
@@ -271,11 +282,28 @@ impl SqliteLedger {
         Ok(())
     }
 
+    pub(crate) fn finish_github_creation_recovery(
+        &mut self,
+        request_json: &str,
+        cached: &GithubCacheItem,
+    ) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        replace_github_item_in_transaction(&transaction, cached)?;
+        transaction.execute(
+            "DELETE FROM pending_github_creations WHERE request_json = ?1",
+            params![request_json],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub(crate) fn replace_github_cache_batch(
         &mut self,
         repository: &str,
         items: &[GithubCacheItem],
-        removed_item_ids: &[i64],
+        cleanup: GithubCacheCleanup<'_>,
         cursor: Option<DateTime<Utc>>,
         etag: Option<&str>,
         synchronized_at: DateTime<Utc>,
@@ -283,11 +311,17 @@ impl SqliteLedger {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for id in removed_item_ids {
+        for id in cleanup.removed_item_ids {
             transaction.execute("DELETE FROM work_items WHERE id = ?1", params![id])?;
         }
         for item in items {
             replace_github_item_in_transaction(&transaction, item)?;
+        }
+        for request_json in cleanup.completed_creation_requests {
+            transaction.execute(
+                "DELETE FROM pending_github_creations WHERE request_json = ?1",
+                params![request_json],
+            )?;
         }
         transaction.execute(
             "INSERT INTO github_cache_state
@@ -322,6 +356,11 @@ pub(crate) struct GithubCacheItem {
     pub item: WorkItem,
     pub history: Vec<HistoryEntry>,
     pub rejected: Vec<RejectedMutation>,
+}
+
+pub(crate) struct GithubCacheCleanup<'a> {
+    pub removed_item_ids: &'a [i64],
+    pub completed_creation_requests: &'a [String],
 }
 
 fn replace_github_item_in_transaction(

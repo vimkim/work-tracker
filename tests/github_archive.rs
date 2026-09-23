@@ -320,6 +320,88 @@ fn archive_records_one_event_closes_not_planned_and_locks() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn stable_event_id_recovers_an_archive_whose_publication_response_was_lost() -> Result<()> {
+    let scenario = ArchiveScenario::new()?;
+    let event_id = "archive-retry-41";
+    let issue = serde_json::json!({
+        "number":41,
+        "title":"Retain evidence",
+        "body":scenario.projection.clone(),
+        "labels":[
+            {"name":"work-tracker:item"},
+            {"name":"work-tracker:status:pending"}
+        ],
+        "state":"open",
+        "locked":false
+    });
+    let genesis = serde_json::json!({
+        "id":9001,
+        "created_at":"2026-09-23T01:02:04Z",
+        "user":{"login":"octocat"},
+        "body":scenario.genesis_body.clone()
+    });
+    let archived = serde_json::json!({
+        "id":9002,
+        "created_at":"2026-09-23T01:03:04Z",
+        "user":{"login":"octocat"},
+        "body":archive_comment().replace("{{LAST_EVENT_ID}}", event_id)
+    });
+    let args = [
+        "--json",
+        "archive",
+        "41",
+        "--note",
+        "superseded",
+        "--event-id",
+        event_id,
+        "--actor",
+        "agent-b",
+    ];
+    scenario.gh.respond(17, 0, r#"{"login":"octocat"}"#, "")?;
+    scenario.gh.respond(18, 0, &issue.to_string(), "")?;
+    scenario
+        .gh
+        .respond(19, 0, &serde_json::json!([[genesis]]).to_string(), "")?;
+    scenario
+        .gh
+        .respond(20, 1, "", "gh: connection reset after upload\n")?;
+    ensure!(
+        !scenario
+            .cli
+            .run_with_fake_gh(&scenario.gh, args)?
+            .status
+            .success()
+    );
+
+    scenario.gh.respond(21, 0, r#"{"login":"octocat"}"#, "")?;
+    scenario.gh.respond(22, 0, &issue.to_string(), "")?;
+    scenario.gh.respond(
+        23,
+        0,
+        &serde_json::json!([[genesis, archived]]).to_string(),
+        "",
+    )?;
+    scenario.gh.respond(24, 0, "{}", "")?;
+    scenario.gh.respond(25, 0, "{}", "")?;
+    let recovered = scenario.cli.run_with_fake_gh(&scenario.gh, args)?;
+    assert_success(&recovered)?;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&recovered.stdout)?["status"],
+        "archived"
+    );
+    assert_eq!(
+        scenario
+            .gh
+            .calls()?
+            .matches("\tPOST\trepos/octocat/work-tracker-data/issues/41/comments")
+            .count(),
+        2,
+        "the retry must not publish after the uncertain archive POST"
+    );
+    Ok(())
+}
+
 fn archive_lock_failure_is_recovered_by_sync(lock_applied: bool) -> Result<()> {
     let scenario = ArchiveScenario::new()?;
     let cli = &scenario.cli;
@@ -402,7 +484,14 @@ fn archive_lock_failure_is_recovered_by_sync(lock_applied: bool) -> Result<()> {
         ],
     )?;
     ensure!(!repeated.status.success());
-    ensure!(std::str::from_utf8(&repeated.stderr)?.contains("is archived and cannot be modified"));
+    let repeated_error: Value = serde_json::from_slice(&repeated.stderr)?;
+    assert_eq!(repeated_error["error"]["code"], "github_archived_immutable");
+    assert_eq!(repeated_error["error"]["projection_repaired"], true);
+    ensure!(
+        repeated_error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("projection drift was repaired"))
+    );
     let calls = gh.calls()?;
     assert_eq!(
         calls
@@ -415,8 +504,8 @@ fn archive_lock_failure_is_recovered_by_sync(lock_applied: bool) -> Result<()> {
         calls
             .matches("\tPUT\trepos/octocat/work-tracker-data/issues/41/lock")
             .count(),
-        lock_calls_before,
-        "a repeated archive must not repair projection drift"
+        lock_calls_before + 1,
+        "a repeated archive must repair lock drift before rejecting the mutation"
     );
     Ok(())
 }

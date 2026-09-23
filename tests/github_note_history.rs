@@ -584,53 +584,58 @@ fn retrying_a_known_event_id_returns_the_prior_entry_without_another_comment() -
     let gh = FakeGh::new()?;
     initialize(&cli, &gh)?;
     let (projection, genesis) = create_item(&cli, &gh)?;
-    gh.respond(17, 0, r#"{"login":"octocat"}"#, "")?;
-    gh.respond(
-        18,
-        0,
-        &serde_json::json!({
-            "number": 41,
-            "body": projection,
-            "labels": [
-                {"name": "work-tracker:item"},
-                {"name": "work-tracker:status:pending"}
-            ]
-        })
-        .to_string(),
-        "",
-    )?;
-    gh.respond(
-        19,
-        0,
-        &serde_json::json!([[{
+    let issue = serde_json::json!({
+        "number": 41,
+        "body": projection,
+        "labels": [
+            {"name": "work-tracker:item"},
+            {"name": "work-tracker:status:pending"}
+        ]
+    });
+    let genesis_comment = serde_json::json!({
             "id": 9001,
             "created_at": "2026-09-23T01:02:04Z",
             "user": {"login": "octocat"},
             "body": genesis
-        }, {
+    });
+    let note = serde_json::json!({
             "id": 9002,
             "created_at": "2026-09-23T01:03:04Z",
             "user": {"login": "octocat"},
             "body": note_comment("note-fixed-1", "agent-b", "octocat", "deployment queued")
-        }]])
-        .to_string(),
+    });
+    gh.respond(17, 0, r#"{"login":"octocat"}"#, "")?;
+    gh.respond(18, 0, &issue.to_string(), "")?;
+    gh.respond(
+        19,
+        0,
+        &serde_json::json!([[genesis_comment]]).to_string(),
         "",
     )?;
-    gh.respond(20, 0, "{}", "")?;
+    gh.respond(20, 1, "", "gh: connection reset after upload\n")?;
+    let args = [
+        "--json",
+        "note",
+        "41",
+        "deployment queued",
+        "--actor",
+        "agent-b",
+        "--event-id",
+        "note-fixed-1",
+    ];
+    ensure!(!cli.run_with_fake_gh(&gh, args)?.status.success());
 
-    let retried = cli.run_with_fake_gh(
-        &gh,
-        [
-            "--json",
-            "note",
-            "41",
-            "deployment queued",
-            "--actor",
-            "agent-b",
-            "--event-id",
-            "note-fixed-1",
-        ],
+    gh.respond(21, 0, r#"{"login":"octocat"}"#, "")?;
+    gh.respond(22, 0, &issue.to_string(), "")?;
+    gh.respond(
+        23,
+        0,
+        &serde_json::json!([[genesis_comment, note]]).to_string(),
+        "",
     )?;
+    gh.respond(24, 0, "{}", "")?;
+
+    let retried = cli.run_with_fake_gh(&gh, args)?;
     assert_success(&retried)?;
     let entry = json(&retried)?;
     assert_eq!(entry["id"], 9002);
@@ -640,8 +645,8 @@ fn retrying_a_known_event_id_returns_the_prior_entry_without_another_comment() -
         calls
             .matches("\tPOST\trepos/octocat/work-tracker-data/issues/41/comments")
             .count(),
-        1,
-        "only the genesis comment should have been published"
+        2,
+        "the retry must not publish after the uncertain note POST"
     );
     Ok(())
 }

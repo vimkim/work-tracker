@@ -37,6 +37,7 @@ pub enum ReadHealth {
     Local,
     Fresh {
         synchronized_at: DateTime<Utc>,
+        repaired_work_item_ids: Vec<i64>,
     },
     Stale {
         last_successful_sync_at: DateTime<Utc>,
@@ -104,7 +105,9 @@ impl ReadHealth {
 
     pub fn last_successful_sync_at(&self) -> Option<&DateTime<Utc>> {
         match self {
-            Self::Fresh { synchronized_at } => Some(synchronized_at),
+            Self::Fresh {
+                synchronized_at, ..
+            } => Some(synchronized_at),
             Self::Stale {
                 last_successful_sync_at,
                 ..
@@ -132,6 +135,16 @@ impl ReadHealth {
 
     pub fn is_unavailable(&self) -> bool {
         matches!(self, Self::Unavailable { .. })
+    }
+
+    pub fn repaired_work_item_ids(&self) -> &[i64] {
+        match self {
+            Self::Fresh {
+                repaired_work_item_ids,
+                ..
+            } => repaired_work_item_ids,
+            _ => &[],
+        }
     }
 
     pub fn unreadable_error(&self) -> Option<ReadHealthError> {
@@ -171,6 +184,18 @@ pub trait Ledger: Send {
         note: Option<&str>,
     ) -> Result<WorkItem>;
 
+    fn create_with_event_id(
+        &mut self,
+        title: &str,
+        description: Option<&str>,
+        status: Status,
+        actor: &str,
+        note: Option<&str>,
+        _event_id: Option<&str>,
+    ) -> Result<WorkItem> {
+        self.create(title, description, status, actor, note)
+    }
+
     fn get(&self, id: i64) -> Result<WorkItem>;
 
     fn list(
@@ -191,6 +216,18 @@ pub trait Ledger: Send {
         note: Option<&str>,
     ) -> Result<WorkItem>;
 
+    fn update_with_event_id(
+        &mut self,
+        id: i64,
+        title: Option<&str>,
+        description: Option<Option<&str>>,
+        actor: &str,
+        note: Option<&str>,
+        _event_id: Option<&str>,
+    ) -> Result<WorkItem> {
+        self.update(id, title, description, actor, note)
+    }
+
     fn set_status(
         &mut self,
         id: i64,
@@ -198,6 +235,17 @@ pub trait Ledger: Send {
         actor: &str,
         note: Option<&str>,
     ) -> Result<WorkItem>;
+
+    fn set_status_with_event_id(
+        &mut self,
+        id: i64,
+        status: Status,
+        actor: &str,
+        note: Option<&str>,
+        _event_id: Option<&str>,
+    ) -> Result<WorkItem> {
+        self.set_status(id, status, actor, note)
+    }
 
     fn add_note(
         &mut self,
@@ -210,6 +258,10 @@ pub trait Ledger: Send {
     fn history(&mut self, id: i64) -> Result<Vec<HistoryEntry>>;
 
     fn rejected_mutations(&mut self, id: i64) -> Result<Vec<RejectedMutation>>;
+
+    fn take_projection_repairs(&mut self) -> Vec<i64> {
+        Vec::new()
+    }
 }
 
 /// Backend configuration shared by CLI dispatch and dashboard handlers.

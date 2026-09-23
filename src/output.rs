@@ -15,6 +15,10 @@ pub fn print_json(value: &impl Serialize) -> Result<()> {
 }
 
 pub fn print_read_warning(health: &ReadHealth, json_output: bool) {
+    if !health.repaired_work_item_ids().is_empty() {
+        print_projection_repair_warning(health.repaired_work_item_ids(), json_output);
+        return;
+    }
     let (code, label) = match health.kind() {
         ReadHealthKind::Stale => (
             if health.is_offline() {
@@ -49,6 +53,30 @@ pub fn print_read_warning(health: &ReadHealth, json_output: bool) {
                     "message": message,
                     "last_successful_sync_at": health.last_successful_sync_at(),
                     "stale_age_seconds": stale_age_seconds,
+                }
+            })
+        );
+    } else {
+        eprintln!("warning: {message}");
+    }
+}
+
+pub fn print_projection_repair_warning(work_item_ids: &[i64], json_output: bool) {
+    if work_item_ids.is_empty() {
+        return;
+    }
+    let message = format!(
+        "GITHUB PROJECTION REPAIRED: restored Work Items {:?} from accepted history after unsupported direct edits or interrupted writes",
+        work_item_ids
+    );
+    if json_output {
+        eprintln!(
+            "{}",
+            json!({
+                "warning": {
+                    "code": "github_projection_repaired",
+                    "message": message,
+                    "work_item_ids": work_item_ids,
                 }
             })
         );
@@ -95,11 +123,16 @@ fn github_error_code(kind: GitHubErrorKind) -> &'static str {
         GitHubErrorKind::Unauthenticated => "github_unauthenticated",
         GitHubErrorKind::PermissionDenied => "github_permission_denied",
         GitHubErrorKind::NotFound => "github_not_found",
+        GitHubErrorKind::ValidationFailed => "github_validation_failed",
+        GitHubErrorKind::RateLimited => "github_rate_limited",
+        GitHubErrorKind::NetworkFailure => "github_network_failure",
+        GitHubErrorKind::ServiceFailure => "github_service_failure",
         GitHubErrorKind::ApiFailure => "github_api_failure",
         GitHubErrorKind::InvalidVisibility => "github_invalid_visibility",
         GitHubErrorKind::IncompatibleRepository => "github_incompatible_repository",
         GitHubErrorKind::RejectedMutation => "github_rejected_mutation",
         GitHubErrorKind::ProjectionPending => "github_projection_pending",
+        GitHubErrorKind::ArchivedImmutable => "github_archived_immutable",
         GitHubErrorKind::LedgerIntegrity
         | GitHubErrorKind::UnknownEventSchema
         | GitHubErrorKind::IncompatibleMetadata

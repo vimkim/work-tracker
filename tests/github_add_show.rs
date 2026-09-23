@@ -196,7 +196,15 @@ fn existing_repository_starts_with_a_recovery_capable_cache() -> Result<()> {
 
     let added = cli.run_with_fake_gh(
         &gh,
-        ["--json", "add", "Existing repository", "--actor", "agent-a"],
+        [
+            "--json",
+            "add",
+            "Existing repository",
+            "--event-id",
+            "genesis-existing-repository",
+            "--actor",
+            "agent-a",
+        ],
     )?;
     assert_success(&added)?;
     assert_eq!(json(&added)?["id"], 41);
@@ -297,7 +305,15 @@ fn retry_after_projection_failure_reuses_the_published_genesis_event() -> Result
     )?;
     gh.respond(16, 1, "", "gh: projection update failed (HTTP 503)\n")?;
 
-    let args = ["--json", "add", "Finish projection", "--actor", "agent-a"];
+    let args = [
+        "--json",
+        "add",
+        "Finish projection",
+        "--event-id",
+        "genesis-finish-projection",
+        "--actor",
+        "agent-a",
+    ];
     let interrupted = cli.run_with_fake_gh(&gh, args)?;
     ensure!(!interrupted.status.success());
     let first_calls = gh.calls()?;
@@ -314,15 +330,29 @@ fn retry_after_projection_failure_reuses_the_published_genesis_event() -> Result
         "\nCALL\tapi\t--method\tPATCH\t",
     )?;
 
+    let cache = cli.github_cache_path("octocat", "work-tracker-data");
+    for path in [
+        cache.clone(),
+        cache.with_extension("db-wal"),
+        cache.with_extension("db-shm"),
+    ] {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+
     gh.respond(17, 0, r#"{"login":"octocat"}"#, "")?;
     gh.respond(
         18,
         0,
-        &serde_json::json!({
+        &serde_json::json!([[{
             "number": 41,
+            "title": "Unsupported direct edit",
             "body": completed_body,
             "labels": [{"name": "work-tracker:item"}, {"name": "work-tracker:status:pending"}]
-        })
+        }]])
         .to_string(),
         "",
     )?;
@@ -343,6 +373,9 @@ fn retry_after_projection_failure_reuses_the_published_genesis_event() -> Result
     let resumed = cli.run_with_fake_gh(&gh, args)?;
     assert_success(&resumed)?;
     assert_eq!(json(&resumed)?["id"], 41);
+    let warning: Value = serde_json::from_slice(&resumed.stderr)?;
+    assert_eq!(warning["warning"]["code"], "github_projection_repaired");
+    assert_eq!(warning["warning"]["work_item_ids"], serde_json::json!([41]));
     let all_calls = gh.calls()?;
     assert_eq!(
         all_calls
@@ -361,7 +394,8 @@ fn retry_after_projection_failure_reuses_the_published_genesis_event() -> Result
         all_calls
             .matches("\tPATCH\trepos/octocat/work-tracker-data/issues/41")
             .count(),
-        2
+        2,
+        "completed creation recovery must repair direct projection drift"
     );
     Ok(())
 }
@@ -524,6 +558,8 @@ fn pending_creation_is_recoverable_after_the_disposable_cache_is_lost() -> Resul
         "--json",
         "add",
         "Recover without cache",
+        "--event-id",
+        "genesis-recover-without-cache",
         "--actor",
         "agent-a",
     ];
@@ -618,6 +654,50 @@ fn retry_creates_the_issue_when_the_failed_request_created_nothing() -> Result<(
             .count(),
         2,
         "one failed attempt and one successful retry were expected"
+    );
+    Ok(())
+}
+
+#[test]
+fn identical_adds_with_distinct_event_ids_create_distinct_work_items() -> Result<()> {
+    let cli = CliHarness::new()?;
+    let gh = FakeGh::new()?;
+    initialize(&cli, &gh)?;
+    for (offset, issue, comment, event_id) in [
+        (13, 41, 9001, "genesis-identical-a"),
+        (17, 42, 9002, "genesis-identical-b"),
+    ] {
+        gh.respond(offset, 0, r#"{"login":"octocat"}"#, "")?;
+        gh.respond(offset + 1, 0, &format!(r#"{{"number":{issue}}}"#), "")?;
+        gh.respond(
+            offset + 2,
+            0,
+            &format!(
+                r#"{{"id":{comment},"created_at":"2026-09-23T01:02:04Z","user":{{"login":"octocat"}}}}"#
+            ),
+            "",
+        )?;
+        gh.respond(offset + 3, 0, "{}", "")?;
+        let added = cli.run_with_fake_gh(
+            &gh,
+            [
+                "--json",
+                "add",
+                "Same intent",
+                "--event-id",
+                event_id,
+                "--actor",
+                "agent-a",
+            ],
+        )?;
+        assert_success(&added)?;
+        assert_eq!(json(&added)?["id"], issue);
+    }
+    assert_eq!(
+        gh.calls()?
+            .matches("\tPOST\trepos/octocat/work-tracker-data/issues\t")
+            .count(),
+        2
     );
     Ok(())
 }

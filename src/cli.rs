@@ -144,6 +144,10 @@ pub struct AddArgs {
     #[arg(long)]
     pub note: Option<String>,
 
+    /// Stable creation identity for safely retrying after cache loss.
+    #[arg(long)]
+    pub event_id: Option<String>,
+
     #[command(flatten)]
     pub actor: ActorArgs,
 }
@@ -196,6 +200,10 @@ pub struct UpdateArgs {
     #[arg(long)]
     pub note: Option<String>,
 
+    /// Stable mutation identity for safely retrying an uncertain publication.
+    #[arg(long)]
+    pub event_id: Option<String>,
+
     #[command(flatten)]
     pub actor: ActorArgs,
 }
@@ -210,6 +218,10 @@ pub struct StatusArgs {
     /// Optional transition reason stored in history.
     #[arg(long)]
     pub note: Option<String>,
+
+    /// Stable mutation identity for safely retrying an uncertain publication.
+    #[arg(long)]
+    pub event_id: Option<String>,
 
     #[command(flatten)]
     pub actor: ActorArgs,
@@ -235,6 +247,10 @@ pub struct ArchiveArgs {
     /// Optional archival reason stored in history.
     #[arg(long)]
     pub note: Option<String>,
+
+    /// Stable mutation identity for safely retrying an uncertain publication.
+    #[arg(long)]
+    pub event_id: Option<String>,
 
     #[command(flatten)]
     pub actor: ActorArgs,

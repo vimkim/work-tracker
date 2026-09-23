@@ -44,6 +44,21 @@ Pass `OWNER/REPO` to create or validate a different private repository. The firs
 
 Initialization stores repository configuration but no GitHub token. It creates the repository only after the explicit command, validates existing repositories before use, and is safe to repeat.
 
+### GitHub retries and repair
+
+GitHub writes are convergent. For `add`, `update`, `status`, `note`, and `archive`, pass the same `--event-id` when retrying an uncertain publication; Work Tracker finds the prior structured event, validates its content, and returns its accepted or rejected result instead of publishing another proposal. Creation also carries a request fingerprint and pending genesis marker, but cache-independent retry requires the original event ID so a legitimate later add with identical content remains a distinct Work Item.
+
+| Interrupted or uncertain step | Retry outcome |
+|---|---|
+| Issue creation response is lost | The pending marker/fingerprint locates the existing issue; no second Work Item is created. |
+| Genesis comment publication is interrupted | The next create retry, or synchronization with retained local intent, publishes or discovers the same genesis event. |
+| Mutation comment response is lost | Retrying with the same `--event-id` discovers the accepted or rejected proposal and does not add another effective History Entry. |
+| Title, body, Status label, issue state/reason, or archive lock update is interrupted | Synchronization derives the complete projection from accepted history and repairs it. |
+| Cache batch commit is interrupted | The item/history changes and synchronization cursor roll back together; the next synchronization replays the batch. |
+| A projection field is edited directly on GitHub | Synchronization repairs it and emits `github_projection_repaired`; unstructured comments are left untouched. |
+
+In `--json` mode, GitHub authentication, permission, validation, rate-limit, network, service, and unknown API failures have distinct error codes on standard error. Successful data remains on standard output, including when a warning is emitted.
+
 ### Local SQLite ledger
 
 The database is created automatically at `$XDG_DATA_HOME/work-tracker/work-tracker.db`, or at `~/.local/share/work-tracker/work-tracker.db` when `XDG_DATA_HOME` is unset. After a GitHub default is configured, pass `--database PATH` to select this explicit local backend.
