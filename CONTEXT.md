@@ -41,7 +41,7 @@ An explicit recovery that acknowledges untrusted history and establishes a revie
 _Avoid_: Reset, automatic repair
 
 **Archived Work Item**:
-An immutable Work Item removed from active use but retained indefinitely with its History Entries.
+A Work Item removed from active use and retained indefinitely with its History Entries; only explicit integrity recovery may repair its evidence without changing its reviewed fields, archived Status, or lock.
 _Avoid_: Deleted Work Item, removed task
 
 **Daily View**:

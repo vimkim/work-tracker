@@ -26,32 +26,21 @@ fn exact_recovery_restores_verified_copy_revalidates_and_rebuilds_projection() -
     let cli = CliHarness::new()?;
     configure_github(&cli)?;
     let gh = FakeGh::new()?;
-    let original_event = event("Original title");
-    let edited_event = event("Edited behind Work Tracker");
-    let original_comment = comment(&original_event)?;
-    let edited_comment = comment(&edited_event)?;
-    let projection = projection(&hash(&original_event, 9001)?);
-    let healthy_issue = issue(&projection, "2026-09-23T01:02:04Z", false);
-    let corrupt_issue = issue(&projection, "2026-09-23T02:02:04Z", false);
+    let scenario = seed_edited_integrity(&cli, &gh)?;
 
-    respond_sync(&gh, 1, &healthy_issue, &remote_comment(&original_comment))?;
-    assert_success(&cli.run_with_fake_gh(&gh, ["--json", "show", "41"])?)?;
-    respond_sync(&gh, 3, &corrupt_issue, &remote_comment(&edited_comment))?;
-    assert_success(&cli.run_with_fake_gh(&gh, ["--json", "show", "41"])?)?;
-
-    gh.respond(5, 0, &corrupt_issue.to_string(), "")?;
+    gh.respond(5, 0, &scenario.corrupt_issue.to_string(), "")?;
     gh.respond(
         6,
         0,
-        &json!([[remote_comment(&edited_comment)]]).to_string(),
+        &json!([[remote_comment(&scenario.edited_comment)]]).to_string(),
         "",
     )?;
     gh.respond(7, 0, "", "")?;
-    gh.respond(8, 0, &healthy_issue.to_string(), "")?;
+    gh.respond(8, 0, &scenario.healthy_issue.to_string(), "")?;
     gh.respond(
         9,
         0,
-        &json!([[remote_comment(&original_comment)]]).to_string(),
+        &json!([[remote_comment(&scenario.original_comment)]]).to_string(),
         "",
     )?;
     gh.respond(10, 0, "", "")?;
@@ -82,31 +71,21 @@ fn exact_recovery_failure_stays_latched_and_reports_failed_validation() -> Resul
     let cli = CliHarness::new()?;
     configure_github(&cli)?;
     let gh = FakeGh::new()?;
-    let original_event = event("Original title");
-    let edited_event = event("Edited behind Work Tracker");
-    let original_comment = comment(&original_event)?;
-    let edited_comment = comment(&edited_event)?;
-    let projection = projection(&hash(&original_event, 9001)?);
-    let healthy_issue = issue(&projection, "2026-09-23T01:02:04Z", false);
-    let corrupt_issue = issue(&projection, "2026-09-23T02:02:04Z", false);
-    respond_sync(&gh, 1, &healthy_issue, &remote_comment(&original_comment))?;
-    assert_success(&cli.run_with_fake_gh(&gh, ["--json", "show", "41"])?)?;
-    respond_sync(&gh, 3, &corrupt_issue, &remote_comment(&edited_comment))?;
-    assert_success(&cli.run_with_fake_gh(&gh, ["--json", "show", "41"])?)?;
+    let scenario = seed_edited_integrity(&cli, &gh)?;
 
-    gh.respond(5, 0, &corrupt_issue.to_string(), "")?;
+    gh.respond(5, 0, &scenario.corrupt_issue.to_string(), "")?;
     gh.respond(
         6,
         0,
-        &json!([[remote_comment(&edited_comment)]]).to_string(),
+        &json!([[remote_comment(&scenario.edited_comment)]]).to_string(),
         "",
     )?;
     gh.respond(7, 0, "", "")?;
-    gh.respond(8, 0, &corrupt_issue.to_string(), "")?;
+    gh.respond(8, 0, &scenario.corrupt_issue.to_string(), "")?;
     gh.respond(
         9,
         0,
-        &json!([[remote_comment(&edited_comment)]]).to_string(),
+        &json!([[remote_comment(&scenario.edited_comment)]]).to_string(),
         "",
     )?;
     let recovered = cli.run_with_fake_gh(
@@ -241,32 +220,18 @@ fn explicit_rebaseline_retains_untrusted_evidence_and_starts_a_new_hash_root() -
         "still_blocked"
     );
 
-    gh.respond(3, 0, &corrupt_issue.to_string(), "")?;
-    gh.respond(
-        4,
-        0,
-        &json!([[remote_comment(&original_comment)]]).to_string(),
-        "",
-    )?;
-    gh.respond(
-        5,
-        0,
-        &json!([[{
+    respond_rebaseline(
+        &gh,
+        3,
+        &corrupt_issue,
+        &[remote_comment(&original_comment)],
+        &json!([{
             "event": "commented",
             "comment_id": 9001,
             "actor": {"login": "octocat"}
-        }]])
-        .to_string(),
-        "",
+        }]),
+        "2026-09-23T04:02:03Z",
     )?;
-    gh.respond(6, 0, r#"{"login":"octocat"}"#, "")?;
-    gh.respond(
-        7,
-        0,
-        r#"{"id":9100,"created_at":"2026-09-23T04:02:03Z","user":{"login":"octocat"}}"#,
-        "",
-    )?;
-    gh.respond(8, 0, "", "")?;
     let recovered = cli.run_with_fake_gh(
         &gh,
         [
@@ -339,22 +304,14 @@ fn doctor_diagnosis_can_be_rebaselined_without_a_prior_cached_latch() -> Result<
         json!(["rebaseline"])
     );
 
-    gh.respond(4, 0, &corrupt_issue.to_string(), "")?;
-    gh.respond(
-        5,
-        0,
-        &json!([[remote_comment(&original_comment)]]).to_string(),
-        "",
+    respond_rebaseline(
+        &gh,
+        4,
+        &corrupt_issue,
+        &[remote_comment(&original_comment)],
+        &json!([]),
+        "2026-09-23T04:02:03Z",
     )?;
-    gh.respond(6, 0, "[[]]", "")?;
-    gh.respond(7, 0, r#"{"login":"octocat"}"#, "")?;
-    gh.respond(
-        8,
-        0,
-        r#"{"id":9100,"created_at":"2026-09-23T04:02:03Z","user":{"login":"octocat"}}"#,
-        "",
-    )?;
-    gh.respond(9, 0, "", "")?;
     let recovered = cli.run_with_fake_gh(
         &gh,
         [
@@ -382,34 +339,17 @@ fn rebaseline_retains_cached_and_observed_edited_variants_as_untrusted() -> Resu
     let cli = CliHarness::new()?;
     configure_github(&cli)?;
     let gh = FakeGh::new()?;
-    let original_event = event("Original title");
-    let edited_event = event("Edited behind Work Tracker");
-    let original_comment = comment(&original_event)?;
-    let edited_comment = comment(&edited_event)?;
-    let projection = projection(&hash(&original_event, 9001)?);
-    let healthy_issue = issue(&projection, "2026-09-23T01:02:04Z", false);
-    let corrupt_issue = issue(&projection, "2026-09-23T02:02:04Z", false);
-    respond_sync(&gh, 1, &healthy_issue, &remote_comment(&original_comment))?;
-    assert_success(&cli.run_with_fake_gh(&gh, ["--json", "show", "41"])?)?;
-    respond_sync(&gh, 3, &corrupt_issue, &remote_comment(&edited_comment))?;
-    assert_success(&cli.run_with_fake_gh(&gh, ["--json", "show", "41"])?)?;
-
-    gh.respond(5, 0, &corrupt_issue.to_string(), "")?;
-    gh.respond(
-        6,
-        0,
-        &json!([[remote_comment(&edited_comment)]]).to_string(),
-        "",
+    let scenario = seed_edited_integrity(&cli, &gh)?;
+    let mut reviewed_live_issue = scenario.corrupt_issue.clone();
+    reviewed_live_issue["title"] = json!("Reviewed live title");
+    respond_rebaseline(
+        &gh,
+        5,
+        &reviewed_live_issue,
+        &[remote_comment(&scenario.edited_comment)],
+        &json!([]),
+        "2026-09-23T04:02:03Z",
     )?;
-    gh.respond(7, 0, "[[]]", "")?;
-    gh.respond(8, 0, r#"{"login":"octocat"}"#, "")?;
-    gh.respond(
-        9,
-        0,
-        r#"{"id":9100,"created_at":"2026-09-23T04:02:03Z","user":{"login":"octocat"}}"#,
-        "",
-    )?;
-    gh.respond(10, 0, "", "")?;
     let recovered = cli.run_with_fake_gh(
         &gh,
         [
@@ -439,6 +379,7 @@ fn rebaseline_retains_cached_and_observed_edited_variants_as_untrusted() -> Resu
     assert_eq!(entries[1]["trust"], "untrusted");
     assert_eq!(entries[1]["changes"]["title"], "Original title");
     assert_eq!(entries[2]["kind"], "rebaseline");
+    assert_eq!(entries[2]["changes"]["title"], "Reviewed live title");
     assert_eq!(
         entries[2]["changes"]["prior_evidence"][0]["variant"],
         "observed_damaged_copy"
@@ -545,6 +486,60 @@ fn remote_comment(body: &str) -> Value {
 fn respond_sync(gh: &FakeGh, start: usize, issue: &Value, comment: &Value) -> Result<()> {
     gh.respond(start, 0, &json!([[issue]]).to_string(), "")?;
     gh.respond(start + 1, 0, &json!([[comment]]).to_string(), "")?;
+    Ok(())
+}
+
+struct EditedIntegrityScenario {
+    original_comment: String,
+    edited_comment: String,
+    healthy_issue: Value,
+    corrupt_issue: Value,
+}
+
+fn seed_edited_integrity(cli: &CliHarness, gh: &FakeGh) -> Result<EditedIntegrityScenario> {
+    let original_event = event("Original title");
+    let edited_event = event("Edited behind Work Tracker");
+    let original_comment = comment(&original_event)?;
+    let edited_comment = comment(&edited_event)?;
+    let projection = projection(&hash(&original_event, 9001)?);
+    let healthy_issue = issue(&projection, "2026-09-23T01:02:04Z", false);
+    let corrupt_issue = issue(&projection, "2026-09-23T02:02:04Z", false);
+    respond_sync(gh, 1, &healthy_issue, &remote_comment(&original_comment))?;
+    assert_success(&cli.run_with_fake_gh(gh, ["--json", "show", "41"])?)?;
+    respond_sync(gh, 3, &corrupt_issue, &remote_comment(&edited_comment))?;
+    assert_success(&cli.run_with_fake_gh(gh, ["--json", "show", "41"])?)?;
+    Ok(EditedIntegrityScenario {
+        original_comment,
+        edited_comment,
+        healthy_issue,
+        corrupt_issue,
+    })
+}
+
+fn respond_rebaseline(
+    gh: &FakeGh,
+    start: usize,
+    issue: &Value,
+    comments: &[Value],
+    timeline: &Value,
+    created_at: &str,
+) -> Result<()> {
+    gh.respond(start, 0, &issue.to_string(), "")?;
+    gh.respond(start + 1, 0, &json!([comments]).to_string(), "")?;
+    gh.respond(start + 2, 0, &json!([timeline]).to_string(), "")?;
+    gh.respond(start + 3, 0, r#"{"login":"octocat"}"#, "")?;
+    gh.respond(
+        start + 4,
+        0,
+        &json!({
+            "id": 9100,
+            "created_at": created_at,
+            "user": {"login": "octocat"}
+        })
+        .to_string(),
+        "",
+    )?;
+    gh.respond(start + 5, 0, "", "")?;
     Ok(())
 }
 
@@ -1373,7 +1368,7 @@ fn deleted_interior_event_is_correlated_without_claiming_unrelated_deletions() -
 }
 
 #[test]
-fn archived_rebaseline_is_temporarily_unlocked_relocked_and_remains_immutable() -> Result<()> {
+fn archived_rebaseline_stays_locked_and_remains_immutable() -> Result<()> {
     let cli = CliHarness::new()?;
     configure_github(&cli)?;
     let gh = FakeGh::new()?;
@@ -1444,29 +1439,18 @@ fn archived_rebaseline_is_temporarily_unlocked_relocked_and_remains_immutable() 
     gh.respond(4, 0, &json!([[archive_comment]]).to_string(), "")?;
     assert_success(&cli.run_with_fake_gh(&gh, ["--json", "show", "41"])?)?;
 
-    gh.respond(5, 0, &archived_issue.to_string(), "")?;
-    gh.respond(6, 0, &json!([[archive_comment]]).to_string(), "")?;
-    gh.respond(
-        7,
-        0,
-        &json!([[{
+    respond_rebaseline(
+        &gh,
+        5,
+        &archived_issue,
+        std::slice::from_ref(&archive_comment),
+        &json!([{
             "event": "comment_deleted",
             "comment_id": 9001,
             "actor": {"login": "repository-admin"}
-        }]])
-        .to_string(),
-        "",
+        }]),
+        "2026-09-23T06:02:03Z",
     )?;
-    gh.respond(8, 0, r#"{"login":"octocat"}"#, "")?;
-    gh.respond(9, 0, "", "")?;
-    gh.respond(
-        10,
-        0,
-        r#"{"id":9100,"created_at":"2026-09-23T06:02:03Z","user":{"login":"octocat"}}"#,
-        "",
-    )?;
-    gh.respond(11, 0, "", "")?;
-    gh.respond(12, 0, "", "")?;
     let recovered = cli.run_with_fake_gh(
         &gh,
         [
@@ -1485,8 +1469,7 @@ fn archived_rebaseline_is_temporarily_unlocked_relocked_and_remains_immutable() 
     ensure!(human.contains("Recovery:    rebaseline"));
     ensure!(human.contains("Archived:    true"));
     let calls = gh.calls()?;
-    ensure!(calls.contains("\tDELETE\trepos/octocat/work-tracker-data/issues/41/lock"));
-    ensure!(calls.contains("\tPUT\trepos/octocat/work-tracker-data/issues/41/lock"));
+    ensure!(!calls.contains("\trepos/octocat/work-tracker-data/issues/41/lock"));
 
     let shown = cli.run_with_fake_gh(&gh, ["--offline", "--json", "show", "41"])?;
     assert_success(&shown)?;

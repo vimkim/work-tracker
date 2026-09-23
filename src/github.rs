@@ -2387,49 +2387,6 @@ impl GitHubLedger {
         }
     }
 
-    fn reviewed_item_from_issue(
-        &self,
-        issue: &LedgerIssue,
-        comments: &[LedgerComment],
-    ) -> WorkItem {
-        let status = issue
-            .labels
-            .iter()
-            .find_map(|label| {
-                label
-                    .name
-                    .strip_prefix("work-tracker:status:")
-                    .and_then(|status| Status::from_str(status).ok())
-            })
-            .unwrap_or(Status::Pending);
-        let observed_at = comments
-            .iter()
-            .map(|comment| comment.created_at)
-            .min()
-            .or(issue.updated_at)
-            .unwrap_or_else(Utc::now);
-        let updated_at = issue.updated_at.unwrap_or(observed_at);
-        let visible = projection_visible_text(&issue.body).unwrap_or_default();
-        let description =
-            (!matches!(visible, "" | "_No description provided._")).then(|| visible.to_owned());
-        let archived_at = (status == Status::Archived).then_some(updated_at);
-        WorkItem {
-            id: issue.number,
-            title: issue
-                .title
-                .clone()
-                .unwrap_or_else(|| format!("GitHub issue #{}", issue.number)),
-            description,
-            status,
-            created_at: observed_at,
-            updated_at,
-            archived_at,
-            deleted_at: archived_at,
-            purge_after: None,
-            ledger_integrity_error: true,
-        }
-    }
-
     fn restore_exact_copy(&mut self, issue_number: i64) -> Result<RecoveryReport> {
         let (issue, metadata) = self.load_work_item_issue(issue_number)?;
         let comments = self.load_comments(issue_number)?;
@@ -2585,12 +2542,10 @@ impl GitHubLedger {
             )
             .into());
         }
-        let cached_reviewed = self.cache.get(issue_number).ok();
-        let reviewed = cached_reviewed
-            .clone()
-            .unwrap_or_else(|| self.reviewed_item_from_issue(&issue, &comments));
+        let has_cached_item = self.cache.get(issue_number).is_ok();
+        let reviewed = reviewed_item_from_issue(&issue, &comments);
         diagnosis.archived = reviewed.status == Status::Archived;
-        let cached_history = if cached_reviewed.is_some() {
+        let cached_history = if has_cached_item {
             self.cache.history(issue_number)?
         } else {
             Vec::new()
@@ -2664,13 +2619,6 @@ impl GitHubLedger {
         };
         let body = event_comment_body(&event)?;
         let archived = reviewed.status == Status::Archived;
-        if archived && issue.locked {
-            self.github.api_empty(
-                "DELETE",
-                &format!("repos/{}/issues/{issue_number}/lock", self.repository),
-                &[],
-            )?;
-        }
 
         let recovery = (|| -> Result<(WorkItem, ReplayedHistory, Vec<LedgerComment>)> {
             let mut comment: LedgerComment = self.github.api_json(
@@ -2723,23 +2671,6 @@ impl GitHubLedger {
             self.project_history_head(&issue, metadata.clone(), &replayed.accepted)?;
             Ok((item, replayed, comments.clone()))
         })();
-
-        let relock = if archived && issue.locked {
-            self.github.api_empty(
-                "PUT",
-                &format!("repos/{}/issues/{issue_number}/lock", self.repository),
-                &[],
-            )
-        } else {
-            Ok(())
-        };
-        if let Err(error) = relock {
-            return Err(recovery_validation_failed(
-                issue_number,
-                format!("the archived Work Item could not be relocked: {error:#}"),
-            )
-            .into());
-        }
         let (item, replayed, comments) = recovery?;
         let trusted_event_count = replayed.accepted.len();
         let untrusted_event_count = replayed.untrusted.len();
@@ -3618,6 +3549,45 @@ fn materialize_item(issue_number: i64, history: &[HistoryEntry]) -> Result<WorkI
         purge_after: None,
         ledger_integrity_error: false,
     })
+}
+
+fn reviewed_item_from_issue(issue: &LedgerIssue, comments: &[LedgerComment]) -> WorkItem {
+    let status = issue
+        .labels
+        .iter()
+        .find_map(|label| {
+            label
+                .name
+                .strip_prefix("work-tracker:status:")
+                .and_then(|status| Status::from_str(status).ok())
+        })
+        .unwrap_or(Status::Pending);
+    let observed_at = comments
+        .iter()
+        .map(|comment| comment.created_at)
+        .min()
+        .or(issue.updated_at)
+        .unwrap_or_else(Utc::now);
+    let updated_at = issue.updated_at.unwrap_or(observed_at);
+    let visible = projection_visible_text(&issue.body).unwrap_or_default();
+    let description =
+        (!matches!(visible, "" | "_No description provided._")).then(|| visible.to_owned());
+    let archived_at = (status == Status::Archived).then_some(updated_at);
+    WorkItem {
+        id: issue.number,
+        title: issue
+            .title
+            .clone()
+            .unwrap_or_else(|| format!("GitHub issue #{}", issue.number)),
+        description,
+        status,
+        created_at: observed_at,
+        updated_at,
+        archived_at,
+        deleted_at: archived_at,
+        purge_after: None,
+        ledger_integrity_error: true,
+    }
 }
 
 fn extract_metadata<'a>(body: &'a str, marker: &str) -> Result<&'a str> {

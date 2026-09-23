@@ -18,7 +18,7 @@ Work Tracker preserves the current status and context of long-running work acros
 - GitHub Issues is the authoritative ledger after explicit GitHub initialization; SQLite remains the single source of truth only for the explicit local backend and is otherwise a disposable cache. See ADR 0002.
 - Every effective mutation and standalone note appends a History Entry in the same transaction.
 - Repeating an already-applied status is idempotent and does not append history.
-- Archived Work Items are immutable and retained indefinitely with their history.
+- Archived Work Items reject ordinary mutations and remain archived, locked, and retained indefinitely; explicit integrity recovery may repair ledger evidence under ADR 0003.
 - The Daily View uses the server's local day and includes every Actionable Work Item.
 - `list` shows only Actionable Work Items unless `--all` or `--status` widens it; see `docs/adr/0001-list-shows-actionable-work-by-default.md`.
 - Keep the HTML interface read-only. Mutations belong in the CLI.
