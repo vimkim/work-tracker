@@ -16,7 +16,9 @@ pub enum Status {
     Blocked,
     Done,
     Cancelled,
-    Deleted,
+    #[serde(alias = "deleted")]
+    #[value(alias = "deleted")]
+    Archived,
 }
 
 impl Status {
@@ -28,7 +30,7 @@ impl Status {
             Self::Blocked => "blocked",
             Self::Done => "done",
             Self::Cancelled => "cancelled",
-            Self::Deleted => "deleted",
+            Self::Archived => "archived",
         }
     }
 
@@ -57,7 +59,7 @@ impl FromStr for Status {
             "blocked" => Ok(Self::Blocked),
             "done" => Ok(Self::Done),
             "cancelled" => Ok(Self::Cancelled),
-            "deleted" => Ok(Self::Deleted),
+            "archived" | "deleted" => Ok(Self::Archived),
             _ => bail!("invalid status: {value}"),
         }
     }
@@ -71,7 +73,10 @@ pub struct WorkItem {
     pub status: Status,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub archived_at: Option<DateTime<Utc>>,
+    /// Deprecated compatibility alias for `archived_at`.
     pub deleted_at: Option<DateTime<Utc>>,
+    /// Deprecated compatibility field. Archival is retained indefinitely.
     pub purge_after: Option<DateTime<Utc>>,
 }
 

@@ -18,7 +18,7 @@ Work Tracker preserves the current status and context of long-running work acros
 - SQLite is the single source of truth. Do not add a second writable store.
 - Every effective mutation and standalone note appends a History Entry in the same transaction.
 - Repeating an already-applied status is idempotent and does not append history.
-- Deleted Work Items are immutable, readable for 60 days, and then purged with their history.
+- Archived Work Items are immutable and retained indefinitely with their history.
 - The Daily View uses the server's local day and includes every Actionable Work Item.
 - `list` shows only Actionable Work Items unless `--all` or `--status` widens it; see `docs/adr/0001-list-shows-actionable-work-by-default.md`.
 - Keep the HTML interface read-only. Mutations belong in the CLI.

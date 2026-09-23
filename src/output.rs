@@ -28,10 +28,10 @@ pub fn print_item(item: &WorkItem) {
             .with_timezone(&Local)
             .format("%Y-%m-%d %H:%M:%S %:z")
     );
-    if let Some(purge_after) = item.purge_after {
+    if let Some(archived_at) = item.archived_at {
         println!(
-            "Purge after: {}",
-            purge_after
+            "Archived:    {}",
+            archived_at
                 .with_timezone(&Local)
                 .format("%Y-%m-%d %H:%M:%S %:z")
         );

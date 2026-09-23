@@ -6,10 +6,10 @@ Work Tracker is a small, agent-friendly status ledger for parallel and long-runn
 
 - Transaction-safe updates from concurrent agents using SQLite WAL mode.
 - Stable human-readable commands and machine-readable `--json` output.
-- Immutable creation, note, update, status-transition, and deletion history.
+- Immutable creation, note, update, status-transition, and archival history.
 - A default `list` that shows only actionable work, with `--all` for the full ledger.
 - A Daily View containing everything updated today and every actionable item.
-- Soft deletion with a 60-day readable retention window and automatic purge.
+- Permanent archival that keeps Work Items and their history readable indefinitely.
 - A localhost-only, read-only dashboard suitable for SSH tunneling.
 
 ## Build and install
@@ -65,18 +65,18 @@ If neither is set, the CLI uses the current `USER`, then `unknown` as a last res
 | Command | Purpose |
 |---|---|
 | `add` | Create a Work Item, initially `pending` unless selected otherwise |
-| `show ID` | Show one item, including a soft-deleted item |
+| `show ID` | Show one item, including an Archived Work Item |
 | `list` | List actionable items; `--all` adds done and cancelled, `--status` selects one status |
 | `today` | Show items updated today plus all actionable items |
 | `update ID` | Change title or description |
 | `status ID STATUS` | Apply an idempotent status transition |
 | `note ID MESSAGE` | Preserve context without changing status |
-| `delete ID` | Soft-delete an item for 60 days |
+| `archive ID` | Permanently archive an item while retaining its history |
 | `history ID` | Show the complete immutable history |
 | `path` | Show the SQLite database path |
 | `serve` | Host the read-only dashboard |
 
-The statuses are `pending`, `active`, `waiting`, `blocked`, `done`, `cancelled`, and `deleted`. The first four are actionable: they are what `list` shows by default, and they remain in the Daily View even when they were not updated today.
+The statuses are `pending`, `active`, `waiting`, `blocked`, `done`, `cancelled`, and `archived`. The first four are actionable: they are what `list` shows by default, and they remain in the Daily View even when they were not updated today.
 
 Run `work-tracker COMMAND --help` for all options.
 
@@ -91,7 +91,7 @@ work-tracker list --status done   # exactly one status
 work-tracker today                # actionable items plus anything updated today
 ```
 
-Both views order work by attention first: blocked, active, waiting, pending, then finished work, most recently updated first within each group. `--all` and `--status` cannot be combined. The human-readable `list` output ends with a footer that names `--all` whenever finished items are hidden; `--json` output is always a plain array. Deleted items stay hidden from every list unless you pass `--include-deleted` or `--status deleted`.
+Both views order work by attention first: blocked, active, waiting, pending, then finished work, most recently updated first within each group. `--all` and `--status` cannot be combined. The human-readable `list` output ends with a footer that names `--all` whenever finished items are hidden; `--json` output is always a plain array. Archived Work Items stay hidden from every list unless you pass `--include-archived` or `--status archived`.
 
 ## Agent and script usage
 
@@ -107,9 +107,11 @@ work-tracker --database /srv/work-tracker/team.db list --json
 
 For multiple agents, point every process at the same database file on the same Linux host. SQLite serializes writes, waits up to five seconds for a busy writer, and keeps reads responsive through WAL mode. Do not put the database on a filesystem that does not support SQLite locking semantics.
 
-## Deletion and retention
+## Archival and compatibility
 
-`delete` changes the status to `deleted`, records the actor and reason, and sets `purge_after` to exactly 60 days after deletion. Deleted items remain available through `show`, `history`, `list --include-deleted`, or `list --status deleted`. They cannot be changed. Opening the tracker lazily purges items whose retention window has expired, including their history.
+`archive` changes the status to `archived` and records the actor and reason. Archived Work Items remain available through `show`, `history`, `list --include-archived`, or `list --status archived`; they cannot be changed and are never purged.
+
+For existing scripts, `delete`, `deleted`, and `--include-deleted` remain accepted as deprecated input aliases for `archive`, `archived`, and `--include-archived`. Human-readable and JSON output always use canonical archival language. Work Item JSON adds `archived_at`, keeps deprecated `deleted_at` as the same timestamp, and keeps deprecated `purge_after` as `null`.
 
 ## HTML dashboard
 

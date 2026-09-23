@@ -31,7 +31,7 @@ pub struct Cli {
 pub enum Command {
     /// Create a work item.
     Add(AddArgs),
-    /// Show one work item, including a soft-deleted item.
+    /// Show one work item, including an Archived Work Item.
     Show(IdArgs),
     /// List actionable work items, or every work item with --all.
     List(ListArgs),
@@ -43,8 +43,9 @@ pub enum Command {
     Status(StatusArgs),
     /// Add a context note without changing status.
     Note(NoteArgs),
-    /// Soft-delete a work item for the 60-day retention window.
-    Delete(DeleteArgs),
+    /// Archive a Work Item permanently while retaining its history.
+    #[command(visible_alias = "delete")]
+    Archive(ArchiveArgs),
     /// Show the immutable history of a work item.
     History(IdArgs),
     /// Print the database path in use.
@@ -106,9 +107,9 @@ pub struct ListArgs {
     #[arg(long, value_enum)]
     pub status: Option<Status>,
 
-    /// Include soft-deleted work items.
-    #[arg(long)]
-    pub include_deleted: bool,
+    /// Include Archived Work Items.
+    #[arg(long, visible_alias = "include-deleted")]
+    pub include_archived: bool,
 
     /// Maximum number of rows.
     #[arg(long, default_value_t = 100)]
@@ -117,9 +118,9 @@ pub struct ListArgs {
 
 #[derive(Debug, Args)]
 pub struct TodayArgs {
-    /// Include work items deleted today.
-    #[arg(long)]
-    pub include_deleted: bool,
+    /// Include Work Items archived today.
+    #[arg(long, visible_alias = "include-deleted")]
+    pub include_archived: bool,
 }
 
 #[derive(Debug, Args)]
@@ -168,10 +169,10 @@ pub struct NoteArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct DeleteArgs {
+pub struct ArchiveArgs {
     pub id: i64,
 
-    /// Optional deletion reason stored in history.
+    /// Optional archival reason stored in history.
     #[arg(long)]
     pub note: Option<String>,
 
@@ -227,7 +228,7 @@ mod tests {
         };
         assert!(!args.all);
         assert!(args.status.is_none());
-        assert!(!args.include_deleted);
+        assert!(!args.include_archived);
         Ok(())
     }
 

@@ -37,11 +37,11 @@ pub trait Ledger: Send {
     fn list(
         &self,
         filter: ListFilter,
-        include_deleted: bool,
+        include_archived: bool,
         limit: usize,
     ) -> Result<Vec<WorkItem>>;
 
-    fn daily_view(&self, include_deleted: bool) -> Result<Vec<WorkItem>>;
+    fn daily_view(&self, include_archived: bool) -> Result<Vec<WorkItem>>;
 
     fn update(
         &mut self,

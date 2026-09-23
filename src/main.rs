@@ -59,7 +59,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Show(args) => show_item(&ledger.get(args.id)?, cli.json),
         Command::List(args) => {
             let filter = list_filter(&args);
-            let items = ledger.list(filter, args.include_deleted, args.limit)?;
+            let items = ledger.list(filter, args.include_archived, args.limit)?;
             if cli.json {
                 output::print_json(&items)
             } else if filter == ListFilter::Actionable {
@@ -71,7 +71,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Today(args) => {
-            let items = ledger.daily_view(args.include_deleted)?;
+            let items = ledger.daily_view(args.include_archived)?;
             show_items(&items, cli.json)
         }
         Command::Update(args) => {
@@ -107,10 +107,10 @@ async fn run(cli: Cli) -> Result<()> {
                 Ok(())
             }
         }
-        Command::Delete(args) => {
+        Command::Archive(args) => {
             let item = ledger.set_status(
                 args.id,
-                Status::Deleted,
+                Status::Archived,
                 &args.actor.resolved(),
                 args.note.as_deref(),
             )?;

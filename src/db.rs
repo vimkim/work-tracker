@@ -1,7 +1,7 @@
 use std::{path::Path, str::FromStr, time::Duration as StdDuration};
 
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Duration, Local, LocalResult, NaiveTime, TimeZone, Utc};
+use chrono::{DateTime, Local, LocalResult, NaiveTime, TimeZone, Utc};
 use rusqlite::{
     Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params, types::Type,
 };
@@ -12,7 +12,7 @@ use crate::{
     ledger::{Ledger, ListFilter},
 };
 
-const RETENTION_DAYS: i64 = 60;
+const SCHEMA_VERSION: i64 = 2;
 
 /// SQL list of the statuses that make a Work Item actionable. Keep in sync with
 /// `Status::is_actionable`.
@@ -39,25 +39,43 @@ impl SqliteLedger {
         let connection = Connection::open(path)
             .with_context(|| format!("failed to open database {}", path.display()))?;
         connection.busy_timeout(StdDuration::from_secs(5))?;
-        connection.pragma_update(None, "foreign_keys", "ON")?;
+        let schema_version: i64 =
+            connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        match schema_version {
+            0 => create_schema(&connection)?,
+            1 => migrate_deleted_items_to_archived(&connection)?,
+            SCHEMA_VERSION => {}
+            version => bail!("unsupported database schema version {version}"),
+        }
         connection.pragma_update(None, "journal_mode", "WAL")?;
-        connection.execute_batch(
-            "
+        connection.pragma_update(None, "foreign_keys", "ON")?;
+
+        Ok(Self { connection })
+    }
+
+    #[cfg(test)]
+    fn open_in_memory() -> Result<Self> {
+        Self::open(Path::new(":memory:"))
+    }
+}
+
+fn create_schema(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "
             CREATE TABLE IF NOT EXISTS work_items (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
                 title         TEXT NOT NULL CHECK (length(trim(title)) > 0),
                 description   TEXT,
                 status        TEXT NOT NULL CHECK (
-                    status IN ('pending', 'active', 'waiting', 'blocked', 'done', 'cancelled', 'deleted')
+                    status IN ('pending', 'active', 'waiting', 'blocked', 'done', 'cancelled', 'archived')
                 ),
                 created_at    TEXT NOT NULL,
                 updated_at    TEXT NOT NULL,
-                deleted_at    TEXT,
-                purge_after   TEXT,
+                archived_at   TEXT,
                 CHECK (
-                    (status = 'deleted' AND deleted_at IS NOT NULL AND purge_after IS NOT NULL)
+                    (status = 'archived' AND archived_at IS NOT NULL)
                     OR
-                    (status != 'deleted' AND deleted_at IS NULL AND purge_after IS NULL)
+                    (status != 'archived' AND archived_at IS NULL)
                 )
             );
 
@@ -73,34 +91,81 @@ impl SqliteLedger {
 
             CREATE INDEX IF NOT EXISTS idx_work_items_status_updated
                 ON work_items(status, updated_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_work_items_purge_after
-                ON work_items(purge_after) WHERE status = 'deleted';
             CREATE INDEX IF NOT EXISTS idx_history_work_item
                 ON history_entries(work_item_id, id);
 
-            PRAGMA user_version = 1;
+            PRAGMA user_version = 2;
             ",
-        )?;
+    )?;
+    Ok(())
+}
 
-        let tracker = Self { connection };
-        tracker.purge_expired(Utc::now())?;
-        Ok(tracker)
+fn migrate_deleted_items_to_archived(connection: &Connection) -> Result<()> {
+    connection.execute_batch("BEGIN IMMEDIATE;")?;
+    let locked_version: i64 =
+        connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if locked_version == SCHEMA_VERSION {
+        connection.execute_batch("COMMIT;")?;
+        return Ok(());
+    }
+    if locked_version != 1 {
+        connection.execute_batch("ROLLBACK;")?;
+        bail!("cannot migrate database schema version {locked_version}");
     }
 
-    #[cfg(test)]
-    fn open_in_memory() -> Result<Self> {
-        Self::open(Path::new(":memory:"))
-    }
-
-    fn purge_expired(&self, now: DateTime<Utc>) -> Result<usize> {
-        self.connection
-            .execute(
-                "DELETE FROM work_items
-                 WHERE status = 'deleted' AND purge_after <= ?1",
-                params![timestamp(now)],
+    // Keep this v1-to-v2 schema snapshot self-contained. Future schema versions
+    // must add a new migration instead of changing the historical v2 target.
+    connection.execute_batch(
+        "
+        CREATE TABLE work_items_v2 (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            title         TEXT NOT NULL CHECK (length(trim(title)) > 0),
+            description   TEXT,
+            status        TEXT NOT NULL CHECK (
+                status IN ('pending', 'active', 'waiting', 'blocked', 'done', 'cancelled', 'archived')
+            ),
+            created_at    TEXT NOT NULL,
+            updated_at    TEXT NOT NULL,
+            archived_at   TEXT,
+            CHECK (
+                (status = 'archived' AND archived_at IS NOT NULL)
+                OR
+                (status != 'archived' AND archived_at IS NULL)
             )
-            .map_err(Into::into)
-    }
+        );
+        CREATE TABLE history_entries_v2 (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            work_item_id  INTEGER NOT NULL REFERENCES work_items_v2(id) ON DELETE CASCADE,
+            kind          TEXT NOT NULL,
+            actor         TEXT NOT NULL CHECK (length(trim(actor)) > 0),
+            note          TEXT,
+            occurred_at   TEXT NOT NULL,
+            changes_json  TEXT NOT NULL
+        );
+        INSERT INTO work_items_v2
+            (id, title, description, status, created_at, updated_at, archived_at)
+        SELECT id, title, description,
+               CASE status WHEN 'deleted' THEN 'archived' ELSE status END,
+               created_at, updated_at,
+               CASE status WHEN 'deleted' THEN deleted_at ELSE NULL END
+        FROM work_items;
+        INSERT INTO history_entries_v2
+            (id, work_item_id, kind, actor, note, occurred_at, changes_json)
+        SELECT id, work_item_id, kind, actor, note, occurred_at, changes_json
+        FROM history_entries;
+        DROP TABLE history_entries;
+        DROP TABLE work_items;
+        ALTER TABLE work_items_v2 RENAME TO work_items;
+        ALTER TABLE history_entries_v2 RENAME TO history_entries;
+        CREATE INDEX idx_work_items_status_updated
+            ON work_items(status, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_history_work_item
+            ON history_entries(work_item_id, id);
+        PRAGMA user_version = 2;
+        COMMIT;
+        ",
+    )?;
+    Ok(())
 }
 
 impl Ledger for SqliteLedger {
@@ -114,8 +179,8 @@ impl Ledger for SqliteLedger {
     ) -> Result<WorkItem> {
         let title = normalized_required(title, "title")?;
         let actor = normalized_required(actor, "actor")?;
-        if status == Status::Deleted {
-            bail!("a work item cannot be created with deleted status");
+        if status == Status::Archived {
+            bail!("a work item cannot be created with archived status");
         }
         let description = normalized_optional(description);
         let now = Utc::now();
@@ -125,8 +190,8 @@ impl Ledger for SqliteLedger {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "INSERT INTO work_items
-             (title, description, status, created_at, updated_at, deleted_at, purge_after)
-             VALUES (?1, ?2, ?3, ?4, ?4, NULL, NULL)",
+             (title, description, status, created_at, updated_at, archived_at)
+             VALUES (?1, ?2, ?3, ?4, ?4, NULL)",
             params![title, description, status.as_str(), timestamp],
         )?;
         let id = transaction.last_insert_rowid();
@@ -150,7 +215,7 @@ impl Ledger for SqliteLedger {
     fn list(
         &self,
         filter: ListFilter,
-        include_deleted: bool,
+        include_archived: bool,
         limit: usize,
     ) -> Result<Vec<WorkItem>> {
         let (status, actionable_only) = match filter {
@@ -158,36 +223,36 @@ impl Ledger for SqliteLedger {
             ListFilter::All => (None, false),
             ListFilter::Status(status) => (Some(status.as_str()), false),
         };
-        let include_deleted = include_deleted || filter == ListFilter::Status(Status::Deleted);
+        let include_archived = include_archived || filter == ListFilter::Status(Status::Archived);
         let mut statement = self.connection.prepare(&format!(
-            "SELECT id, title, description, status, created_at, updated_at, deleted_at, purge_after
+            "SELECT id, title, description, status, created_at, updated_at, archived_at
              FROM work_items
              WHERE (?1 IS NULL OR status = ?1)
                AND (NOT ?2 OR status IN {ACTIONABLE_STATUSES})
-               AND (?3 OR status != 'deleted')
+               AND (?3 OR status != 'archived')
              ORDER BY {STATUS_PRIORITY_ORDER}
              LIMIT ?4"
         ))?;
         let rows = statement.query_map(
-            params![status, actionable_only, include_deleted, limit as i64],
+            params![status, actionable_only, include_archived, limit as i64],
             row_to_item,
         )?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
 
-    fn daily_view(&self, include_deleted: bool) -> Result<Vec<WorkItem>> {
+    fn daily_view(&self, include_archived: bool) -> Result<Vec<WorkItem>> {
         let (start, end) = local_day_bounds(Utc::now())?;
         let mut statement = self.connection.prepare(&format!(
-            "SELECT id, title, description, status, created_at, updated_at, deleted_at, purge_after
+            "SELECT id, title, description, status, created_at, updated_at, archived_at
              FROM work_items
              WHERE (updated_at >= ?1 AND updated_at < ?2
                     OR status IN {ACTIONABLE_STATUSES})
-               AND (?3 OR status != 'deleted')
+               AND (?3 OR status != 'archived')
              ORDER BY {STATUS_PRIORITY_ORDER}"
         ))?;
         let rows = statement.query_map(
-            params![timestamp(start), timestamp(end), include_deleted],
+            params![timestamp(start), timestamp(end), include_archived],
             row_to_item,
         )?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -277,21 +342,16 @@ impl Ledger for SqliteLedger {
         ensure_mutable(&current)?;
 
         let now = Utc::now();
-        let (deleted_at, purge_after, kind) = if status == Status::Deleted {
-            let purge_after = now + Duration::days(RETENTION_DAYS);
-            (
-                Some(timestamp(now)),
-                Some(timestamp(purge_after)),
-                "deleted",
-            )
+        let (archived_at, kind) = if status == Status::Archived {
+            (Some(timestamp(now)), "archived")
         } else {
-            (None, None, "status_changed")
+            (None, "status_changed")
         };
         transaction.execute(
             "UPDATE work_items
-             SET status = ?1, updated_at = ?2, deleted_at = ?3, purge_after = ?4
-             WHERE id = ?5",
-            params![status.as_str(), timestamp(now), deleted_at, purge_after, id],
+             SET status = ?1, updated_at = ?2, archived_at = ?3
+             WHERE id = ?4",
+            params![status.as_str(), timestamp(now), archived_at, id],
         )?;
         insert_history(
             &transaction,
@@ -352,11 +412,8 @@ impl Ledger for SqliteLedger {
 }
 
 fn ensure_mutable(item: &WorkItem) -> Result<()> {
-    if item.status == Status::Deleted {
-        bail!(
-            "work item {} is deleted and cannot be modified during retention",
-            item.id
-        );
+    if item.status == Status::Archived {
+        bail!("work item {} is archived and cannot be modified", item.id);
     }
     Ok(())
 }
@@ -427,7 +484,7 @@ fn insert_history(
 fn get_item(connection: &Connection, id: i64) -> Result<Option<WorkItem>> {
     connection
         .query_row(
-            "SELECT id, title, description, status, created_at, updated_at, deleted_at, purge_after
+            "SELECT id, title, description, status, created_at, updated_at, archived_at
              FROM work_items WHERE id = ?1",
             params![id],
             row_to_item,
@@ -439,7 +496,7 @@ fn get_item(connection: &Connection, id: i64) -> Result<Option<WorkItem>> {
 fn get_item_from_transaction(transaction: &Transaction<'_>, id: i64) -> Result<Option<WorkItem>> {
     transaction
         .query_row(
-            "SELECT id, title, description, status, created_at, updated_at, deleted_at, purge_after
+            "SELECT id, title, description, status, created_at, updated_at, archived_at
              FROM work_items WHERE id = ?1",
             params![id],
             row_to_item,
@@ -462,22 +519,41 @@ fn row_to_item(row: &Row<'_>) -> rusqlite::Result<WorkItem> {
         })?,
         created_at: datetime_column(row, 4)?,
         updated_at: datetime_column(row, 5)?,
+        archived_at: optional_datetime_column(row, 6)?,
         deleted_at: optional_datetime_column(row, 6)?,
-        purge_after: optional_datetime_column(row, 7)?,
+        purge_after: None,
     })
 }
 
 fn row_to_history(row: &Row<'_>) -> rusqlite::Result<HistoryEntry> {
     let changes_json: String = row.get(6)?;
+    let mut kind: String = row.get(2)?;
+    let mut changes: Value =
+        serde_json::from_str(&changes_json).map_err(|error| conversion_error(6, error))?;
+    canonicalize_archival_history(&mut kind, &mut changes);
     Ok(HistoryEntry {
         id: row.get(0)?,
         work_item_id: row.get(1)?,
-        kind: row.get(2)?,
+        kind,
         actor: row.get(3)?,
         note: row.get(4)?,
         occurred_at: datetime_column(row, 5)?,
-        changes: serde_json::from_str(&changes_json).map_err(|error| conversion_error(6, error))?,
+        changes,
     })
+}
+
+fn canonicalize_archival_history(kind: &mut String, changes: &mut Value) {
+    if kind == "deleted" {
+        *kind = "archived".to_owned();
+    }
+    let Some(status_change) = changes.get_mut("status").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for side in ["from", "to"] {
+        if status_change.get(side).and_then(Value::as_str) == Some("deleted") {
+            status_change.insert(side.to_owned(), Value::String("archived".to_owned()));
+        }
+    }
 }
 
 fn datetime_column(row: &Row<'_>, index: usize) -> rusqlite::Result<DateTime<Utc>> {
@@ -513,7 +589,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lifecycle_records_history_and_keeps_deleted_item() -> Result<()> {
+    fn lifecycle_records_history_and_keeps_archived_item() -> Result<()> {
         let mut tracker = SqliteLedger::open_in_memory()?;
         let item = tracker.create(
             "Watch CI",
@@ -523,11 +599,13 @@ mod tests {
             None,
         )?;
         tracker.set_status(item.id, Status::Waiting, "agent-a", Some("CI queued"))?;
-        let deleted = tracker.set_status(item.id, Status::Deleted, "human", Some("obsolete"))?;
+        let archived = tracker.set_status(item.id, Status::Archived, "human", Some("obsolete"))?;
 
-        assert_eq!(deleted.status, Status::Deleted);
+        assert_eq!(archived.status, Status::Archived);
         assert_eq!(tracker.history(item.id)?.len(), 3);
-        assert!(deleted.purge_after.is_some());
+        assert!(archived.archived_at.is_some());
+        assert_eq!(archived.deleted_at, archived.archived_at);
+        assert!(archived.purge_after.is_none());
         assert!(tracker.list(ListFilter::All, false, 100)?.is_empty());
         assert_eq!(tracker.list(ListFilter::All, true, 100)?.len(), 1);
         Ok(())
@@ -543,15 +621,21 @@ mod tests {
     }
 
     #[test]
-    fn purging_removes_item_and_history_after_retention() -> Result<()> {
-        let mut tracker = SqliteLedger::open_in_memory()?;
+    fn archived_item_and_history_survive_reopening_the_database() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("tracker.db");
+        let mut tracker = SqliteLedger::open(&path)?;
         let item = tracker.create("Old work", None, Status::Pending, "human", None)?;
-        let deleted = tracker.set_status(item.id, Status::Deleted, "human", None)?;
-        let purge_time = deleted.purge_after.context("missing purge time")? + Duration::seconds(1);
+        tracker.set_status(item.id, Status::Archived, "human", None)?;
+        tracker.connection.execute(
+            "UPDATE work_items SET archived_at = '2020-01-01T00:00:00.000Z' WHERE id = ?1",
+            params![item.id],
+        )?;
+        drop(tracker);
 
-        assert_eq!(tracker.purge_expired(purge_time - Duration::days(1))?, 0);
-        assert_eq!(tracker.purge_expired(purge_time)?, 1);
-        assert!(tracker.get(item.id).is_err());
+        let tracker = SqliteLedger::open(&path)?;
+        assert_eq!(tracker.get(item.id)?.status, Status::Archived);
+        assert_eq!(tracker.history(item.id)?.len(), 2);
         Ok(())
     }
 
@@ -626,8 +710,9 @@ mod tests {
         ] {
             tracker.create(&format!("{status} work"), None, status, "agent", None)?;
         }
-        let removed = tracker.create("Removed work", None, Status::Pending, "agent", None)?;
-        tracker.set_status(removed.id, Status::Deleted, "agent", None)?;
+        let archived_item =
+            tracker.create("Archived work", None, Status::Pending, "agent", None)?;
+        tracker.set_status(archived_item.id, Status::Archived, "agent", None)?;
 
         let actionable = tracker.list(ListFilter::Actionable, false, 100)?;
         assert_eq!(actionable.len(), 4);
@@ -640,9 +725,9 @@ mod tests {
         assert_eq!(done.len(), 1);
         assert_eq!(done[0].status, Status::Done);
 
-        let deleted = tracker.list(ListFilter::Status(Status::Deleted), false, 100)?;
-        assert_eq!(deleted.len(), 1);
-        assert_eq!(deleted[0].id, removed.id);
+        let archived = tracker.list(ListFilter::Status(Status::Archived), false, 100)?;
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].id, archived_item.id);
         Ok(())
     }
 
@@ -731,11 +816,11 @@ mod tests {
     }
 
     #[test]
-    fn deleting_twice_is_idempotent() -> Result<()> {
+    fn archiving_twice_is_idempotent() -> Result<()> {
         let mut tracker = SqliteLedger::open_in_memory()?;
         let item = tracker.create("Disposable", None, Status::Pending, "agent", None)?;
-        tracker.set_status(item.id, Status::Deleted, "agent", None)?;
-        tracker.set_status(item.id, Status::Deleted, "agent", None)?;
+        tracker.set_status(item.id, Status::Archived, "agent", None)?;
+        tracker.set_status(item.id, Status::Archived, "agent", None)?;
         assert_eq!(tracker.history(item.id)?.len(), 2);
         Ok(())
     }
