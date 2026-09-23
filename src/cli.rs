@@ -72,6 +72,8 @@ pub enum Command {
     Archive(ArchiveArgs),
     /// Show the immutable history of a work item.
     History(IdArgs),
+    /// Show field or Status proposals rejected by State Revision checks.
+    Rejected(IdArgs),
     /// Print the database path in use.
     Path,
     /// Host the read-only HTML dashboard.
@@ -193,10 +195,6 @@ pub struct UpdateArgs {
     /// Optional reason stored in history when a field changes.
     #[arg(long)]
     pub note: Option<String>,
-
-    /// Stable GitHub mutation identity for safely retrying uncertain publication.
-    #[arg(long)]
-    pub event_id: Option<String>,
 
     #[command(flatten)]
     pub actor: ActorArgs,

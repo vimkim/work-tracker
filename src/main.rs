@@ -77,6 +77,7 @@ async fn run(cli: Cli) -> Result<()> {
                 | Command::Update(_)
                 | Command::Note(_)
                 | Command::History(_)
+                | Command::Rejected(_)
         )
     {
         anyhow::bail!("the GitHub ledger does not support this mutation yet");
@@ -139,7 +140,6 @@ async fn run(cli: Cli) -> Result<()> {
                 description,
                 &args.actor.resolved(),
                 args.note.as_deref(),
-                args.event_id.as_deref(),
             )?;
             show_item(&item, cli.json)
         }
@@ -184,6 +184,15 @@ async fn run(cli: Cli) -> Result<()> {
                 Ok(())
             }
         }
+        Command::Rejected(args) => {
+            let rejected = ledger.rejected_mutations(args.id)?;
+            if cli.json {
+                output::print_json(&rejected)
+            } else {
+                output::print_rejected_mutations(&rejected);
+                Ok(())
+            }
+        }
         Command::Init(_) | Command::Path | Command::Serve(_) => unreachable!(),
     }
 }
@@ -191,7 +200,11 @@ async fn run(cli: Cli) -> Result<()> {
 fn is_read_command(command: &Command) -> bool {
     matches!(
         command,
-        Command::Show(_) | Command::List(_) | Command::Today(_) | Command::History(_)
+        Command::Show(_)
+            | Command::List(_)
+            | Command::Today(_)
+            | Command::History(_)
+            | Command::Rejected(_)
     )
 }
 

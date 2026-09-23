@@ -4,7 +4,7 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::{
-    domain::{HistoryEntry, WorkItem},
+    domain::{HistoryEntry, RejectedMutation, WorkItem},
     github::{GitHubError, GitHubErrorKind},
     ledger::{ReadHealth, ReadHealthError, ReadHealthErrorKind, ReadHealthKind},
 };
@@ -98,7 +98,8 @@ fn github_error_code(kind: GitHubErrorKind) -> &'static str {
         GitHubErrorKind::ApiFailure => "github_api_failure",
         GitHubErrorKind::InvalidVisibility => "github_invalid_visibility",
         GitHubErrorKind::IncompatibleRepository => "github_incompatible_repository",
-        GitHubErrorKind::StateConflict => "github_state_conflict",
+        GitHubErrorKind::RejectedMutation => "github_rejected_mutation",
+        GitHubErrorKind::ProjectionPending => "github_projection_pending",
         GitHubErrorKind::LedgerIntegrity
         | GitHubErrorKind::UnknownEventSchema
         | GitHubErrorKind::IncompatibleMetadata
@@ -217,6 +218,34 @@ pub fn print_history(entries: &[HistoryEntry]) {
         }
         if let Some(history_hash) = &entry.history_hash {
             println!("  History hash: {history_hash}");
+        }
+    }
+}
+
+pub fn print_rejected_mutations(rejected: &[RejectedMutation]) {
+    if rejected.is_empty() {
+        println!("No Rejected Mutations.");
+        return;
+    }
+    for mutation in rejected {
+        println!(
+            "{}  Rejected Mutation by {} (GitHub: {})",
+            mutation
+                .occurred_at
+                .with_timezone(&Local)
+                .format("%Y-%m-%d %H:%M:%S %:z"),
+            mutation.actor,
+            mutation.github_actor,
+        );
+        println!("  Event: {}", mutation.event_id);
+        println!(
+            "  State revision: expected {:?}, current {}",
+            mutation.expected_state_revision, mutation.current_state_revision
+        );
+        println!("  Reason: {}", mutation.reason);
+        println!("  Changes: {}", mutation.changes);
+        if let Some(note) = &mutation.note {
+            println!("  Note: {note}");
         }
     }
 }

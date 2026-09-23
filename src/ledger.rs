@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 
 use crate::{
     db::SqliteLedger,
-    domain::{HistoryEntry, Status, WorkItem},
+    domain::{HistoryEntry, RejectedMutation, Status, WorkItem},
     github::{GitHubLedger, RepositoryName},
 };
 
@@ -189,7 +189,6 @@ pub trait Ledger: Send {
         description: Option<Option<&str>>,
         actor: &str,
         note: Option<&str>,
-        event_id: Option<&str>,
     ) -> Result<WorkItem>;
 
     fn set_status(
@@ -209,6 +208,8 @@ pub trait Ledger: Send {
     ) -> Result<HistoryEntry>;
 
     fn history(&mut self, id: i64) -> Result<Vec<HistoryEntry>>;
+
+    fn rejected_mutations(&mut self, id: i64) -> Result<Vec<RejectedMutation>>;
 }
 
 /// Backend configuration shared by CLI dispatch and dashboard handlers.

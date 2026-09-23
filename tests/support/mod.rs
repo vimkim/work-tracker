@@ -145,7 +145,14 @@ printf '%s' "$count" > "$count_file"
     printf '\n'
 } >> "$root/calls"
 response=$root/responses/$count
-if [ -f "$response.stdout" ]; then /bin/cat "$response.stdout"; fi
+if [ -f "$response.stdout" ]; then
+    if /bin/grep -q '{{LAST_EVENT_ID}}' "$response.stdout"; then
+        event_id=$(/bin/sed -n 's/.*"event_id":"\(update-[^"]*\)".*/\1/p' "$root/calls" | /bin/tail -n 1)
+        /bin/sed "s/{{LAST_EVENT_ID}}/$event_id/g" "$response.stdout"
+    else
+        /bin/cat "$response.stdout"
+    fi
+fi
 if [ -f "$response.stderr" ]; then /bin/cat "$response.stderr" >&2; fi
 if [ -f "$response.code" ]; then exit "$(/bin/cat "$response.code")"; fi
 exit 0

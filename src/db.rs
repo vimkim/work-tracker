@@ -8,11 +8,13 @@ use rusqlite::{
 use serde_json::{Map, Value, json};
 
 use crate::{
-    domain::{HistoryEntry, Status, WorkItem, normalized_optional, normalized_required},
+    domain::{
+        HistoryEntry, RejectedMutation, Status, WorkItem, normalized_optional, normalized_required,
+    },
     ledger::{Ledger, ListFilter, ReadHealth, ReadPolicy},
 };
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// SQL list of the statuses that make a Work Item actionable. Keep in sync with
 /// `Status::is_actionable`.
@@ -49,23 +51,31 @@ impl SqliteLedger {
                 migrate_github_sync_state(&connection)?;
                 migrate_trusted_history(&connection)?;
                 migrate_github_freshness_state(&connection)?;
+                migrate_rejected_mutations(&connection)?;
             }
             2 => {
                 migrate_github_creation_recovery(&connection)?;
                 migrate_github_sync_state(&connection)?;
                 migrate_trusted_history(&connection)?;
                 migrate_github_freshness_state(&connection)?;
+                migrate_rejected_mutations(&connection)?;
             }
             3 => {
                 migrate_github_sync_state(&connection)?;
                 migrate_trusted_history(&connection)?;
                 migrate_github_freshness_state(&connection)?;
+                migrate_rejected_mutations(&connection)?;
             }
             4 => {
                 migrate_trusted_history(&connection)?;
                 migrate_github_freshness_state(&connection)?;
+                migrate_rejected_mutations(&connection)?;
             }
-            5 => migrate_legacy_schema_5(&connection)?,
+            5 => {
+                migrate_legacy_schema_5(&connection)?;
+                migrate_rejected_mutations(&connection)?;
+            }
+            6 => migrate_rejected_mutations(&connection)?,
             SCHEMA_VERSION => {}
             version => bail!("unsupported database schema version {version}"),
         }
@@ -264,7 +274,7 @@ impl SqliteLedger {
     pub(crate) fn replace_github_cache_batch(
         &mut self,
         repository: &str,
-        items: &[(WorkItem, Vec<HistoryEntry>)],
+        items: &[GithubCacheItem],
         removed_item_ids: &[i64],
         cursor: Option<DateTime<Utc>>,
         etag: Option<&str>,
@@ -276,33 +286,8 @@ impl SqliteLedger {
         for id in removed_item_ids {
             transaction.execute("DELETE FROM work_items WHERE id = ?1", params![id])?;
         }
-        for (item, history) in items {
-            transaction.execute(
-                "INSERT INTO work_items
-                 (id, title, description, status, created_at, updated_at, archived_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT(id) DO UPDATE SET
-                   title = excluded.title,
-                   description = excluded.description,
-                   status = excluded.status,
-                   created_at = excluded.created_at,
-                   updated_at = excluded.updated_at,
-                   archived_at = excluded.archived_at",
-                params![
-                    item.id,
-                    item.title,
-                    item.description,
-                    item.status.as_str(),
-                    timestamp(item.created_at),
-                    timestamp(item.updated_at),
-                    item.archived_at.map(timestamp),
-                ],
-            )?;
-            transaction.execute(
-                "DELETE FROM history_entries WHERE work_item_id = ?1",
-                params![item.id],
-            )?;
-            insert_github_history(&transaction, history)?;
+        for item in items {
+            replace_github_item_in_transaction(&transaction, item)?;
         }
         transaction.execute(
             "INSERT INTO github_cache_state
@@ -323,77 +308,87 @@ impl SqliteLedger {
         Ok(())
     }
 
-    pub(crate) fn replace_github_history(
-        &mut self,
-        work_item_id: i64,
-        history: &[HistoryEntry],
-    ) -> Result<()> {
+    pub(crate) fn replace_github_item(&mut self, item: &GithubCacheItem) -> Result<()> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let exists = transaction
-            .query_row(
-                "SELECT 1 FROM work_items WHERE id = ?1",
-                params![work_item_id],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        if !exists {
-            bail!("work item {work_item_id} not found in the GitHub cache");
-        }
-        transaction.execute(
-            "DELETE FROM history_entries WHERE work_item_id = ?1",
-            params![work_item_id],
-        )?;
-        insert_github_history(&transaction, history)?;
-        if let Some(last) = history.last() {
-            transaction.execute(
-                "UPDATE work_items SET updated_at = ?1 WHERE id = ?2",
-                params![timestamp(last.occurred_at), work_item_id],
-            )?;
-        }
+        replace_github_item_in_transaction(&transaction, item)?;
         transaction.commit()?;
         Ok(())
     }
+}
 
-    pub(crate) fn replace_github_item(
-        &mut self,
-        item: &WorkItem,
-        history: &[HistoryEntry],
-    ) -> Result<()> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+pub(crate) struct GithubCacheItem {
+    pub item: WorkItem,
+    pub history: Vec<HistoryEntry>,
+    pub rejected: Vec<RejectedMutation>,
+}
+
+fn replace_github_item_in_transaction(
+    transaction: &Transaction<'_>,
+    cached: &GithubCacheItem,
+) -> Result<()> {
+    let item = &cached.item;
+    transaction.execute(
+        "INSERT INTO work_items
+         (id, title, description, status, created_at, updated_at, archived_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(id) DO UPDATE SET
+           title = excluded.title,
+           description = excluded.description,
+           status = excluded.status,
+           created_at = excluded.created_at,
+           updated_at = excluded.updated_at,
+           archived_at = excluded.archived_at",
+        params![
+            item.id,
+            item.title,
+            item.description,
+            item.status.as_str(),
+            timestamp(item.created_at),
+            timestamp(item.updated_at),
+            item.archived_at.map(timestamp),
+        ],
+    )?;
+    transaction.execute(
+        "DELETE FROM history_entries WHERE work_item_id = ?1",
+        params![item.id],
+    )?;
+    insert_github_history(transaction, &cached.history)?;
+    transaction.execute(
+        "DELETE FROM rejected_mutations WHERE work_item_id = ?1",
+        params![item.id],
+    )?;
+    insert_rejected_mutations(transaction, &cached.rejected)?;
+    Ok(())
+}
+
+fn insert_rejected_mutations(
+    transaction: &Transaction<'_>,
+    rejected: &[RejectedMutation],
+) -> Result<()> {
+    for mutation in rejected {
         transaction.execute(
-            "INSERT INTO work_items
-             (id, title, description, status, created_at, updated_at, archived_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(id) DO UPDATE SET
-               title = excluded.title,
-               description = excluded.description,
-               status = excluded.status,
-               created_at = excluded.created_at,
-               updated_at = excluded.updated_at,
-               archived_at = excluded.archived_at",
+            "INSERT INTO rejected_mutations
+             (id, work_item_id, event_id, actor, github_actor, note, occurred_at,
+              expected_state_revision, current_state_revision, changes_json, reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
-                item.id,
-                item.title,
-                item.description,
-                item.status.as_str(),
-                timestamp(item.created_at),
-                timestamp(item.updated_at),
-                item.archived_at.map(timestamp),
+                mutation.id,
+                mutation.work_item_id,
+                mutation.event_id,
+                mutation.actor,
+                mutation.github_actor,
+                mutation.note,
+                timestamp(mutation.occurred_at),
+                mutation.expected_state_revision,
+                mutation.current_state_revision,
+                serde_json::to_string(&mutation.changes)?,
+                mutation.reason,
             ],
         )?;
-        transaction.execute(
-            "DELETE FROM history_entries WHERE work_item_id = ?1",
-            params![item.id],
-        )?;
-        insert_github_history(&transaction, history)?;
-        transaction.commit()?;
-        Ok(())
     }
+    Ok(())
 }
 
 fn insert_github_history(transaction: &Transaction<'_>, history: &[HistoryEntry]) -> Result<()> {
@@ -486,7 +481,23 @@ fn create_schema(connection: &Connection) -> Result<()> {
                 last_successful_sync_at TEXT
             );
 
-            PRAGMA user_version = 6;
+            CREATE TABLE IF NOT EXISTS rejected_mutations (
+                id                      INTEGER PRIMARY KEY,
+                work_item_id            INTEGER NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+                event_id                TEXT NOT NULL,
+                actor                   TEXT NOT NULL,
+                github_actor            TEXT NOT NULL,
+                note                    TEXT,
+                occurred_at             TEXT NOT NULL,
+                expected_state_revision INTEGER,
+                current_state_revision  INTEGER NOT NULL,
+                changes_json            TEXT NOT NULL,
+                reason                  TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_rejected_work_item
+                ON rejected_mutations(work_item_id, id);
+
+            PRAGMA user_version = 7;
             ",
     )?;
     Ok(())
@@ -692,6 +703,40 @@ fn migrate_legacy_schema_5(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_rejected_mutations(connection: &Connection) -> Result<()> {
+    connection.execute_batch("BEGIN IMMEDIATE;")?;
+    let locked_version: i64 =
+        connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if locked_version >= 7 {
+        connection.execute_batch("COMMIT;")?;
+        return Ok(());
+    }
+    if locked_version != 6 {
+        connection.execute_batch("ROLLBACK;")?;
+        bail!("cannot migrate database schema version {locked_version}");
+    }
+    connection.execute_batch(
+        "CREATE TABLE rejected_mutations (
+             id                      INTEGER PRIMARY KEY,
+             work_item_id            INTEGER NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+             event_id                TEXT NOT NULL,
+             actor                   TEXT NOT NULL,
+             github_actor            TEXT NOT NULL,
+             note                    TEXT,
+             occurred_at             TEXT NOT NULL,
+             expected_state_revision INTEGER,
+             current_state_revision  INTEGER NOT NULL,
+             changes_json            TEXT NOT NULL,
+             reason                  TEXT NOT NULL
+         );
+         CREATE INDEX idx_rejected_work_item
+             ON rejected_mutations(work_item_id, id);
+         PRAGMA user_version = 7;
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
 fn table_has_column(connection: &Connection, table: &str, column: &str) -> Result<bool> {
     connection
         .query_row(
@@ -806,7 +851,6 @@ impl Ledger for SqliteLedger {
         description: Option<Option<&str>>,
         actor: &str,
         note: Option<&str>,
-        _event_id: Option<&str>,
     ) -> Result<WorkItem> {
         let actor = normalized_required(actor, "actor")?;
         let transaction = self
@@ -957,6 +1001,20 @@ impl Ledger for SqliteLedger {
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
+
+    fn rejected_mutations(&mut self, id: i64) -> Result<Vec<RejectedMutation>> {
+        self.get(id)?;
+        let mut statement = self.connection.prepare(
+            "SELECT id, work_item_id, event_id, actor, github_actor, note, occurred_at,
+                    expected_state_revision, current_state_revision, changes_json, reason
+             FROM rejected_mutations
+             WHERE work_item_id = ?1
+             ORDER BY id",
+        )?;
+        let rows = statement.query_map(params![id], row_to_rejected_mutation)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
 }
 
 fn ensure_mutable(item: &WorkItem) -> Result<()> {
@@ -1055,6 +1113,23 @@ fn row_to_item(row: &Row<'_>) -> rusqlite::Result<WorkItem> {
         archived_at: optional_datetime_column(row, 6)?,
         deleted_at: optional_datetime_column(row, 6)?,
         purge_after: None,
+    })
+}
+
+fn row_to_rejected_mutation(row: &Row<'_>) -> rusqlite::Result<RejectedMutation> {
+    let changes: String = row.get(9)?;
+    Ok(RejectedMutation {
+        id: row.get(0)?,
+        work_item_id: row.get(1)?,
+        event_id: row.get(2)?,
+        actor: row.get(3)?,
+        github_actor: row.get(4)?,
+        note: row.get(5)?,
+        occurred_at: datetime_column(row, 6)?,
+        expected_state_revision: row.get(7)?,
+        current_state_revision: row.get(8)?,
+        changes: serde_json::from_str(&changes).map_err(|error| conversion_error(9, error))?,
+        reason: row.get(10)?,
     })
 }
 
@@ -1252,6 +1327,29 @@ mod tests {
     }
 
     #[test]
+    fn schema_6_adds_durable_rejected_mutations_as_schema_7() -> Result<()> {
+        let connection = Connection::open_in_memory()?;
+        connection.execute_batch(
+            "CREATE TABLE work_items (id INTEGER PRIMARY KEY);
+             PRAGMA user_version = 6;",
+        )?;
+
+        migrate_rejected_mutations(&connection)?;
+
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        assert_eq!(version, 7);
+        let columns: i64 = connection.query_row(
+            "SELECT count(*) FROM pragma_table_info('rejected_mutations')
+             WHERE name IN ('event_id', 'expected_state_revision',
+                            'current_state_revision', 'changes_json', 'reason')",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(columns, 5);
+        Ok(())
+    }
+
+    #[test]
     fn lifecycle_records_history_and_keeps_archived_item() -> Result<()> {
         let mut tracker = SqliteLedger::open_in_memory()?;
         let item = tracker.create(
@@ -1312,14 +1410,12 @@ mod tests {
             Some(Some("details")),
             "agent-a",
             Some("clarified"),
-            None,
         )?;
         tracker.update(
             item.id,
             Some("Changed"),
             Some(Some("details")),
             "agent-b",
-            None,
             None,
         )?;
 

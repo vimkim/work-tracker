@@ -345,7 +345,7 @@ fn concurrent_legacy_opens_apply_the_migration_once() -> Result<()> {
     let connection = Connection::open(cli.database_path())?;
     let schema_version: i64 =
         connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    assert_eq!(schema_version, 6);
+    assert_eq!(schema_version, 7);
     let sync_columns: i64 = connection.query_row(
         "SELECT count(*) FROM pragma_table_info('github_cache_state')
          WHERE name IN ('sync_cursor', 'etag', 'last_successful_sync_at')",

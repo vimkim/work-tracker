@@ -116,6 +116,21 @@ pub struct HistoryEntry {
     pub state_revision: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RejectedMutation {
+    pub id: i64,
+    pub work_item_id: i64,
+    pub event_id: String,
+    pub actor: String,
+    pub github_actor: String,
+    pub note: Option<String>,
+    pub occurred_at: DateTime<Utc>,
+    pub expected_state_revision: Option<u64>,
+    pub current_state_revision: u64,
+    pub changes: Value,
+    pub reason: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
