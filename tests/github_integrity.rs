@@ -160,6 +160,33 @@ fn exact_recovery_refuses_to_unlock_a_live_locked_work_item() -> Result<()> {
 }
 
 #[test]
+fn exact_recovery_refuses_an_unlocked_issue_labeled_archived_before_patch() -> Result<()> {
+    let cli = CliHarness::new()?;
+    configure_github(&cli)?;
+    let gh = FakeGh::new()?;
+    let scenario = seed_edited_integrity(&cli, &gh)?;
+    let mut unlocked_archived = scenario.corrupt_issue.clone();
+    unlocked_archived["labels"] = json!([
+        {"name": "work-tracker:item"},
+        {"name": "work-tracker:status:archived"}
+    ]);
+    gh.respond(5, 0, &unlocked_archived.to_string(), "")?;
+    gh.respond(
+        6,
+        0,
+        &json!([[remote_comment(&scenario.edited_comment)]]).to_string(),
+        "",
+    )?;
+    let recovered = cli.run_with_fake_gh(
+        &gh,
+        ["--json", "recover", "41", "--mode", "restore-exact-copy"],
+    )?;
+    ensure!(!recovered.status.success());
+    ensure!(!gh.calls()?.contains("\tPATCH\t"));
+    Ok(())
+}
+
+#[test]
 fn exact_recovery_refuses_a_lock_added_after_the_comment_restore() -> Result<()> {
     let cli = CliHarness::new()?;
     configure_github(&cli)?;
@@ -379,6 +406,51 @@ fn exact_recovery_latches_a_comment_edit_observed_after_projection() -> Result<(
         |row| row.get(0),
     )?;
     ensure!(report.contains("Changed during exact projection"));
+    Ok(())
+}
+
+#[test]
+fn exact_recovery_rejects_readable_projection_drift_after_projection() -> Result<()> {
+    let cli = CliHarness::new()?;
+    configure_github(&cli)?;
+    let gh = FakeGh::new()?;
+    let scenario = seed_edited_integrity(&cli, &gh)?;
+    let mut drifted = scenario.healthy_issue.clone();
+    drifted["title"] = json!("Changed after projection");
+    gh.respond(5, 0, &scenario.corrupt_issue.to_string(), "")?;
+    gh.respond(
+        6,
+        0,
+        &json!([[remote_comment(&scenario.edited_comment)]]).to_string(),
+        "",
+    )?;
+    gh.respond(
+        7,
+        0,
+        &json!([[remote_comment(&scenario.edited_comment)]]).to_string(),
+        "",
+    )?;
+    gh.respond(8, 0, "", "")?;
+    gh.respond(9, 0, &scenario.healthy_issue.to_string(), "")?;
+    gh.respond(
+        10,
+        0,
+        &json!([[remote_comment(&scenario.original_comment)]]).to_string(),
+        "",
+    )?;
+    gh.respond(11, 0, "", "")?;
+    gh.respond(12, 0, &drifted.to_string(), "")?;
+    gh.respond(
+        13,
+        0,
+        &json!([[remote_comment(&scenario.original_comment)]]).to_string(),
+        "",
+    )?;
+    let recovered = cli.run_with_fake_gh(
+        &gh,
+        ["--json", "recover", "41", "--mode", "restore-exact-copy"],
+    )?;
+    ensure!(!recovered.status.success());
     Ok(())
 }
 
@@ -1157,6 +1229,44 @@ fn cacheless_recovery_latch_derives_archived_status_from_the_live_lock() -> Resu
 }
 
 #[test]
+fn rebaseline_refuses_an_unlocked_archived_label_before_publishing() -> Result<()> {
+    let cli = CliHarness::new()?;
+    configure_github(&cli)?;
+    let gh = FakeGh::new()?;
+    let invalid_projection = projection("disconnected-projection-head");
+    let mut issue = issue(&invalid_projection, "2026-09-23T01:02:04Z", false);
+    issue["labels"] = json!([
+        {"name": "work-tracker:item"},
+        {"name": "work-tracker:status:archived"}
+    ]);
+    gh.respond(1, 0, &issue.to_string(), "")?;
+    gh.respond(
+        2,
+        0,
+        &json!([[remote_comment(&comment(&event("Original title"))?)]]).to_string(),
+        "",
+    )?;
+    gh.respond(3, 0, "[[]]", "")?;
+    let recovered = cli.run_with_fake_gh(
+        &gh,
+        [
+            "--json",
+            "recover",
+            "41",
+            "--mode",
+            "rebaseline",
+            "--actor",
+            "reviewer-a",
+            "--reason",
+            "reviewed archive",
+        ],
+    )?;
+    ensure!(!recovered.status.success());
+    ensure!(!gh.calls()?.contains("\tPOST\t"));
+    Ok(())
+}
+
+#[test]
 fn archived_rebaseline_verifies_the_lock_after_projection_before_unlatching() -> Result<()> {
     let cli = CliHarness::new()?;
     configure_github(&cli)?;
@@ -1717,6 +1827,45 @@ fn rebaseline_latches_a_comment_edit_observed_after_projection() -> Result<()> {
         |row| row.get(0),
     )?;
     ensure!(report.contains("Changed during projection"));
+    Ok(())
+}
+
+#[test]
+fn rebaseline_rejects_issue_state_drift_after_projection() -> Result<()> {
+    let cli = CliHarness::new()?;
+    configure_github(&cli)?;
+    let gh = FakeGh::new()?;
+    let original_comment = comment(&event("Original title"))?;
+    let invalid_projection = projection("disconnected-projection-head");
+    let corrupt_issue = issue(&invalid_projection, "2026-09-23T02:02:04Z", false);
+    respond_rebaseline(
+        &gh,
+        1,
+        &corrupt_issue,
+        &[remote_comment(&original_comment)],
+        &json!([]),
+        "2026-09-23T04:02:03Z",
+    )?;
+    let mut drifted = corrupt_issue.clone();
+    drifted["body"] = json!("{{LAST_REQUEST_BODY}}");
+    drifted["state"] = json!("closed");
+    drifted["state_reason"] = json!("completed");
+    gh.respond(11, 0, &drifted.to_string(), "")?;
+    let recovered = cli.run_with_fake_gh(
+        &gh,
+        [
+            "--json",
+            "recover",
+            "41",
+            "--mode",
+            "rebaseline",
+            "--actor",
+            "reviewer-a",
+            "--reason",
+            "reviewed state drift",
+        ],
+    )?;
+    ensure!(!recovered.status.success());
     Ok(())
 }
 
@@ -2961,6 +3110,9 @@ fn archived_rebaseline_stays_locked_and_remains_immutable() -> Result<()> {
     gh.respond(15, 0, "", "")?;
     let mut projected_archived_issue = damaged_archived_issue.clone();
     projected_archived_issue["body"] = json!("{{LAST_REQUEST_BODY}}");
+    projected_archived_issue["labels"][1]["name"] = json!("work-tracker:status:archived");
+    projected_archived_issue["state"] = json!("closed");
+    projected_archived_issue["state_reason"] = json!("not_planned");
     gh.respond(16, 0, &projected_archived_issue.to_string(), "")?;
     gh.respond(
         17,

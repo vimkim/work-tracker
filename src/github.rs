@@ -2713,14 +2713,23 @@ impl GitHubLedger {
                 format!("post-projection exact history did not replay: {error:#}"),
             )
         })?;
-        projection_head_needs_update(issue_number, &post_metadata, &replayed.accepted, None)
-            .map_err(|error| {
-                recovery_validation_failed(
-                    issue_number,
-                    format!("post-projection exact history did not match: {error:#}"),
-                )
-            })?;
+        let head_differs =
+            projection_head_needs_update(issue_number, &post_metadata, &replayed.accepted, None)
+                .map_err(|error| {
+                    recovery_validation_failed(
+                        issue_number,
+                        format!("post-projection exact history did not match: {error:#}"),
+                    )
+                })?;
         let item = materialize_item(issue_number, &replayed.accepted)?;
+        if projection_differs(&post_issue, &item, head_differs)? {
+            self.preserve_integrity_snapshot(&post_issue, &post_comments, &diagnosis, None)?;
+            return Err(recovery_validation_failed(
+                issue_number,
+                "the complete authoritative projection drifted during exact recovery",
+            )
+            .into());
+        }
         let evidence = event_evidence(&post_comments, &replayed.accepted);
         let trusted_event_count = replayed.accepted.len();
         self.cache.complete_github_recovery(&GithubCacheItem {
@@ -2787,6 +2796,13 @@ impl GitHubLedger {
                 format!("the live GitHub state cannot be reviewed safely: {error:#}"),
             )
         })?;
+        if reviewed.status == Status::Archived && !issue.locked {
+            return Err(recovery_still_blocked(
+                issue_number,
+                "the live issue is labeled Archived but is unlocked; relock it before Rebaseline",
+            )
+            .into());
+        }
         diagnosis.archived = reviewed.status == Status::Archived;
         let cached_history = if has_cached_item {
             self.cache.history(issue_number)?
@@ -3178,14 +3194,27 @@ impl GitHubLedger {
                         format!("post-projection Rebaseline history did not replay: {error:#}"),
                     )
                 })?;
-            projection_head_needs_update(issue_number, &post_metadata, &replayed.accepted, None)
-                .map_err(|error| {
-                    recovery_validation_failed(
-                        issue_number,
-                        format!("post-projection Rebaseline history did not match: {error:#}"),
-                    )
-                })?;
+            let head_differs = projection_head_needs_update(
+                issue_number,
+                &post_metadata,
+                &replayed.accepted,
+                None,
+            )
+            .map_err(|error| {
+                recovery_validation_failed(
+                    issue_number,
+                    format!("post-projection Rebaseline history did not match: {error:#}"),
+                )
+            })?;
             let item = materialize_item(issue_number, &replayed.accepted)?;
+            if projection_differs(&post_issue, &item, head_differs)? {
+                self.preserve_integrity_snapshot(&post_issue, &post_comments, &diagnosis, None)?;
+                return Err(recovery_validation_failed(
+                    issue_number,
+                    "the complete authoritative projection drifted during Rebaseline",
+                )
+                .into());
+            }
             Ok((item, replayed, post_comments))
         })();
         let (item, replayed, comments) = recovery?;
@@ -4354,9 +4383,12 @@ fn exact_chain_preserves_live_archive(
     issue: &LedgerIssue,
     evidence: &[GithubEventEvidence],
 ) -> bool {
-    if !issue.locked {
-        return true;
-    }
+    let live_archived = issue.locked
+        || issue.labels.iter().any(|label| {
+            label
+                .name
+                .eq_ignore_ascii_case("work-tracker:status:archived")
+        });
     let comments = evidence
         .iter()
         .map(|evidence| LedgerComment {
@@ -4370,7 +4402,7 @@ fn exact_chain_preserves_live_archive(
         .collect::<Vec<_>>();
     replay_trusted_history(issue.number, &comments)
         .and_then(|replayed| materialize_item(issue.number, &replayed.accepted))
-        .is_ok_and(|item| item.status == Status::Archived)
+        .is_ok_and(|item| (item.status == Status::Archived) == live_archived)
 }
 
 fn next_observed_evidence_id(evidence: &[RetainedRecoveryEvidence], github_comment_id: i64) -> i64 {
