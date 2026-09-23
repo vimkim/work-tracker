@@ -5,6 +5,7 @@ use anyhow::Result;
 use crate::{
     db::SqliteLedger,
     domain::{HistoryEntry, Status, WorkItem},
+    github::{GitHubLedger, RepositoryName},
 };
 
 /// Which Work Items a Ledger list operation returns.
@@ -77,6 +78,10 @@ pub struct LedgerConfig {
 #[derive(Debug, Clone)]
 enum BackendConfig {
     Sqlite(PathBuf),
+    Github {
+        repository: RepositoryName,
+        cache: PathBuf,
+    },
 }
 
 impl LedgerConfig {
@@ -86,9 +91,32 @@ impl LedgerConfig {
         }
     }
 
+    pub fn github(repository: RepositoryName, cache: impl Into<PathBuf>) -> Self {
+        Self {
+            backend: BackendConfig::Github {
+                repository,
+                cache: cache.into(),
+            },
+        }
+    }
+
     pub fn open(&self) -> Result<Box<dyn Ledger>> {
         match &self.backend {
             BackendConfig::Sqlite(path) => Ok(Box::new(SqliteLedger::open(path)?)),
+            BackendConfig::Github { repository, cache } => {
+                Ok(Box::new(GitHubLedger::open(repository.clone(), cache)?))
+            }
         }
+    }
+
+    pub fn prepare_github_cache(&self, repository_is_new: bool) -> Result<()> {
+        let BackendConfig::Github { repository, cache } = &self.backend else {
+            anyhow::bail!("only a GitHub ledger has a GitHub cache");
+        };
+        let cache = SqliteLedger::open(cache)?;
+        if repository_is_new {
+            cache.mark_github_cache_initialized(&repository.to_string())?;
+        }
+        Ok(())
     }
 }

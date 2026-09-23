@@ -8,11 +8,11 @@ use rusqlite::{
 use serde_json::{Map, Value, json};
 
 use crate::{
-    domain::{HistoryEntry, Status, WorkItem},
+    domain::{HistoryEntry, Status, WorkItem, normalized_optional, normalized_required},
     ledger::{Ledger, ListFilter},
 };
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// SQL list of the statuses that make a Work Item actionable. Keep in sync with
 /// `Status::is_actionable`.
@@ -43,7 +43,11 @@ impl SqliteLedger {
             connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         match schema_version {
             0 => create_schema(&connection)?,
-            1 => migrate_deleted_items_to_archived(&connection)?,
+            1 => {
+                migrate_deleted_items_to_archived(&connection)?;
+                migrate_github_creation_recovery(&connection)?;
+            }
+            2 => migrate_github_creation_recovery(&connection)?,
             SCHEMA_VERSION => {}
             version => bail!("unsupported database schema version {version}"),
         }
@@ -57,6 +61,119 @@ impl SqliteLedger {
     fn open_in_memory() -> Result<Self> {
         Self::open(Path::new(":memory:"))
     }
+
+    pub(crate) fn pending_github_creation(
+        &self,
+        request_json: &str,
+    ) -> Result<Option<PendingGithubCreation>> {
+        self.connection
+            .query_row(
+                "SELECT event_id, issue_number FROM pending_github_creations
+                 WHERE request_json = ?1",
+                params![request_json],
+                |row| {
+                    Ok(PendingGithubCreation {
+                        event_id: row.get(0)?,
+                        issue_number: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn begin_github_creation(&self, request_json: &str, event_id: &str) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO pending_github_creations (request_json, event_id)
+             VALUES (?1, ?2)",
+            params![request_json, event_id],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn remember_github_issue(
+        &self,
+        request_json: &str,
+        issue_number: i64,
+    ) -> Result<()> {
+        self.connection.execute(
+            "UPDATE pending_github_creations SET issue_number = ?1
+             WHERE request_json = ?2",
+            params![issue_number, request_json],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn github_cache_is_initialized(&self, repository: &str) -> Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT 1 FROM github_cache_state WHERE repository = ?1",
+                params![repository],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|row| row.is_some())
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn mark_github_cache_initialized(&self, repository: &str) -> Result<()> {
+        self.connection.execute(
+            "INSERT OR IGNORE INTO github_cache_state (repository) VALUES (?1)",
+            params![repository],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn finish_github_creation(
+        &mut self,
+        request_json: &str,
+        item: &WorkItem,
+        history: &HistoryEntry,
+    ) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO work_items
+             (id, title, description, status, created_at, updated_at, archived_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                item.id,
+                item.title,
+                item.description,
+                item.status.as_str(),
+                timestamp(item.created_at),
+                timestamp(item.updated_at),
+                item.archived_at.map(timestamp),
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO history_entries
+             (id, work_item_id, kind, actor, note, occurred_at, changes_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                history.id,
+                history.work_item_id,
+                history.kind,
+                history.actor,
+                history.note,
+                timestamp(history.occurred_at),
+                serde_json::to_string(&history.changes)?,
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM pending_github_creations WHERE request_json = ?1",
+            params![request_json],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingGithubCreation {
+    pub event_id: String,
+    pub issue_number: Option<i64>,
 }
 
 fn create_schema(connection: &Connection) -> Result<()> {
@@ -94,7 +211,17 @@ fn create_schema(connection: &Connection) -> Result<()> {
             CREATE INDEX IF NOT EXISTS idx_history_work_item
                 ON history_entries(work_item_id, id);
 
-            PRAGMA user_version = 2;
+            CREATE TABLE IF NOT EXISTS pending_github_creations (
+                request_json  TEXT PRIMARY KEY,
+                event_id      TEXT NOT NULL UNIQUE,
+                issue_number  INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS github_cache_state (
+                repository TEXT PRIMARY KEY
+            );
+
+            PRAGMA user_version = 3;
             ",
     )?;
     Ok(())
@@ -104,7 +231,7 @@ fn migrate_deleted_items_to_archived(connection: &Connection) -> Result<()> {
     connection.execute_batch("BEGIN IMMEDIATE;")?;
     let locked_version: i64 =
         connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if locked_version == SCHEMA_VERSION {
+    if locked_version >= 2 {
         connection.execute_batch("COMMIT;")?;
         return Ok(());
     }
@@ -164,6 +291,23 @@ fn migrate_deleted_items_to_archived(connection: &Connection) -> Result<()> {
         PRAGMA user_version = 2;
         COMMIT;
         ",
+    )?;
+    Ok(())
+}
+
+fn migrate_github_creation_recovery(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "BEGIN IMMEDIATE;
+         CREATE TABLE IF NOT EXISTS pending_github_creations (
+             request_json  TEXT PRIMARY KEY,
+             event_id      TEXT NOT NULL UNIQUE,
+             issue_number  INTEGER
+         );
+         CREATE TABLE IF NOT EXISTS github_cache_state (
+             repository TEXT PRIMARY KEY
+         );
+         PRAGMA user_version = 3;
+         COMMIT;",
     )?;
     Ok(())
 }
@@ -416,21 +560,6 @@ fn ensure_mutable(item: &WorkItem) -> Result<()> {
         bail!("work item {} is archived and cannot be modified", item.id);
     }
     Ok(())
-}
-
-fn normalized_required(value: &str, field: &str) -> Result<String> {
-    let value = value.trim();
-    if value.is_empty() {
-        bail!("{field} cannot be empty");
-    }
-    Ok(value.to_owned())
-}
-
-fn normalized_optional(value: Option<&str>) -> Option<String> {
-    value.and_then(|value| {
-        let value = value.trim();
-        (!value.is_empty()).then(|| value.to_owned())
-    })
 }
 
 fn timestamp(value: DateTime<Utc>) -> String {

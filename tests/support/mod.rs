@@ -181,6 +181,7 @@ pub fn assert_success(output: &Output) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn assert_database_exists(path: &Path) -> Result<()> {
     ensure!(
         path.is_file(),

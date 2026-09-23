@@ -476,7 +476,7 @@ fn configured_github_default_never_silently_writes_the_legacy_sqlite_ledger() ->
 
     let add = cli.run(["--json", "add", "must not become local"])?;
     ensure!(!add.status.success());
-    ensure!(stderr(&add)?.contains("GitHub ledger octocat/work-tracker-data is selected"));
+    ensure!(stderr(&add)?.contains("failed to execute gh"));
     ensure!(!cli.database_path().exists());
 
     let explicit_local = cli.run([

@@ -47,7 +47,10 @@ async fn run(cli: Cli) -> Result<()> {
         return show_path(&cli);
     }
     let app_config = AppConfig::load(&config::config_path()?)?;
-    if cli.database.is_none() {
+    let (ledger_config, github_backend) = if let Some(database) = cli.database.as_ref() {
+        cli::prepare_database_path(database)?;
+        (LedgerConfig::sqlite(database), false)
+    } else {
         let selected = cli
             .repository
             .as_deref()
@@ -59,14 +62,18 @@ async fn run(cli: Cli) -> Result<()> {
                     .map(|config| config.default_repository.clone())
             });
         if let Some(repository) = selected {
-            anyhow::bail!(
-                "GitHub ledger {repository} is selected; Work Item commands are not available until the GitHub ledger adapter is installed (use --database for the explicit local backend)"
-            );
+            let cache = config::github_cache_path(&repository)?;
+            cli::prepare_database_path(&cache)?;
+            (LedgerConfig::github(repository, cache), true)
+        } else {
+            let database = cli::database_path(None)?;
+            cli::prepare_database_path(&database)?;
+            (LedgerConfig::sqlite(database), false)
         }
+    };
+    if github_backend && !matches!(&cli.command, Command::Add(_) | Command::Show(_)) {
+        anyhow::bail!("the GitHub ledger currently supports only add and show");
     }
-    let database = cli::database_path(cli.database)?;
-    cli::prepare_database_path(&database)?;
-    let ledger_config = LedgerConfig::sqlite(&database);
 
     if let Command::Serve(args) = &cli.command {
         ledger_config.open()?;
@@ -217,7 +224,7 @@ fn init_github(cli: &Cli, positional_repository: Option<&str>) -> Result<()> {
 
     let cache = config::github_cache_path(&repository.full_name)?;
     cli::prepare_database_path(&cache)?;
-    LedgerConfig::sqlite(&cache).open()?;
+    LedgerConfig::github(repository.full_name.clone(), &cache).prepare_github_cache(created)?;
 
     let is_default = existing_config.as_ref().is_none_or(|config| {
         config
