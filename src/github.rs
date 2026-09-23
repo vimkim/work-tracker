@@ -322,7 +322,7 @@ struct RecoverableCreationRequest {
     event_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ProjectionMetadata {
     schema_version: u32,
     kind: String,
@@ -2536,8 +2536,8 @@ impl GitHubLedger {
                     .map_err(|error| recovery_still_blocked(issue_number, error))
             })?;
         let latched_diagnosis = self.cache.github_integrity_report(issue_number)?;
-        let (issue, mut metadata) = self.load_work_item_issue(issue_number)?;
-        let mut comments = self.load_comments(issue_number)?;
+        let (issue, metadata) = self.load_work_item_issue(issue_number)?;
+        let comments = self.load_comments(issue_number)?;
         let timeline = self.load_timeline(issue_number)?;
         let mut diagnosis = self.diagnose_loaded(&issue, &metadata, &comments, timeline)?;
         if !diagnosis
@@ -2563,9 +2563,14 @@ impl GitHubLedger {
         } else {
             Vec::new()
         };
-        let mut prior_evidence = self
-            .cache
-            .github_event_evidence(issue_number)?
+        let cached_evidence = self.cache.github_event_evidence(issue_number)?;
+        let cached_comment_ids = cached_evidence
+            .iter()
+            .map(|evidence| evidence.comment_id)
+            .collect::<HashSet<_>>();
+        let initial_evidence =
+            recovery_evidence_snapshot(&comments, &metadata, &cached_comment_ids, None);
+        let mut prior_evidence = cached_evidence
             .into_iter()
             .map(|evidence| RetainedRecoveryEvidence {
                 evidence_id: evidence.comment_id,
@@ -2680,23 +2685,68 @@ impl GitHubLedger {
         let archived = reviewed.status == Status::Archived;
 
         let recovery = (|| -> Result<(WorkItem, ReplayedHistory, Vec<LedgerComment>)> {
-            let mut comment: LedgerComment = self.github.api_json(
+            let published_anchor: LedgerComment = self.github.api_json(
                 "POST",
                 &format!("repos/{}/issues/{issue_number}/comments", self.repository),
                 &[("body", body.as_str())],
             )?;
-            if comment.user.login != event.github_actor {
+            if published_anchor.user.login != event.github_actor {
                 return Err(metadata_collision(issue_number).into());
             }
-            comment.body = body.clone();
-            let anchor_id = comment.id;
-            comments.push(comment);
-            let replayed = replay_trusted_history(issue_number, &comments).map_err(|error| {
+            let anchor_id = published_anchor.id;
+
+            let (reloaded_issue, mut reloaded_metadata) =
+                self.load_work_item_issue(issue_number)?;
+            let reloaded_comments = self.load_comments(issue_number)?;
+            let reloaded_reviewed = reviewed_item_from_issue(&reloaded_issue, &reloaded_comments)
+                .map_err(|error| {
                 recovery_validation_failed(
                     issue_number,
-                    format!("the Rebaseline sequence did not replay: {error:#}"),
+                    format!("the live GitHub state became ambiguous: {error:#}"),
                 )
             })?;
+            let reloaded_evidence = recovery_evidence_snapshot(
+                &reloaded_comments,
+                &reloaded_metadata,
+                &cached_comment_ids,
+                Some(anchor_id),
+            );
+            if reloaded_metadata != metadata
+                || reloaded_issue.locked != issue.locked
+                || reloaded_reviewed.title != reviewed.title
+                || reloaded_reviewed.description != reviewed.description
+                || reloaded_reviewed.status != reviewed.status
+                || reloaded_evidence != initial_evidence
+            {
+                return Err(recovery_validation_failed(
+                    issue_number,
+                    "the live GitHub state or integrity evidence changed while the Rebaseline anchor was published; recovery remains blocked and a retry must retain the new evidence",
+                )
+                .into());
+            }
+            let reloaded_anchor = reloaded_comments
+                .iter()
+                .find(|comment| comment.id == anchor_id)
+                .ok_or_else(|| {
+                    recovery_validation_failed(
+                        issue_number,
+                        "the published Rebaseline anchor was absent during validation",
+                    )
+                })?;
+            if reloaded_anchor.user.login != event.github_actor || reloaded_anchor.body != body {
+                return Err(recovery_validation_failed(
+                    issue_number,
+                    "the published Rebaseline anchor changed before validation",
+                )
+                .into());
+            }
+            let replayed =
+                replay_trusted_history(issue_number, &reloaded_comments).map_err(|error| {
+                    recovery_validation_failed(
+                        issue_number,
+                        format!("the Rebaseline sequence did not replay: {error:#}"),
+                    )
+                })?;
             let anchor = replayed.accepted.first().ok_or_else(|| {
                 recovery_validation_failed(
                     issue_number,
@@ -2713,22 +2763,22 @@ impl GitHubLedger {
                 )
                 .into());
             }
-            metadata.event_id = event.event_id.clone();
-            metadata.pending_genesis_event_id = None;
-            metadata.pending_genesis_event = None;
-            metadata.genesis_comment_id = Some(anchor_id);
-            metadata.state_revision = 1;
-            metadata.head_event_id = None;
-            metadata.head_comment_id = None;
-            metadata.history_hash = None;
+            reloaded_metadata.event_id = event.event_id.clone();
+            reloaded_metadata.pending_genesis_event_id = None;
+            reloaded_metadata.pending_genesis_event = None;
+            reloaded_metadata.genesis_comment_id = Some(anchor_id);
+            reloaded_metadata.state_revision = 1;
+            reloaded_metadata.head_event_id = None;
+            reloaded_metadata.head_comment_id = None;
+            reloaded_metadata.history_hash = None;
             let item = materialize_item(issue_number, &replayed.accepted).map_err(|error| {
                 recovery_validation_failed(
                     issue_number,
                     format!("the reviewed current state could not be rebuilt: {error:#}"),
                 )
             })?;
-            self.project_history_head(&issue, metadata.clone(), &replayed.accepted)?;
-            Ok((item, replayed, comments.clone()))
+            self.project_history_head(&reloaded_issue, reloaded_metadata, &replayed.accepted)?;
+            Ok((item, replayed, reloaded_comments))
         })();
         let (item, replayed, comments) = recovery?;
         let trusted_event_count = replayed.accepted.len();
@@ -3678,6 +3728,25 @@ fn is_projected_or_structured_event(
     has_metadata(&comment.body, EVENT_MARKER)
         || metadata.genesis_comment_id == Some(comment.id)
         || metadata.head_comment_id == Some(comment.id)
+}
+
+fn recovery_evidence_snapshot(
+    comments: &[LedgerComment],
+    metadata: &ProjectionMetadata,
+    cached_comment_ids: &HashSet<i64>,
+    excluded_comment_id: Option<i64>,
+) -> Vec<(i64, String, String)> {
+    let mut evidence = comments
+        .iter()
+        .filter(|comment| Some(comment.id) != excluded_comment_id)
+        .filter(|comment| {
+            cached_comment_ids.contains(&comment.id)
+                || is_projected_or_structured_event(metadata, comment)
+        })
+        .map(|comment| (comment.id, comment.user.login.clone(), comment.body.clone()))
+        .collect::<Vec<_>>();
+    evidence.sort();
+    evidence
 }
 
 fn event_comment_body(event: &CanonicalEvent) -> Result<String> {

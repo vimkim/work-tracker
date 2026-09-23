@@ -615,6 +615,157 @@ fn rebaseline_retains_markerless_current_and_latched_damaged_variants() -> Resul
     Ok(())
 }
 
+#[test]
+fn rebaseline_reloads_changed_evidence_and_retry_retains_every_observed_variant() -> Result<()> {
+    let cli = CliHarness::new()?;
+    configure_github(&cli)?;
+    let gh = FakeGh::new()?;
+    let scenario = seed_edited_integrity(&cli, &gh)?;
+    let raced_event = event("Changed while Rebaseline was publishing");
+    let raced_comment = comment(&raced_event)?;
+    respond_rebaseline_attempt(
+        &gh,
+        5,
+        &scenario.corrupt_issue,
+        &[remote_comment(&scenario.edited_comment)],
+        &json!([]),
+        9100,
+        "2026-09-23T04:02:03Z",
+        &scenario.corrupt_issue,
+        &[remote_comment(&raced_comment)],
+    )?;
+    let raced = cli.run_with_fake_gh(
+        &gh,
+        [
+            "--json",
+            "recover",
+            "41",
+            "--mode",
+            "rebaseline",
+            "--actor",
+            "reviewer-a",
+            "--reason",
+            "first reviewed snapshot",
+        ],
+    )?;
+    ensure!(!raced.status.success());
+    let error: Value = serde_json::from_slice(&raced.stderr)?;
+    assert_eq!(error["error"]["code"], "github_recovery_validation_failed");
+    let calls = gh.calls()?;
+    ensure!(!calls.contains("\tPATCH\trepos/octocat/work-tracker-data/issues/41"));
+    let first_anchor_body = last_published_rebaseline_body(&calls)?;
+    let first_anchor = json!({
+        "id": 9100,
+        "created_at": "2026-09-23T04:02:03Z",
+        "user": {"login": "octocat"},
+        "body": first_anchor_body
+    });
+
+    let retry_comments = vec![remote_comment(&raced_comment), first_anchor];
+    respond_rebaseline_attempt(
+        &gh,
+        12,
+        &scenario.corrupt_issue,
+        &retry_comments,
+        &json!([]),
+        9200,
+        "2026-09-23T04:03:03Z",
+        &scenario.corrupt_issue,
+        &retry_comments,
+    )?;
+    let recovered = cli.run_with_fake_gh(
+        &gh,
+        [
+            "--json",
+            "recover",
+            "41",
+            "--mode",
+            "rebaseline",
+            "--actor",
+            "reviewer-a",
+            "--reason",
+            "reviewed raced evidence",
+        ],
+    )?;
+    assert_success(&recovered)?;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&recovered.stdout)?["untrusted_event_count"],
+        4
+    );
+    let history = cli.run_with_fake_gh(&gh, ["--offline", "--json", "history", "41"])?;
+    assert_success(&history)?;
+    let entries: Value = serde_json::from_slice(&history.stdout)?;
+    assert_eq!(entries.as_array().map(Vec::len), Some(5));
+    let untrusted = &entries.as_array().context("history should be an array")?[..4];
+    assert!(
+        untrusted.iter().any(|entry| {
+            entry["changes"]["title"] == "Changed while Rebaseline was publishing"
+        })
+    );
+    assert!(
+        untrusted
+            .iter()
+            .any(|entry| entry["changes"]["title"] == "Edited behind Work Tracker")
+    );
+    assert!(
+        untrusted
+            .iter()
+            .any(|entry| entry["changes"]["title"] == "Original title")
+    );
+    assert!(untrusted.iter().any(|entry| entry["kind"] == "rebaseline"));
+    Ok(())
+}
+
+#[test]
+fn rebaseline_rejects_a_lock_change_during_publication() -> Result<()> {
+    let cli = CliHarness::new()?;
+    configure_github(&cli)?;
+    let gh = FakeGh::new()?;
+    let original_event = event("Original title");
+    let original_comment = comment(&original_event)?;
+    let invalid_projection = projection("disconnected-projection-head");
+    let mut locked_issue = issue(&invalid_projection, "2026-09-23T01:02:04Z", true);
+    locked_issue["labels"] = json!([
+        {"name": "work-tracker:item"},
+        {"name": "work-tracker:status:archived"}
+    ]);
+    let mut unlocked_issue = locked_issue.clone();
+    unlocked_issue["locked"] = json!(false);
+    respond_rebaseline_attempt(
+        &gh,
+        1,
+        &locked_issue,
+        &[remote_comment(&original_comment)],
+        &json!([]),
+        9100,
+        "2026-09-23T04:02:03Z",
+        &unlocked_issue,
+        &[remote_comment(&original_comment)],
+    )?;
+
+    let recovered = cli.run_with_fake_gh(
+        &gh,
+        [
+            "--json",
+            "recover",
+            "41",
+            "--mode",
+            "rebaseline",
+            "--actor",
+            "reviewer-a",
+            "--reason",
+            "reviewed archived state",
+        ],
+    )?;
+    ensure!(!recovered.status.success());
+    let error: Value = serde_json::from_slice(&recovered.stderr)?;
+    assert_eq!(error["error"]["code"], "github_recovery_validation_failed");
+    let calls = gh.calls()?;
+    ensure!(!calls.contains("\tPATCH\trepos/octocat/work-tracker-data/issues/41"));
+    ensure!(!calls.contains("\tDELETE\trepos/octocat/work-tracker-data/issues/41/lock"));
+    Ok(())
+}
+
 #[derive(Clone, Serialize)]
 struct Event<'a> {
     schema_version: u32,
@@ -748,6 +899,23 @@ fn respond_rebaseline(
     timeline: &Value,
     created_at: &str,
 ) -> Result<()> {
+    respond_rebaseline_attempt(
+        gh, start, issue, comments, timeline, 9100, created_at, issue, comments,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn respond_rebaseline_attempt(
+    gh: &FakeGh,
+    start: usize,
+    issue: &Value,
+    comments: &[Value],
+    timeline: &Value,
+    anchor_id: i64,
+    created_at: &str,
+    reloaded_issue: &Value,
+    reloaded_comments: &[Value],
+) -> Result<()> {
     gh.respond(start, 0, &issue.to_string(), "")?;
     gh.respond(start + 1, 0, &json!([comments]).to_string(), "")?;
     gh.respond(start + 2, 0, &json!([timeline]).to_string(), "")?;
@@ -756,15 +924,42 @@ fn respond_rebaseline(
         start + 4,
         0,
         &json!({
-            "id": 9100,
+            "id": anchor_id,
             "created_at": created_at,
             "user": {"login": "octocat"}
         })
         .to_string(),
         "",
     )?;
-    gh.respond(start + 5, 0, "", "")?;
+    gh.respond(start + 5, 0, &reloaded_issue.to_string(), "")?;
+    let mut authoritative_comments = reloaded_comments.to_vec();
+    authoritative_comments.push(json!({
+        "id": anchor_id,
+        "created_at": created_at,
+        "user": {"login": "octocat"},
+        "body": "{{LAST_REQUEST_BODY}}"
+    }));
+    gh.respond(
+        start + 6,
+        0,
+        &json!([authoritative_comments]).to_string(),
+        "",
+    )?;
+    gh.respond(start + 7, 0, "", "")?;
     Ok(())
+}
+
+fn last_published_rebaseline_body(calls: &str) -> Result<String> {
+    let prefix = "body=Work Tracker History Entry: rebaseline";
+    let start = calls
+        .rfind(prefix)
+        .context("fake gh calls omitted a Rebaseline body")?;
+    let body_start = start + "body=".len();
+    let body_end = calls[body_start..]
+        .find("\n-->")
+        .map(|offset| body_start + offset + "\n-->".len())
+        .context("Rebaseline body omitted its metadata terminator")?;
+    Ok(calls[body_start..body_end].to_owned())
 }
 
 #[test]

@@ -18,3 +18,4 @@ Ledger integrity recovery is the sole exception to the rule that an Archived Wor
 - Ordinary field, Status, and note commands continue to reject Archived Work Items.
 - Recovery records the live GitHub projection as the reviewed state and preserves the archived Status.
 - Archived recovery keeps the issue locked throughout the current implementation, avoiding a temporary mutability window.
+- Rebaseline reloads the authoritative issue, lock, and evidence after publishing its anchor. A concurrent change leaves recovery latched and requires another explicit Rebaseline; that retry retains the abandoned anchor and newly observed variants as untrusted evidence.
