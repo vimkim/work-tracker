@@ -112,7 +112,9 @@ fn doctor_never_offers_exact_recovery_for_unverified_cached_evidence() -> Result
     configure_github(&cli)?;
     let gh = FakeGh::new()?;
     let original_event = event("Original title");
+    let edited_event = event("Edited after untrusted caching");
     let original_comment = comment(&original_event)?;
+    let edited_comment = comment(&edited_event)?;
     let invalid_projection = projection("not-the-event-hash");
     let corrupt_issue = issue(&invalid_projection, "2026-09-23T01:02:04Z", false);
     respond_sync(&gh, 1, &corrupt_issue, &remote_comment(&original_comment))?;
@@ -127,7 +129,7 @@ fn doctor_never_offers_exact_recovery_for_unverified_cached_evidence() -> Result
     gh.respond(
         4,
         0,
-        &json!([[remote_comment(&original_comment)]]).to_string(),
+        &json!([[remote_comment(&edited_comment)]]).to_string(),
         "",
     )?;
     gh.respond(5, 0, "[[]]", "")?;
@@ -140,7 +142,7 @@ fn doctor_never_offers_exact_recovery_for_unverified_cached_evidence() -> Result
     gh.respond(
         7,
         0,
-        &json!([[remote_comment(&original_comment)]]).to_string(),
+        &json!([[remote_comment(&edited_comment)]]).to_string(),
         "",
     )?;
     let recovered = cli.run_with_fake_gh(
@@ -1435,14 +1437,23 @@ fn archived_rebaseline_stays_locked_and_remains_immutable() -> Result<()> {
     )?;
     assert_success(&cli.run_with_fake_gh(&gh, ["--json", "show", "41"])?)?;
 
-    gh.respond(3, 0, &json!([[archived_issue]]).to_string(), "")?;
+    let mut damaged_archived_issue = archived_issue.clone();
+    damaged_archived_issue["labels"][1]["name"] = json!("work-tracker:status:pending");
+    damaged_archived_issue["state"] = json!("open");
+    damaged_archived_issue["state_reason"] = Value::Null;
+    gh.respond(
+        3,
+        0,
+        &json!([[damaged_archived_issue.clone()]]).to_string(),
+        "",
+    )?;
     gh.respond(4, 0, &json!([[archive_comment]]).to_string(), "")?;
     assert_success(&cli.run_with_fake_gh(&gh, ["--json", "show", "41"])?)?;
 
     respond_rebaseline(
         &gh,
         5,
-        &archived_issue,
+        &damaged_archived_issue,
         std::slice::from_ref(&archive_comment),
         &json!([{
             "event": "comment_deleted",

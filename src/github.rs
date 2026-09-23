@@ -1497,8 +1497,10 @@ impl GitHubLedger {
                 ),
                 _ => continue,
             };
-            let exact_copy_verified =
-                observed.is_some() && cached_exact_chain_is_verified(&cached[..=index]);
+            let exact_copy_verified = observed.is_some()
+                && cached_exact_chain_is_verified(&cached)
+                && parse_projection(&issue.body)
+                    .is_ok_and(|metadata| cached_chain_matches_projection(&cached, &metadata));
             let report = IntegrityDoctorReport {
                 work_item_id: issue.number,
                 integrity_health: IntegrityHealth::LedgerIntegrityError,
@@ -2423,7 +2425,8 @@ impl GitHubLedger {
             .ok_or_else(|| {
                 recovery_still_blocked(issue_number, "the diagnosed event has no cached evidence")
             })?;
-        if !cached_exact_chain_is_verified(&cached[..=target_index])
+        if !cached_exact_chain_is_verified(&cached)
+            || !cached_chain_matches_projection(&cached, &metadata)
             || cached[target_index].body != exact_body
         {
             return Err(recovery_still_blocked(
@@ -3552,16 +3555,20 @@ fn materialize_item(issue_number: i64, history: &[HistoryEntry]) -> Result<WorkI
 }
 
 fn reviewed_item_from_issue(issue: &LedgerIssue, comments: &[LedgerComment]) -> WorkItem {
-    let status = issue
-        .labels
-        .iter()
-        .find_map(|label| {
-            label
-                .name
-                .strip_prefix("work-tracker:status:")
-                .and_then(|status| Status::from_str(status).ok())
-        })
-        .unwrap_or(Status::Pending);
+    let status = if issue.locked {
+        Status::Archived
+    } else {
+        issue
+            .labels
+            .iter()
+            .find_map(|label| {
+                label
+                    .name
+                    .strip_prefix("work-tracker:status:")
+                    .and_then(|status| Status::from_str(status).ok())
+            })
+            .unwrap_or(Status::Pending)
+    };
     let observed_at = comments
         .iter()
         .map(|comment| comment.created_at)
@@ -3688,6 +3695,20 @@ fn cached_exact_chain_is_verified(evidence: &[GithubEventEvidence]) -> bool {
         previous_hash = Some(observed_hash);
     }
     true
+}
+
+fn cached_chain_matches_projection(
+    evidence: &[GithubEventEvidence],
+    metadata: &ProjectionMetadata,
+) -> bool {
+    let (Some(genesis), Some(head)) = (evidence.first(), evidence.last()) else {
+        return false;
+    };
+    genesis.comment_id == metadata.genesis_comment_id.unwrap_or_default()
+        && genesis.event_id.as_deref() == Some(metadata.event_id.as_str())
+        && head.comment_id == metadata.head_comment_id.unwrap_or_default()
+        && head.event_id.as_deref() == metadata.head_event_id.as_deref()
+        && head.history_hash.as_deref() == metadata.history_hash.as_deref()
 }
 
 fn hash_part(hasher: &mut Sha256, bytes: &[u8]) {
