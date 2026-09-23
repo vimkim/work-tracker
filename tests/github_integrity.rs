@@ -181,6 +181,97 @@ fn exact_recovery_refuses_a_lock_added_after_the_comment_restore() -> Result<()>
 }
 
 #[test]
+fn exact_recovery_latches_before_restoring_and_blocks_mutation_after_validation_failure()
+-> Result<()> {
+    let cli = CliHarness::new()?;
+    configure_github(&cli)?;
+    let gh = FakeGh::new()?;
+    let original_event = event("Original title");
+    let edited_event = event("Edited behind Work Tracker");
+    let original_comment = comment(&original_event)?;
+    let edited_comment = comment(&edited_event)?;
+    let projection = projection(&hash(&original_event, 9001)?);
+    let healthy_issue = issue(&projection, "2026-09-23T01:02:04Z", false);
+    let corrupt_issue = issue(&projection, "2026-09-23T02:02:04Z", false);
+    let mut locked_issue = corrupt_issue.clone();
+    locked_issue["locked"] = json!(true);
+
+    respond_sync(&gh, 1, &healthy_issue, &remote_comment(&original_comment))?;
+    assert_success(&cli.run_with_fake_gh(&gh, ["--json", "show", "41"])?)?;
+    gh.respond(3, 0, &corrupt_issue.to_string(), "")?;
+    gh.respond(
+        4,
+        0,
+        &json!([[remote_comment(&edited_comment)]]).to_string(),
+        "",
+    )?;
+    gh.respond(5, 0, "", "")?;
+    gh.respond(6, 0, &locked_issue.to_string(), "")?;
+    gh.respond(
+        7,
+        0,
+        &json!([[remote_comment(&original_comment)]]).to_string(),
+        "",
+    )?;
+
+    let recovered = cli.run_with_fake_gh(
+        &gh,
+        ["--json", "recover", "41", "--mode", "restore-exact-copy"],
+    )?;
+    ensure!(!recovered.status.success());
+    let error: Value = serde_json::from_slice(&recovered.stderr)?;
+    assert_eq!(error["error"]["code"], "github_recovery_validation_failed");
+
+    let calls_before_mutation = gh.calls()?.lines().count();
+    let mutation = cli.run_with_fake_gh(
+        &gh,
+        [
+            "--json",
+            "note",
+            "41",
+            "must remain blocked",
+            "--actor",
+            "agent-b",
+        ],
+    )?;
+    ensure!(!mutation.status.success());
+    let mutation_error: Value = serde_json::from_slice(&mutation.stderr)?;
+    assert_eq!(mutation_error["error"]["code"], "github_ledger_integrity");
+    assert_eq!(gh.calls()?.lines().count(), calls_before_mutation);
+    Ok(())
+}
+
+#[test]
+fn doctor_counts_a_cached_event_whose_live_marker_was_removed_as_untrusted() -> Result<()> {
+    let cli = CliHarness::new()?;
+    configure_github(&cli)?;
+    let gh = FakeGh::new()?;
+    let original_event = event("Original title");
+    let original_comment = comment(&original_event)?;
+    let projection = projection(&hash(&original_event, 9001)?);
+    let healthy_issue = issue(&projection, "2026-09-23T01:02:04Z", false);
+    let damaged_issue = issue(&projection, "2026-09-23T02:02:04Z", false);
+    let markerless = remote_comment("damaged body with no event marker");
+
+    respond_sync(&gh, 1, &healthy_issue, &remote_comment(&original_comment))?;
+    assert_success(&cli.run_with_fake_gh(&gh, ["--json", "show", "41"])?)?;
+    gh.respond(3, 0, &damaged_issue.to_string(), "")?;
+    gh.respond(4, 0, &json!([[markerless]]).to_string(), "")?;
+    gh.respond(5, 0, "[[]]", "")?;
+    let diagnosed = cli.run_with_fake_gh(&gh, ["--json", "doctor", "41"])?;
+    assert_success(&diagnosed)?;
+    let report: Value = serde_json::from_slice(&diagnosed.stdout)?;
+    assert_eq!(report["first_break"]["kind"], "edited_event");
+    assert_eq!(report["trusted_event_count"], 0);
+    assert_eq!(report["untrusted_event_count"], 1);
+    assert_eq!(
+        report["observed_evidence"].as_array().map(Vec::len),
+        Some(1)
+    );
+    Ok(())
+}
+
+#[test]
 fn doctor_never_offers_exact_recovery_for_unverified_cached_evidence() -> Result<()> {
     let cli = CliHarness::new()?;
     configure_github(&cli)?;
@@ -984,6 +1075,144 @@ fn rebaseline_retry_retains_an_uncached_interior_body_that_lost_its_marker() -> 
     Ok(())
 }
 
+#[test]
+fn rebaseline_retry_retains_published_and_markerless_anchor_variants() -> Result<()> {
+    let cli = CliHarness::new()?;
+    configure_github(&cli)?;
+    let gh = FakeGh::new()?;
+    let original_event = event("Original title");
+    let original_comment = comment(&original_event)?;
+    let invalid_projection = projection("disconnected-projection-head");
+    let corrupt_issue = issue(&invalid_projection, "2026-09-23T02:02:04Z", false);
+    let markerless_anchor_body = "published anchor body after its event marker was removed";
+    let markerless_anchor = remote_comment_with_id(9100, markerless_anchor_body);
+
+    respond_rebaseline_anchor_guard_failure(
+        &gh,
+        1,
+        &corrupt_issue,
+        &[remote_comment(&original_comment)],
+        9100,
+        "2026-09-23T04:02:03Z",
+        Some(markerless_anchor.clone()),
+    )?;
+    let raced = cli.run_with_fake_gh(
+        &gh,
+        [
+            "--json",
+            "recover",
+            "41",
+            "--mode",
+            "rebaseline",
+            "--actor",
+            "reviewer-a",
+            "--reason",
+            "first review",
+        ],
+    )?;
+    ensure!(!raced.status.success());
+    let first_anchor_body = last_published_rebaseline_body(&gh.calls()?)?;
+
+    let retry_comments = vec![remote_comment(&original_comment), markerless_anchor];
+    respond_rebaseline_attempt(
+        &gh,
+        8,
+        &corrupt_issue,
+        &retry_comments,
+        &json!([]),
+        9200,
+        "2026-09-23T04:03:03Z",
+        &corrupt_issue,
+        &retry_comments,
+    )?;
+    let recovered = cli.run_with_fake_gh(
+        &gh,
+        [
+            "--json",
+            "recover",
+            "41",
+            "--mode",
+            "rebaseline",
+            "--actor",
+            "reviewer-a",
+            "--reason",
+            "reviewed damaged anchor",
+        ],
+    )?;
+    assert_success(&recovered)?;
+    let retained = cached_retained_bodies(&cli)?;
+    ensure!(retained.contains(&first_anchor_body));
+    ensure!(retained.contains(&markerless_anchor_body.to_owned()));
+    Ok(())
+}
+
+#[test]
+fn rebaseline_retry_retains_the_locally_known_body_of_a_deleted_anchor() -> Result<()> {
+    let cli = CliHarness::new()?;
+    configure_github(&cli)?;
+    let gh = FakeGh::new()?;
+    let original_event = event("Original title");
+    let original_comment = comment(&original_event)?;
+    let invalid_projection = projection("disconnected-projection-head");
+    let corrupt_issue = issue(&invalid_projection, "2026-09-23T02:02:04Z", false);
+    let original_comments = vec![remote_comment(&original_comment)];
+
+    respond_rebaseline_anchor_guard_failure(
+        &gh,
+        1,
+        &corrupt_issue,
+        &original_comments,
+        9100,
+        "2026-09-23T04:02:03Z",
+        None,
+    )?;
+    let raced = cli.run_with_fake_gh(
+        &gh,
+        [
+            "--json",
+            "recover",
+            "41",
+            "--mode",
+            "rebaseline",
+            "--actor",
+            "reviewer-a",
+            "--reason",
+            "first review",
+        ],
+    )?;
+    ensure!(!raced.status.success());
+    let first_anchor_body = last_published_rebaseline_body(&gh.calls()?)?;
+
+    respond_rebaseline_attempt(
+        &gh,
+        8,
+        &corrupt_issue,
+        &original_comments,
+        &json!([]),
+        9200,
+        "2026-09-23T04:03:03Z",
+        &corrupt_issue,
+        &original_comments,
+    )?;
+    let recovered = cli.run_with_fake_gh(
+        &gh,
+        [
+            "--json",
+            "recover",
+            "41",
+            "--mode",
+            "rebaseline",
+            "--actor",
+            "reviewer-a",
+            "--reason",
+            "reviewed deleted anchor",
+        ],
+    )?;
+    assert_success(&recovered)?;
+    assert!(cached_retained_bodies(&cli)?.contains(&first_anchor_body));
+    Ok(())
+}
+
 #[derive(Clone, Serialize)]
 struct Event<'a> {
     schema_version: u32,
@@ -1214,6 +1443,43 @@ fn respond_rebaseline_attempt_with_final(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn respond_rebaseline_anchor_guard_failure(
+    gh: &FakeGh,
+    start: usize,
+    issue: &Value,
+    comments: &[Value],
+    anchor_id: i64,
+    created_at: &str,
+    observed_anchor: Option<Value>,
+) -> Result<()> {
+    gh.respond(start, 0, &issue.to_string(), "")?;
+    gh.respond(start + 1, 0, &json!([comments]).to_string(), "")?;
+    gh.respond(start + 2, 0, "[[]]", "")?;
+    gh.respond(start + 3, 0, r#"{"login":"octocat"}"#, "")?;
+    gh.respond(
+        start + 4,
+        0,
+        &json!({
+            "id": anchor_id,
+            "created_at": created_at,
+            "user": {"login": "octocat"}
+        })
+        .to_string(),
+        "",
+    )?;
+    gh.respond(start + 5, 0, &issue.to_string(), "")?;
+    let mut authoritative_comments = comments.to_vec();
+    authoritative_comments.extend(observed_anchor);
+    gh.respond(
+        start + 6,
+        0,
+        &json!([authoritative_comments]).to_string(),
+        "",
+    )?;
+    Ok(())
+}
+
 fn last_published_rebaseline_body(calls: &str) -> Result<String> {
     let prefix = "body=Work Tracker History Entry: rebaseline";
     let start = calls
@@ -1225,6 +1491,29 @@ fn last_published_rebaseline_body(calls: &str) -> Result<String> {
         .map(|offset| body_start + offset + "\n-->".len())
         .context("Rebaseline body omitted its metadata terminator")?;
     Ok(calls[body_start..body_end].to_owned())
+}
+
+fn cached_retained_bodies(cli: &CliHarness) -> Result<Vec<String>> {
+    let connection = Connection::open(cli.github_cache_path("octocat", "work-tracker-data"))?;
+    let mut statement = connection.prepare(
+        "SELECT changes_json FROM history_entries
+         WHERE work_item_id = 41 AND evidence_trust = 'untrusted'",
+    )?;
+    let changes = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    changes
+        .into_iter()
+        .map(|changes| serde_json::from_str::<Value>(&changes).map_err(Into::into))
+        .filter_map(|changes| match changes {
+            Ok(changes) => changes
+                .get("retained_body")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .map(Ok),
+            Err(error) => Some(Err(error)),
+        })
+        .collect()
 }
 
 #[test]

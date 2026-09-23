@@ -1513,7 +1513,17 @@ impl GitHubLedger {
                 .filter(|observed| observed.body != expected.body)
                 .map(observed_integrity_evidence)
                 .into_iter()
-                .collect();
+                .collect::<Vec<_>>();
+            let mut untrusted_comment_ids = cached[index..]
+                .iter()
+                .map(|evidence| evidence.comment_id)
+                .collect::<HashSet<_>>();
+            untrusted_comment_ids.extend(structured.iter().skip(index).map(|comment| comment.id));
+            untrusted_comment_ids.extend(
+                observed_evidence
+                    .iter()
+                    .map(|evidence| evidence.github_comment_id),
+            );
             let report = IntegrityDoctorReport {
                 work_item_id: issue.number,
                 integrity_health: IntegrityHealth::LedgerIntegrityError,
@@ -1535,7 +1545,7 @@ impl GitHubLedger {
                     detail,
                 }),
                 trusted_event_count: index,
-                untrusted_event_count: structured.len().saturating_sub(index),
+                untrusted_event_count: untrusted_comment_ids.len(),
                 timeline_evidence,
                 eligible_repair_modes: if exact_copy_verified {
                     vec![RepairMode::RestoreExactCopy, RepairMode::Rebaseline]
@@ -2416,6 +2426,7 @@ impl GitHubLedger {
         diagnosis: &IntegrityDoctorReport,
         before: &[ObservedIntegrityEvidence],
         after: &[ObservedIntegrityEvidence],
+        additional: &[ObservedIntegrityEvidence],
     ) -> Result<()> {
         self.preserve_integrity_snapshot(issue, comments, diagnosis, None)?;
         let mut latched = self
@@ -2434,6 +2445,16 @@ impl GitHubLedger {
                     && previous.body == observed.body
             });
             if !was_already_observed && !is_already_latched {
+                latched.observed_evidence.push(observed.clone());
+            }
+        }
+        for observed in additional {
+            let is_already_latched = latched.observed_evidence.iter().any(|previous| {
+                previous.github_comment_id == observed.github_comment_id
+                    && previous.github_actor == observed.github_actor
+                    && previous.body == observed.body
+            });
+            if !is_already_latched {
                 latched.observed_evidence.push(observed.clone());
             }
         }
@@ -2528,6 +2549,7 @@ impl GitHubLedger {
             )
             .into());
         }
+        self.preserve_integrity_snapshot(&issue, &comments, &diagnosis, None)?;
         self.github.api_empty(
             "PATCH",
             &format!("repos/{}/issues/comments/{comment_id}", self.repository),
@@ -2810,6 +2832,12 @@ impl GitHubLedger {
                 return Err(metadata_collision(issue_number).into());
             }
             let anchor_id = published_anchor.id;
+            let published_anchor_evidence = ObservedIntegrityEvidence {
+                github_comment_id: anchor_id,
+                github_actor: event.github_actor.clone(),
+                body: body.clone(),
+                observed_at: published_anchor.created_at,
+            };
 
             let reloaded = self.load_rebaseline_validation_snapshot(
                 issue_number,
@@ -2823,12 +2851,15 @@ impl GitHubLedger {
                 &initial_evidence,
                 &reloaded,
             ) {
+                let anchor_evidence =
+                    rebaseline_anchor_evidence(&published_anchor_evidence, &reloaded.comments);
                 self.latch_recovery_race(
                     &reloaded.issue,
                     &reloaded.comments,
                     &diagnosis,
                     &initial_evidence,
                     &reloaded.evidence,
+                    &anchor_evidence,
                 )?;
                 return Err(recovery_validation_failed(
                     issue_number,
@@ -2842,12 +2873,15 @@ impl GitHubLedger {
                 &event.github_actor,
                 &body,
             ) {
+                let anchor_evidence =
+                    rebaseline_anchor_evidence(&published_anchor_evidence, &reloaded.comments);
                 self.latch_recovery_race(
                     &reloaded.issue,
                     &reloaded.comments,
                     &diagnosis,
                     &initial_evidence,
                     &reloaded.evidence,
+                    &anchor_evidence,
                 )?;
                 return Err(recovery_validation_failed(
                     issue_number,
@@ -2872,12 +2906,17 @@ impl GitHubLedger {
                 &event.github_actor,
                 &body,
             ) {
+                let anchor_evidence = rebaseline_anchor_evidence(
+                    &published_anchor_evidence,
+                    &final_snapshot.comments,
+                );
                 self.latch_recovery_race(
                     &final_snapshot.issue,
                     &final_snapshot.comments,
                     &diagnosis,
                     &initial_evidence,
                     &final_snapshot.evidence,
+                    &anchor_evidence,
                 )?;
                 return Err(recovery_validation_failed(
                     issue_number,
@@ -3926,6 +3965,22 @@ fn rebaseline_anchor_is_exact(
     })
 }
 
+fn rebaseline_anchor_evidence(
+    published: &ObservedIntegrityEvidence,
+    comments: &[LedgerComment],
+) -> Vec<ObservedIntegrityEvidence> {
+    let mut evidence = vec![published.clone()];
+    if let Some(observed) = comments
+        .iter()
+        .find(|comment| comment.id == published.github_comment_id)
+        .map(observed_integrity_evidence)
+        && (observed.github_actor != published.github_actor || observed.body != published.body)
+    {
+        evidence.push(observed);
+    }
+    evidence
+}
+
 fn observed_integrity_evidence(comment: &LedgerComment) -> ObservedIntegrityEvidence {
     ObservedIntegrityEvidence {
         github_comment_id: comment.id,
@@ -4240,7 +4295,20 @@ fn retained_evidence_history(
                 occurred_at: evidence.occurred_at.unwrap_or(fallback_time),
                 changes: parsed.as_ref().map_or_else(
                     || json!({"retained_body": evidence.body}),
-                    |event| event.changes.clone(),
+                    |event| {
+                        let mut changes = event.changes.clone();
+                        if let Some(changes) = changes.as_object_mut() {
+                            changes.insert(
+                                "retained_body".to_owned(),
+                                Value::String(evidence.body.clone()),
+                            );
+                            return Value::Object(changes.clone());
+                        }
+                        json!({
+                            "observed_changes": changes,
+                            "retained_body": evidence.body,
+                        })
+                    },
                 ),
                 previous_history_hash: None,
                 history_hash: evidence.history_hash.clone(),
