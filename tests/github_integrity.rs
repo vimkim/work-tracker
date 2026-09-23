@@ -107,6 +107,34 @@ fn exact_recovery_failure_stays_latched_and_reports_failed_validation() -> Resul
 }
 
 #[test]
+fn exact_recovery_refuses_to_unlock_a_live_locked_work_item() -> Result<()> {
+    let cli = CliHarness::new()?;
+    configure_github(&cli)?;
+    let gh = FakeGh::new()?;
+    let scenario = seed_edited_integrity(&cli, &gh)?;
+    let mut locked_issue = scenario.corrupt_issue.clone();
+    locked_issue["locked"] = json!(true);
+    gh.respond(5, 0, &locked_issue.to_string(), "")?;
+    gh.respond(
+        6,
+        0,
+        &json!([[remote_comment(&scenario.edited_comment)]]).to_string(),
+        "",
+    )?;
+    let recovered = cli.run_with_fake_gh(
+        &gh,
+        ["--json", "recover", "41", "--mode", "restore-exact-copy"],
+    )?;
+    ensure!(!recovered.status.success());
+    let error: Value = serde_json::from_slice(&recovered.stderr)?;
+    assert_eq!(error["error"]["code"], "github_recovery_still_blocked");
+    let calls = gh.calls()?;
+    ensure!(!calls.contains("\tPATCH\trepos/octocat/work-tracker-data/issues/comments/9001"));
+    ensure!(!calls.contains("\tDELETE\trepos/octocat/work-tracker-data/issues/41/lock"));
+    Ok(())
+}
+
+#[test]
 fn doctor_never_offers_exact_recovery_for_unverified_cached_evidence() -> Result<()> {
     let cli = CliHarness::new()?;
     configure_github(&cli)?;
@@ -390,6 +418,76 @@ fn rebaseline_retains_cached_and_observed_edited_variants_as_untrusted() -> Resu
         entries[2]["changes"]["prior_evidence"][1]["variant"],
         "cached_exact_copy"
     );
+    Ok(())
+}
+
+#[test]
+fn rebaseline_retains_markerless_current_and_latched_damaged_variants() -> Result<()> {
+    let cli = CliHarness::new()?;
+    configure_github(&cli)?;
+    let gh = FakeGh::new()?;
+    let original_event = event("Original title");
+    let original_comment = comment(&original_event)?;
+    let projection = projection(&hash(&original_event, 9001)?);
+    let healthy_issue = issue(&projection, "2026-09-23T01:02:04Z", false);
+    let corrupt_issue = issue(&projection, "2026-09-23T02:02:04Z", false);
+    let latched_damaged_body = "first damaged body with no structured marker";
+    let current_damaged_body = "second damaged body with no structured marker";
+    respond_sync(&gh, 1, &healthy_issue, &remote_comment(&original_comment))?;
+    assert_success(&cli.run_with_fake_gh(&gh, ["--json", "show", "41"])?)?;
+    respond_sync(
+        &gh,
+        3,
+        &corrupt_issue,
+        &remote_comment(latched_damaged_body),
+    )?;
+    assert_success(&cli.run_with_fake_gh(&gh, ["--json", "show", "41"])?)?;
+
+    respond_rebaseline(
+        &gh,
+        5,
+        &corrupt_issue,
+        &[remote_comment(current_damaged_body)],
+        &json!([]),
+        "2026-09-23T04:02:03Z",
+    )?;
+    let recovered = cli.run_with_fake_gh(
+        &gh,
+        [
+            "--json",
+            "recover",
+            "41",
+            "--mode",
+            "rebaseline",
+            "--actor",
+            "reviewer-a",
+            "--reason",
+            "reviewed damaged unstructured copy",
+        ],
+    )?;
+    assert_success(&recovered)?;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&recovered.stdout)?["untrusted_event_count"],
+        3
+    );
+    let history = cli.run_with_fake_gh(&gh, ["--offline", "--json", "history", "41"])?;
+    assert_success(&history)?;
+    let entries: Value = serde_json::from_slice(&history.stdout)?;
+    assert_eq!(entries.as_array().map(Vec::len), Some(4));
+    let retained_bodies = entries
+        .as_array()
+        .context("history should be an array")?
+        .iter()
+        .filter_map(|entry| entry["changes"]["retained_body"].as_str())
+        .collect::<Vec<_>>();
+    assert!(retained_bodies.contains(&latched_damaged_body));
+    assert!(retained_bodies.contains(&current_damaged_body));
+    assert!(
+        entries.as_array().unwrap()[..3]
+            .iter()
+            .all(|entry| entry["trust"] == "untrusted")
+    );
+    assert_eq!(entries[3]["kind"], "rebaseline");
     Ok(())
 }
 

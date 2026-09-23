@@ -1464,10 +1464,9 @@ impl GitHubLedger {
             .collect::<Vec<_>>();
         let replayed = replay_history(issue.number, comments).ok();
         for (index, expected) in cached.iter().enumerate() {
-            let observed = structured
+            let observed = comments
                 .iter()
-                .find(|comment| comment.id == expected.comment_id)
-                .copied();
+                .find(|comment| comment.id == expected.comment_id);
             let (kind, observed_copy, observed_hash, github_actor, detail) = match observed {
                 None => (
                     IntegrityBreakKind::DeletedEvent,
@@ -1500,7 +1499,8 @@ impl GitHubLedger {
             let exact_copy_verified = observed.is_some()
                 && cached_exact_chain_is_verified(&cached)
                 && parse_projection(&issue.body)
-                    .is_ok_and(|metadata| cached_chain_matches_projection(&cached, &metadata));
+                    .is_ok_and(|metadata| cached_chain_matches_projection(&cached, &metadata))
+                && exact_chain_preserves_live_archive(issue, &cached);
             let report = IntegrityDoctorReport {
                 work_item_id: issue.number,
                 integrity_health: IntegrityHealth::LedgerIntegrityError,
@@ -2435,6 +2435,13 @@ impl GitHubLedger {
             )
             .into());
         }
+        if !exact_chain_preserves_live_archive(&issue, &cached) {
+            return Err(recovery_still_blocked(
+                issue_number,
+                "the verified history is active but the live GitHub issue is locked; exact recovery cannot discard the conservative archived state",
+            )
+            .into());
+        }
         if !comments.iter().any(|comment| comment.id == comment_id) {
             return Err(recovery_still_blocked(
                 issue_number,
@@ -2531,6 +2538,7 @@ impl GitHubLedger {
                 normalized_required(reason, "reason")
                     .map_err(|error| recovery_still_blocked(issue_number, error))
             })?;
+        let latched_diagnosis = self.cache.github_integrity_report(issue_number)?;
         let (issue, mut metadata) = self.load_work_item_issue(issue_number)?;
         let mut comments = self.load_comments(issue_number)?;
         let timeline = self.load_timeline(issue_number)?;
@@ -2571,20 +2579,20 @@ impl GitHubLedger {
                     .map(|entry| entry.occurred_at),
             })
             .collect::<Vec<_>>();
-        for comment in comments
-            .iter()
-            .filter(|comment| has_metadata(&comment.body, EVENT_MARKER))
-        {
+        for comment in &comments {
             let matching = prior_evidence
                 .iter()
                 .find(|evidence| evidence.github_comment_id == comment.id);
+            if matching.is_none() && !has_metadata(&comment.body, EVENT_MARKER) {
+                continue;
+            }
             if matching.is_some_and(|evidence| evidence.body == comment.body) {
                 continue;
             }
             let parsed = parse_event(&comment.body).ok();
             prior_evidence.push(RetainedRecoveryEvidence {
                 evidence_id: if matching.is_some() {
-                    -comment.id
+                    next_observed_evidence_id(&prior_evidence, comment.id)
                 } else {
                     comment.id
                 },
@@ -2599,6 +2607,52 @@ impl GitHubLedger {
                 body: comment.body.clone(),
                 history_hash: None,
                 occurred_at: Some(comment.created_at),
+            });
+        }
+        if let Some(first_break) = latched_diagnosis
+            .as_ref()
+            .and_then(|diagnosis| diagnosis.first_break.as_ref())
+            && let (Some(comment_id), Some(observed_copy)) = (
+                first_break.github_comment_id,
+                first_break.observed_copy.as_ref(),
+            )
+            && !prior_evidence.iter().any(|evidence| {
+                evidence.github_comment_id == comment_id && evidence.body == *observed_copy
+            })
+        {
+            let parsed = parse_event(observed_copy).ok();
+            let github_actor = first_break
+                .github_actor
+                .clone()
+                .or_else(|| {
+                    prior_evidence
+                        .iter()
+                        .find(|evidence| evidence.github_comment_id == comment_id)
+                        .map(|evidence| evidence.github_actor.clone())
+                })
+                .unwrap_or_else(|| "unknown".to_owned());
+            let occurred_at = comments
+                .iter()
+                .find(|comment| comment.id == comment_id)
+                .map(|comment| comment.created_at)
+                .or_else(|| {
+                    cached_history
+                        .iter()
+                        .find(|entry| entry.id == comment_id)
+                        .map(|entry| entry.occurred_at)
+                });
+            prior_evidence.push(RetainedRecoveryEvidence {
+                evidence_id: next_observed_evidence_id(&prior_evidence, comment_id),
+                github_comment_id: comment_id,
+                variant: "latched_observed_copy".to_owned(),
+                event_id: parsed
+                    .as_ref()
+                    .map(|event| event.event_id.clone())
+                    .or_else(|| first_break.event_id.clone()),
+                github_actor,
+                body: observed_copy.clone(),
+                history_hash: first_break.observed_hash.clone(),
+                occurred_at,
             });
         }
         prior_evidence.sort_by_key(|evidence| (evidence.github_comment_id, evidence.evidence_id));
@@ -3709,6 +3763,40 @@ fn cached_chain_matches_projection(
         && head.comment_id == metadata.head_comment_id.unwrap_or_default()
         && head.event_id.as_deref() == metadata.head_event_id.as_deref()
         && head.history_hash.as_deref() == metadata.history_hash.as_deref()
+}
+
+fn exact_chain_preserves_live_archive(
+    issue: &LedgerIssue,
+    evidence: &[GithubEventEvidence],
+) -> bool {
+    if !issue.locked {
+        return true;
+    }
+    let comments = evidence
+        .iter()
+        .map(|evidence| LedgerComment {
+            id: evidence.comment_id,
+            created_at: Utc::now(),
+            user: User {
+                login: evidence.github_actor.clone(),
+            },
+            body: evidence.body.clone(),
+        })
+        .collect::<Vec<_>>();
+    replay_trusted_history(issue.number, &comments)
+        .and_then(|replayed| materialize_item(issue.number, &replayed.accepted))
+        .is_ok_and(|item| item.status == Status::Archived)
+}
+
+fn next_observed_evidence_id(evidence: &[RetainedRecoveryEvidence], github_comment_id: i64) -> i64 {
+    let mut candidate = -github_comment_id;
+    while evidence
+        .iter()
+        .any(|evidence| evidence.evidence_id == candidate)
+    {
+        candidate -= 1;
+    }
+    candidate
 }
 
 fn hash_part(hasher: &mut Sha256, bytes: &[u8]) {
