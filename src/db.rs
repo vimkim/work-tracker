@@ -7,7 +7,10 @@ use rusqlite::{
 };
 use serde_json::{Map, Value, json};
 
-use crate::domain::{HistoryEntry, Status, WorkItem};
+use crate::{
+    domain::{HistoryEntry, Status, WorkItem},
+    ledger::{Ledger, ListFilter},
+};
 
 const RETENTION_DAYS: i64 = 60;
 
@@ -27,22 +30,11 @@ const STATUS_PRIORITY_ORDER: &str = "CASE status
                updated_at DESC,
                id DESC";
 
-/// Which Work Items `Tracker::list` returns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ListFilter {
-    /// Only Actionable Work Items: pending, active, waiting, or blocked.
-    Actionable,
-    /// Every status, including done and cancelled.
-    All,
-    /// Exactly one status.
-    Status(Status),
-}
-
-pub struct Tracker {
+pub(crate) struct SqliteLedger {
     connection: Connection,
 }
 
-impl Tracker {
+impl SqliteLedger {
     pub fn open(path: &Path) -> Result<Self> {
         let connection = Connection::open(path)
             .with_context(|| format!("failed to open database {}", path.display()))?;
@@ -100,7 +92,19 @@ impl Tracker {
         Self::open(Path::new(":memory:"))
     }
 
-    pub fn create(
+    fn purge_expired(&self, now: DateTime<Utc>) -> Result<usize> {
+        self.connection
+            .execute(
+                "DELETE FROM work_items
+                 WHERE status = 'deleted' AND purge_after <= ?1",
+                params![timestamp(now)],
+            )
+            .map_err(Into::into)
+    }
+}
+
+impl Ledger for SqliteLedger {
+    fn create(
         &mut self,
         title: &str,
         description: Option<&str>,
@@ -139,11 +143,11 @@ impl Tracker {
         self.get(id)
     }
 
-    pub fn get(&self, id: i64) -> Result<WorkItem> {
+    fn get(&self, id: i64) -> Result<WorkItem> {
         get_item(&self.connection, id)?.with_context(|| format!("work item {id} not found"))
     }
 
-    pub fn list(
+    fn list(
         &self,
         filter: ListFilter,
         include_deleted: bool,
@@ -172,7 +176,7 @@ impl Tracker {
             .map_err(Into::into)
     }
 
-    pub fn daily_view(&self, include_deleted: bool) -> Result<Vec<WorkItem>> {
+    fn daily_view(&self, include_deleted: bool) -> Result<Vec<WorkItem>> {
         let (start, end) = local_day_bounds(Utc::now())?;
         let mut statement = self.connection.prepare(&format!(
             "SELECT id, title, description, status, created_at, updated_at, deleted_at, purge_after
@@ -190,7 +194,7 @@ impl Tracker {
             .map_err(Into::into)
     }
 
-    pub fn update(
+    fn update(
         &mut self,
         id: i64,
         title: Option<&str>,
@@ -253,7 +257,7 @@ impl Tracker {
         self.get(id)
     }
 
-    pub fn set_status(
+    fn set_status(
         &mut self,
         id: i64,
         status: Status,
@@ -302,7 +306,7 @@ impl Tracker {
         self.get(id)
     }
 
-    pub fn add_note(&mut self, id: i64, message: &str, actor: &str) -> Result<HistoryEntry> {
+    fn add_note(&mut self, id: i64, message: &str, actor: &str) -> Result<HistoryEntry> {
         let actor = normalized_required(actor, "actor")?;
         let message = normalized_required(message, "message")?;
         let transaction = self
@@ -333,7 +337,7 @@ impl Tracker {
             .context("new history entry not found")
     }
 
-    pub fn history(&self, id: i64) -> Result<Vec<HistoryEntry>> {
+    fn history(&self, id: i64) -> Result<Vec<HistoryEntry>> {
         self.get(id)?;
         let mut statement = self.connection.prepare(
             "SELECT id, work_item_id, kind, actor, note, occurred_at, changes_json
@@ -343,16 +347,6 @@ impl Tracker {
         )?;
         let rows = statement.query_map(params![id], row_to_history)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
-    }
-
-    pub fn purge_expired(&self, now: DateTime<Utc>) -> Result<usize> {
-        self.connection
-            .execute(
-                "DELETE FROM work_items
-                 WHERE status = 'deleted' AND purge_after <= ?1",
-                params![timestamp(now)],
-            )
             .map_err(Into::into)
     }
 }
@@ -520,7 +514,7 @@ mod tests {
 
     #[test]
     fn lifecycle_records_history_and_keeps_deleted_item() -> Result<()> {
-        let mut tracker = Tracker::open_in_memory()?;
+        let mut tracker = SqliteLedger::open_in_memory()?;
         let item = tracker.create(
             "Watch CI",
             Some("Wait for the queued suite"),
@@ -541,7 +535,7 @@ mod tests {
 
     #[test]
     fn repeated_status_is_idempotent() -> Result<()> {
-        let mut tracker = Tracker::open_in_memory()?;
+        let mut tracker = SqliteLedger::open_in_memory()?;
         let item = tracker.create("Compile", None, Status::Active, "agent-a", None)?;
         tracker.set_status(item.id, Status::Active, "agent-b", None)?;
         assert_eq!(tracker.history(item.id)?.len(), 1);
@@ -550,7 +544,7 @@ mod tests {
 
     #[test]
     fn purging_removes_item_and_history_after_retention() -> Result<()> {
-        let mut tracker = Tracker::open_in_memory()?;
+        let mut tracker = SqliteLedger::open_in_memory()?;
         let item = tracker.create("Old work", None, Status::Pending, "human", None)?;
         let deleted = tracker.set_status(item.id, Status::Deleted, "human", None)?;
         let purge_time = deleted.purge_after.context("missing purge time")? + Duration::seconds(1);
@@ -563,7 +557,7 @@ mod tests {
 
     #[test]
     fn update_records_only_real_changes() -> Result<()> {
-        let mut tracker = Tracker::open_in_memory()?;
+        let mut tracker = SqliteLedger::open_in_memory()?;
         let item = tracker.create("Original", None, Status::Pending, "human", None)?;
         tracker.update(
             item.id,
@@ -589,7 +583,7 @@ mod tests {
 
     #[test]
     fn note_preserves_context_without_changing_status() -> Result<()> {
-        let mut tracker = Tracker::open_in_memory()?;
+        let mut tracker = SqliteLedger::open_in_memory()?;
         let item = tracker.create("Wait for CI", None, Status::Waiting, "agent-a", None)?;
         tracker.add_note(item.id, "Queue position 12", "agent-b")?;
 
@@ -604,7 +598,7 @@ mod tests {
 
     #[test]
     fn daily_view_includes_stale_actionable_and_excludes_stale_done() -> Result<()> {
-        let mut tracker = Tracker::open_in_memory()?;
+        let mut tracker = SqliteLedger::open_in_memory()?;
         let actionable = tracker.create("Still blocked", None, Status::Blocked, "agent", None)?;
         let done = tracker.create("Old result", None, Status::Done, "agent", None)?;
         let old = "2020-01-01T00:00:00.000Z";
@@ -621,7 +615,7 @@ mod tests {
 
     #[test]
     fn list_shows_actionable_items_by_default_and_everything_with_all() -> Result<()> {
-        let mut tracker = Tracker::open_in_memory()?;
+        let mut tracker = SqliteLedger::open_in_memory()?;
         for status in [
             Status::Pending,
             Status::Active,
@@ -654,7 +648,7 @@ mod tests {
 
     #[test]
     fn list_orders_by_status_priority_then_recency() -> Result<()> {
-        let mut tracker = Tracker::open_in_memory()?;
+        let mut tracker = SqliteLedger::open_in_memory()?;
         let done = tracker.create("Finished", None, Status::Done, "agent", None)?;
         let older_pending =
             tracker.create("Older pending", None, Status::Pending, "agent", None)?;
@@ -709,13 +703,13 @@ mod tests {
     fn concurrent_connections_do_not_lose_creations() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("tracker.db");
-        Tracker::open(&path)?;
+        SqliteLedger::open(&path)?;
 
         let handles = (0..16)
             .map(|index| {
                 let path = path.clone();
                 std::thread::spawn(move || -> Result<()> {
-                    let mut tracker = Tracker::open(&path)?;
+                    let mut tracker = SqliteLedger::open(&path)?;
                     tracker.create(
                         &format!("Parallel work {index}"),
                         None,
@@ -731,14 +725,14 @@ mod tests {
             handle.join().expect("writer thread panicked")?;
         }
 
-        let tracker = Tracker::open(&path)?;
+        let tracker = SqliteLedger::open(&path)?;
         assert_eq!(tracker.list(ListFilter::All, false, 100)?.len(), 16);
         Ok(())
     }
 
     #[test]
     fn deleting_twice_is_idempotent() -> Result<()> {
-        let mut tracker = Tracker::open_in_memory()?;
+        let mut tracker = SqliteLedger::open_in_memory()?;
         let item = tracker.create("Disposable", None, Status::Pending, "agent", None)?;
         tracker.set_status(item.id, Status::Deleted, "agent", None)?;
         tracker.set_status(item.id, Status::Deleted, "agent", None)?;

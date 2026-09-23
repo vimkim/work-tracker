@@ -1,5 +1,6 @@
 pub mod cli;
-pub mod db;
+mod db;
 pub mod domain;
+pub mod ledger;
 pub mod output;
 pub mod web;

@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf};
+use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
 use axum::{
@@ -10,20 +10,20 @@ use axum::{
 };
 use chrono::Local;
 
-use crate::{db::Tracker, domain::WorkItem};
+use crate::{domain::WorkItem, ledger::LedgerConfig};
 
 #[derive(Clone)]
 struct AppState {
-    database: PathBuf,
+    ledger: LedgerConfig,
 }
 
 type WebResult = Result<Html<String>, (StatusCode, Html<String>)>;
 
-pub async fn serve(database: PathBuf, bind: &str) -> Result<()> {
+pub async fn serve(ledger: LedgerConfig, bind: &str) -> Result<()> {
     let address: SocketAddr = bind
         .parse()
         .with_context(|| format!("invalid bind address: {bind}"))?;
-    let app = router(database);
+    let app = router(ledger);
     let listener = tokio::net::TcpListener::bind(address)
         .await
         .with_context(|| format!("failed to bind {address}"))?;
@@ -32,16 +32,16 @@ pub async fn serve(database: PathBuf, bind: &str) -> Result<()> {
     Ok(())
 }
 
-fn router(database: PathBuf) -> Router {
+fn router(ledger: LedgerConfig) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/items/{id}", get(show_item))
-        .with_state(AppState { database })
+        .with_state(AppState { ledger })
 }
 
 async fn index(State(state): State<AppState>) -> WebResult {
-    let tracker = Tracker::open(&state.database).map_err(internal_error)?;
-    let items = tracker.daily_view(false).map_err(internal_error)?;
+    let ledger = state.ledger.open().map_err(internal_error)?;
+    let items = ledger.daily_view(false).map_err(internal_error)?;
     let cards = if items.is_empty() {
         "<p class=\"empty\">No work items in the daily view.</p>".to_owned()
     } else {
@@ -57,8 +57,8 @@ async fn index(State(state): State<AppState>) -> WebResult {
 }
 
 async fn show_item(State(state): State<AppState>, Path(id): Path<i64>) -> WebResult {
-    let tracker = Tracker::open(&state.database).map_err(internal_error)?;
-    let item = match tracker.get(id) {
+    let ledger = state.ledger.open().map_err(internal_error)?;
+    let item = match ledger.get(id) {
         Ok(item) => item,
         Err(_) => {
             return Err((
@@ -70,7 +70,7 @@ async fn show_item(State(state): State<AppState>, Path(id): Path<i64>) -> WebRes
             ));
         }
     };
-    let history = tracker.history(id).map_err(internal_error)?;
+    let history = ledger.history(id).map_err(internal_error)?;
     let description = item
         .description
         .as_deref()
@@ -164,6 +164,13 @@ const CSS: &str = r#"
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        body::{Body, to_bytes},
+        http::Request,
+    };
+    use tower::ServiceExt;
+
+    use crate::domain::Status;
 
     #[test]
     fn html_escape_handles_markup_and_quotes() {
@@ -171,5 +178,43 @@ mod tests {
             escape("<script a='b'>&\"</script>"),
             "&lt;script a=&#39;b&#39;&gt;&amp;&quot;&lt;/script&gt;"
         );
+    }
+
+    #[tokio::test]
+    async fn dashboard_routes_read_through_the_ledger() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let config = LedgerConfig::sqlite(directory.path().join("tracker.db"));
+        let mut ledger = config.open()?;
+        let item = ledger.create(
+            "Watch <CI>",
+            Some("Wait for the queued suite"),
+            Status::Waiting,
+            "agent-a",
+            Some("Queue position 12"),
+        )?;
+        drop(ledger);
+
+        let app = router(config);
+        let index = app
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty())?)
+            .await?;
+        assert_eq!(index.status(), StatusCode::OK);
+        let index_body = to_bytes(index.into_body(), usize::MAX).await?;
+        let index_body = String::from_utf8(index_body.to_vec())?;
+        assert!(index_body.contains("Watch &lt;CI&gt;"));
+
+        let detail = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/items/{}", item.id))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(detail.status(), StatusCode::OK);
+        let detail_body = to_bytes(detail.into_body(), usize::MAX).await?;
+        let detail_body = String::from_utf8(detail_body.to_vec())?;
+        assert!(detail_body.contains("Queue position 12"));
+        Ok(())
     }
 }

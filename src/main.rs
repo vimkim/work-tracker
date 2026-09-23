@@ -5,8 +5,8 @@ use clap::Parser;
 use serde_json::json;
 use work_tracker::{
     cli::{self, Cli, Command, ListArgs},
-    db::{ListFilter, Tracker},
     domain::Status,
+    ledger::{LedgerConfig, ListFilter},
     output, web,
 };
 
@@ -30,10 +30,11 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> Result<()> {
     let database = cli::database_path(cli.database)?;
     cli::prepare_database_path(&database)?;
+    let ledger_config = LedgerConfig::sqlite(&database);
 
     if let Command::Serve(args) = &cli.command {
-        Tracker::open(&database)?;
-        return web::serve(database, &args.bind).await;
+        ledger_config.open()?;
+        return web::serve(ledger_config, &args.bind).await;
     }
     if matches!(cli.command, Command::Path) {
         if cli.json {
@@ -43,10 +44,10 @@ async fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
-    let mut tracker = Tracker::open(&database)?;
+    let mut ledger = ledger_config.open()?;
     match cli.command {
         Command::Add(args) => {
-            let item = tracker.create(
+            let item = ledger.create(
                 &args.title,
                 args.description.as_deref(),
                 args.status,
@@ -55,10 +56,10 @@ async fn run(cli: Cli) -> Result<()> {
             )?;
             show_item(&item, cli.json)
         }
-        Command::Show(args) => show_item(&tracker.get(args.id)?, cli.json),
+        Command::Show(args) => show_item(&ledger.get(args.id)?, cli.json),
         Command::List(args) => {
             let filter = list_filter(&args);
-            let items = tracker.list(filter, args.include_deleted, args.limit)?;
+            let items = ledger.list(filter, args.include_deleted, args.limit)?;
             if cli.json {
                 output::print_json(&items)
             } else if filter == ListFilter::Actionable {
@@ -70,7 +71,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Today(args) => {
-            let items = tracker.daily_view(args.include_deleted)?;
+            let items = ledger.daily_view(args.include_deleted)?;
             show_items(&items, cli.json)
         }
         Command::Update(args) => {
@@ -79,7 +80,7 @@ async fn run(cli: Cli) -> Result<()> {
             } else {
                 args.description.as_deref().map(Some)
             };
-            let item = tracker.update(
+            let item = ledger.update(
                 args.id,
                 args.title.as_deref(),
                 description,
@@ -89,7 +90,7 @@ async fn run(cli: Cli) -> Result<()> {
             show_item(&item, cli.json)
         }
         Command::Status(args) => {
-            let item = tracker.set_status(
+            let item = ledger.set_status(
                 args.id,
                 args.status,
                 &args.actor.resolved(),
@@ -98,7 +99,7 @@ async fn run(cli: Cli) -> Result<()> {
             show_item(&item, cli.json)
         }
         Command::Note(args) => {
-            let entry = tracker.add_note(args.id, &args.message, &args.actor.resolved())?;
+            let entry = ledger.add_note(args.id, &args.message, &args.actor.resolved())?;
             if cli.json {
                 output::print_json(&entry)
             } else {
@@ -107,7 +108,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Delete(args) => {
-            let item = tracker.set_status(
+            let item = ledger.set_status(
                 args.id,
                 Status::Deleted,
                 &args.actor.resolved(),
@@ -116,7 +117,7 @@ async fn run(cli: Cli) -> Result<()> {
             show_item(&item, cli.json)
         }
         Command::History(args) => {
-            let entries = tracker.history(args.id)?;
+            let entries = ledger.history(args.id)?;
             if cli.json {
                 output::print_json(&entries)
             } else {
