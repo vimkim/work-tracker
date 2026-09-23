@@ -95,7 +95,12 @@ fn exact_recovery_failure_stays_latched_and_reports_failed_validation() -> Resul
     )?;
     ensure!(!recovered.status.success());
     let error: Value = serde_json::from_slice(&recovered.stderr)?;
-    assert_eq!(error["error"]["code"], "github_recovery_validation_failed");
+    assert_eq!(
+        error["error"]["code"],
+        "github_recovery_validation_failed",
+        "{}",
+        stderr(&recovered)?
+    );
     assert_eq!(error["error"]["outcome"], "failed_validation");
 
     let shown = cli.run_with_fake_gh(&gh, ["--offline", "--json", "show", "41"])?;
@@ -132,6 +137,46 @@ fn exact_recovery_refuses_to_unlock_a_live_locked_work_item() -> Result<()> {
     let calls = gh.calls()?;
     ensure!(!calls.contains("\tPATCH\trepos/octocat/work-tracker-data/issues/comments/9001"));
     ensure!(!calls.contains("\tDELETE\trepos/octocat/work-tracker-data/issues/41/lock"));
+    Ok(())
+}
+
+#[test]
+fn exact_recovery_refuses_a_lock_added_after_the_comment_restore() -> Result<()> {
+    let cli = CliHarness::new()?;
+    configure_github(&cli)?;
+    let gh = FakeGh::new()?;
+    let scenario = seed_edited_integrity(&cli, &gh)?;
+    let mut locked_issue = scenario.corrupt_issue.clone();
+    locked_issue["locked"] = json!(true);
+    gh.respond(5, 0, &scenario.corrupt_issue.to_string(), "")?;
+    gh.respond(
+        6,
+        0,
+        &json!([[remote_comment(&scenario.edited_comment)]]).to_string(),
+        "",
+    )?;
+    gh.respond(7, 0, "", "")?;
+    gh.respond(8, 0, &locked_issue.to_string(), "")?;
+    gh.respond(
+        9,
+        0,
+        &json!([[remote_comment(&scenario.original_comment)]]).to_string(),
+        "",
+    )?;
+    gh.respond(10, 0, "", "")?;
+    gh.respond(11, 0, "", "")?;
+
+    let recovered = cli.run_with_fake_gh(
+        &gh,
+        ["--json", "recover", "41", "--mode", "restore-exact-copy"],
+    )?;
+    ensure!(!recovered.status.success());
+    let error: Value = serde_json::from_slice(&recovered.stderr)?;
+    assert_eq!(error["error"]["code"], "github_recovery_validation_failed");
+    ensure!(
+        !gh.calls()?
+            .contains("\tDELETE\trepos/octocat/work-tracker-data/issues/41/lock")
+    );
     Ok(())
 }
 
@@ -759,10 +804,183 @@ fn rebaseline_rejects_a_lock_change_during_publication() -> Result<()> {
     )?;
     ensure!(!recovered.status.success());
     let error: Value = serde_json::from_slice(&recovered.stderr)?;
-    assert_eq!(error["error"]["code"], "github_recovery_validation_failed");
+    assert_eq!(
+        error["error"]["code"],
+        "github_recovery_validation_failed",
+        "{}",
+        stderr(&recovered)?
+    );
     let calls = gh.calls()?;
     ensure!(!calls.contains("\tPATCH\trepos/octocat/work-tracker-data/issues/41"));
     ensure!(!calls.contains("\tDELETE\trepos/octocat/work-tracker-data/issues/41/lock"));
+    Ok(())
+}
+
+#[test]
+fn rebaseline_rejects_a_lock_change_after_its_first_authoritative_reload() -> Result<()> {
+    let cli = CliHarness::new()?;
+    configure_github(&cli)?;
+    let gh = FakeGh::new()?;
+    let original_event = event("Original title");
+    let original_comment = comment(&original_event)?;
+    let invalid_projection = projection("disconnected-projection-head");
+    let mut locked_issue = issue(&invalid_projection, "2026-09-23T01:02:04Z", true);
+    locked_issue["labels"] = json!([
+        {"name": "work-tracker:item"},
+        {"name": "work-tracker:status:archived"}
+    ]);
+    let mut unlocked_issue = locked_issue.clone();
+    unlocked_issue["locked"] = json!(false);
+    respond_rebaseline_attempt_with_final(
+        &gh,
+        1,
+        &locked_issue,
+        &[remote_comment(&original_comment)],
+        &json!([]),
+        9100,
+        "2026-09-23T04:02:03Z",
+        &locked_issue,
+        &[remote_comment(&original_comment)],
+        &unlocked_issue,
+        &[remote_comment(&original_comment)],
+    )?;
+
+    let recovered = cli.run_with_fake_gh(
+        &gh,
+        [
+            "--json",
+            "recover",
+            "41",
+            "--mode",
+            "rebaseline",
+            "--actor",
+            "reviewer-a",
+            "--reason",
+            "reviewed archived state",
+        ],
+    )?;
+    ensure!(!recovered.status.success());
+    let error: Value = serde_json::from_slice(&recovered.stderr)?;
+    assert_eq!(
+        error["error"]["code"],
+        "github_recovery_validation_failed",
+        "{}",
+        stderr(&recovered)?
+    );
+    let calls = gh.calls()?;
+    ensure!(!calls.contains("\tPATCH\trepos/octocat/work-tracker-data/issues/41"));
+    ensure!(!calls.contains("\tDELETE\trepos/octocat/work-tracker-data/issues/41/lock"));
+    Ok(())
+}
+
+#[test]
+fn rebaseline_retry_retains_an_uncached_interior_body_that_lost_its_marker() -> Result<()> {
+    let cli = CliHarness::new()?;
+    configure_github(&cli)?;
+    let gh = FakeGh::new()?;
+    let original_event = event("Original title");
+    let original_comment = comment(&original_event)?;
+    let interior_body =
+        "damaged interior body\n\n<!-- work-tracker:event\nnot valid event JSON\n-->";
+    let markerless_body = "raced interior body with its event marker removed";
+    let projection = projection(&hash(&original_event, 9001)?);
+    let healthy_issue = issue(&projection, "2026-09-23T01:02:04Z", false);
+    let corrupt_issue = issue(&projection, "2026-09-23T02:02:04Z", false);
+    respond_sync(&gh, 1, &healthy_issue, &remote_comment(&original_comment))?;
+    assert_success(&cli.run_with_fake_gh(&gh, ["--json", "show", "41"])?)?;
+    let interior_comment = remote_comment_with_id(9050, interior_body);
+    let markerless_comment = remote_comment_with_id(9050, markerless_body);
+    respond_rebaseline_attempt(
+        &gh,
+        3,
+        &corrupt_issue,
+        &[remote_comment(&original_comment), interior_comment],
+        &json!([]),
+        9100,
+        "2026-09-23T04:02:03Z",
+        &corrupt_issue,
+        &[
+            remote_comment(&original_comment),
+            markerless_comment.clone(),
+        ],
+    )?;
+    let raced = cli.run_with_fake_gh(
+        &gh,
+        [
+            "--json",
+            "recover",
+            "41",
+            "--mode",
+            "rebaseline",
+            "--actor",
+            "reviewer-a",
+            "--reason",
+            "first interior review",
+        ],
+    )?;
+    ensure!(!raced.status.success());
+    let race_calls = gh.calls()?;
+    ensure!(
+        race_calls.contains("body=Work Tracker History Entry: rebaseline"),
+        "Rebaseline was not published\nstderr:\n{}\ncalls:\n{}",
+        stderr(&raced)?,
+        race_calls
+    );
+    let first_anchor_body = last_published_rebaseline_body(&race_calls)?;
+    let first_anchor = json!({
+        "id": 9100,
+        "created_at": "2026-09-23T04:02:03Z",
+        "user": {"login": "octocat"},
+        "body": first_anchor_body
+    });
+    let retry_comments = vec![
+        remote_comment(&original_comment),
+        markerless_comment,
+        first_anchor,
+    ];
+    respond_rebaseline_attempt(
+        &gh,
+        10,
+        &corrupt_issue,
+        &retry_comments,
+        &json!([]),
+        9200,
+        "2026-09-23T04:03:03Z",
+        &corrupt_issue,
+        &retry_comments,
+    )?;
+    let recovered = cli.run_with_fake_gh(
+        &gh,
+        [
+            "--json",
+            "recover",
+            "41",
+            "--mode",
+            "rebaseline",
+            "--actor",
+            "reviewer-a",
+            "--reason",
+            "reviewed raced markerless interior",
+        ],
+    )?;
+    assert_success(&recovered)?;
+    let history = cli.run_with_fake_gh(&gh, ["--offline", "--json", "history", "41"])?;
+    assert_success(&history)?;
+    let entries: Value = serde_json::from_slice(&history.stdout)?;
+    assert!(
+        entries
+            .as_array()
+            .context("history should be an array")?
+            .iter()
+            .any(|entry| entry["changes"]["retained_body"] == markerless_body)
+    );
+    assert!(entries.as_array().unwrap().iter().any(|entry| {
+        entry["kind"] == "rebaseline"
+            && entry["trust"] == "untrusted"
+            && entry["changes"]["prior_evidence"]
+                .as_array()
+                .is_some_and(|evidence| evidence.iter().any(|item| item["body"] == interior_body))
+    }));
     Ok(())
 }
 
@@ -850,8 +1068,12 @@ fn issue(body: &str, updated_at: &str, locked: bool) -> Value {
 }
 
 fn remote_comment(body: &str) -> Value {
+    remote_comment_with_id(9001, body)
+}
+
+fn remote_comment_with_id(id: i64, body: &str) -> Value {
     json!({
-        "id": 9001,
+        "id": id,
         "created_at": "2026-09-23T01:02:03Z",
         "user": {"login": "octocat"},
         "body": body
@@ -916,6 +1138,35 @@ fn respond_rebaseline_attempt(
     reloaded_issue: &Value,
     reloaded_comments: &[Value],
 ) -> Result<()> {
+    respond_rebaseline_attempt_with_final(
+        gh,
+        start,
+        issue,
+        comments,
+        timeline,
+        anchor_id,
+        created_at,
+        reloaded_issue,
+        reloaded_comments,
+        reloaded_issue,
+        reloaded_comments,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn respond_rebaseline_attempt_with_final(
+    gh: &FakeGh,
+    start: usize,
+    issue: &Value,
+    comments: &[Value],
+    timeline: &Value,
+    anchor_id: i64,
+    created_at: &str,
+    reloaded_issue: &Value,
+    reloaded_comments: &[Value],
+    final_issue: &Value,
+    final_comments: &[Value],
+) -> Result<()> {
     gh.respond(start, 0, &issue.to_string(), "")?;
     gh.respond(start + 1, 0, &json!([comments]).to_string(), "")?;
     gh.respond(start + 2, 0, &json!([timeline]).to_string(), "")?;
@@ -945,7 +1196,21 @@ fn respond_rebaseline_attempt(
         &json!([authoritative_comments]).to_string(),
         "",
     )?;
-    gh.respond(start + 7, 0, "", "")?;
+    gh.respond(start + 7, 0, &final_issue.to_string(), "")?;
+    let mut final_authoritative_comments = final_comments.to_vec();
+    final_authoritative_comments.push(json!({
+        "id": anchor_id,
+        "created_at": created_at,
+        "user": {"login": "octocat"},
+        "body": "{{LAST_REQUEST_BODY}}"
+    }));
+    gh.respond(
+        start + 8,
+        0,
+        &json!([final_authoritative_comments]).to_string(),
+        "",
+    )?;
+    gh.respond(start + 9, 0, "", "")?;
     Ok(())
 }
 

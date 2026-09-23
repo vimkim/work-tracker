@@ -233,6 +233,16 @@ pub struct IntegrityDoctorReport {
     pub untrusted_event_count: usize,
     pub timeline_evidence: Vec<Value>,
     pub eligible_repair_modes: Vec<RepairMode>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observed_evidence: Vec<ObservedIntegrityEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservedIntegrityEvidence {
+    pub github_comment_id: i64,
+    pub github_actor: String,
+    pub body: String,
+    pub observed_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
