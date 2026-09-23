@@ -75,6 +75,7 @@ async fn run(cli: Cli) -> Result<()> {
                 | Command::List(_)
                 | Command::Today(_)
                 | Command::Update(_)
+                | Command::Status(_)
                 | Command::Note(_)
                 | Command::History(_)
                 | Command::Rejected(_)

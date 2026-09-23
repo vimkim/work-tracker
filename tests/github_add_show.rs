@@ -184,7 +184,7 @@ fn github_backend_still_rejects_mutations_outside_the_completed_tracer_slices() 
     let gh = FakeGh::new()?;
     initialize(&cli, &gh)?;
 
-    let unsupported = cli.run(["--json", "status", "41", "done"])?;
+    let unsupported = cli.run(["--json", "archive", "41"])?;
     ensure!(!unsupported.status.success());
     assert_eq!(stdout(&unsupported)?, "");
     let diagnostic = json_from_stderr(&unsupported)?;
