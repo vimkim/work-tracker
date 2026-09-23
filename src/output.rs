@@ -82,6 +82,11 @@ pub fn print_history(entries: &[HistoryEntry]) {
         return;
     }
     for entry in entries {
+        let attribution = entry
+            .github_actor
+            .as_deref()
+            .map(|github_actor| format!("{} (GitHub: {github_actor})", entry.actor))
+            .unwrap_or_else(|| entry.actor.clone());
         println!(
             "{}  {:<14} by {}",
             entry
@@ -89,13 +94,22 @@ pub fn print_history(entries: &[HistoryEntry]) {
                 .with_timezone(&Local)
                 .format("%Y-%m-%d %H:%M:%S %:z"),
             entry.kind,
-            entry.actor
+            attribution
         );
+        if let Some(event_id) = &entry.event_id {
+            println!("  Event: {event_id}");
+        }
         if let Some(note) = &entry.note {
             println!("  Note: {note}");
         }
         if entry.changes != serde_json::json!({}) {
             println!("  Changes: {}", entry.changes);
+        }
+        if let Some(state_revision) = entry.state_revision {
+            println!("  State revision: {state_revision}");
+        }
+        if let Some(history_hash) = &entry.history_hash {
+            println!("  History hash: {history_hash}");
         }
     }
 }

@@ -61,9 +61,15 @@ pub trait Ledger: Send {
         note: Option<&str>,
     ) -> Result<WorkItem>;
 
-    fn add_note(&mut self, id: i64, message: &str, actor: &str) -> Result<HistoryEntry>;
+    fn add_note(
+        &mut self,
+        id: i64,
+        message: &str,
+        actor: &str,
+        event_id: Option<&str>,
+    ) -> Result<HistoryEntry>;
 
-    fn history(&self, id: i64) -> Result<Vec<HistoryEntry>>;
+    fn history(&mut self, id: i64) -> Result<Vec<HistoryEntry>>;
 }
 
 /// Backend configuration shared by CLI dispatch and dashboard handlers.

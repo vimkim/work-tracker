@@ -57,7 +57,7 @@ async fn index(State(state): State<AppState>) -> WebResult {
 }
 
 async fn show_item(State(state): State<AppState>, Path(id): Path<i64>) -> WebResult {
-    let ledger = state.ledger.open().map_err(internal_error)?;
+    let mut ledger = state.ledger.open().map_err(internal_error)?;
     let item = match ledger.get(id) {
         Ok(item) => item,
         Err(_) => {

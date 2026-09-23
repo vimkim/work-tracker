@@ -99,11 +99,21 @@ pub struct WorkItem {
 pub struct HistoryEntry {
     pub id: i64,
     pub work_item_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
     pub kind: String,
     pub actor: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub github_actor: Option<String>,
     pub note: Option<String>,
     pub occurred_at: DateTime<Utc>,
     pub changes: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_history_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub history_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_revision: Option<u64>,
 }
 
 #[cfg(test)]

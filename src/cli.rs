@@ -199,6 +199,10 @@ pub struct NoteArgs {
     pub id: i64,
     pub message: String,
 
+    /// Stable mutation identity for safely retrying an uncertain publication.
+    #[arg(long)]
+    pub event_id: Option<String>,
+
     #[command(flatten)]
     pub actor: ActorArgs,
 }

@@ -78,6 +78,7 @@ async fn run(cli: Cli) -> Result<()> {
                 | Command::Show(_)
                 | Command::List(_)
                 | Command::Today(_)
+                | Command::Note(_)
                 | Command::History(_)
         )
     {
@@ -143,7 +144,12 @@ async fn run(cli: Cli) -> Result<()> {
             show_item(&item, cli.json)
         }
         Command::Note(args) => {
-            let entry = ledger.add_note(args.id, &args.message, &args.actor.resolved())?;
+            let entry = ledger.add_note(
+                args.id,
+                &args.message,
+                &args.actor.resolved(),
+                args.event_id.as_deref(),
+            )?;
             if cli.json {
                 output::print_json(&entry)
             } else {

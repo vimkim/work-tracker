@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
@@ -242,10 +243,29 @@ struct ProjectionMetadata {
     pending_genesis_event_id: Option<String>,
     genesis_comment_id: Option<i64>,
     state_revision: u64,
+    #[serde(default)]
+    head_event_id: Option<String>,
+    #[serde(default)]
+    head_comment_id: Option<i64>,
+    #[serde(default)]
+    history_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct GenesisEvent {
+#[serde(deny_unknown_fields)]
+struct CanonicalEvent {
+    schema_version: u32,
+    event_id: String,
+    kind: String,
+    actor: String,
+    github_actor: String,
+    note: Option<String>,
+    changes: Value,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyGenesisEvent {
     schema_version: u32,
     event_id: String,
     kind: String,
@@ -256,7 +276,8 @@ struct GenesisEvent {
     occurred_at_source: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GenesisValues {
     title: String,
     description: Option<String>,
@@ -355,12 +376,12 @@ impl GitHubLedger {
                     .begin_github_creation(&request_json, &metadata.event_id)?;
                 (metadata.event_id, Some(issue.number), true, Some(issue))
             } else {
-                let event_id = new_event_id();
+                let event_id = new_event_id("genesis");
                 self.cache.begin_github_creation(&request_json, &event_id)?;
                 (event_id, None, false, None)
             }
         } else {
-            let event_id = new_event_id();
+            let event_id = new_event_id("genesis");
             self.cache.begin_github_creation(&request_json, &event_id)?;
             (event_id, None, false, None)
         };
@@ -372,6 +393,9 @@ impl GitHubLedger {
             pending_genesis_event_id: Some(event_id.clone()),
             genesis_comment_id: None,
             state_revision: 0,
+            head_event_id: None,
+            head_comment_id: None,
+            history_hash: None,
         };
         let pending_body = projection_body(description.as_deref(), &pending_metadata)?;
 
@@ -390,19 +414,18 @@ impl GitHubLedger {
         self.cache
             .remember_github_issue(&request_json, issue.number)?;
 
-        let event = GenesisEvent {
+        let event = CanonicalEvent {
             schema_version: 1,
             event_id: event_id.clone(),
             kind: "created".to_owned(),
             actor: actor.clone(),
             github_actor,
             note: note.clone(),
-            initial_values: GenesisValues {
-                title: title.clone(),
-                description: description.clone(),
-                status,
-            },
-            occurred_at_source: "github_comment.created_at".to_owned(),
+            changes: json!({
+                "title": title.clone(),
+                "description": description.clone(),
+                "status": status,
+            }),
         };
         let comment = if retrying {
             self.find_genesis_comment(issue.number, &event)?
@@ -422,14 +445,18 @@ impl GitHubLedger {
             }
         }
 
+        let history_hash = history_hash(None, &event, comment.id)?;
         let completed_metadata = ProjectionMetadata {
             schema_version: 1,
             kind: "work_item".to_owned(),
-            event_id,
+            event_id: event_id.clone(),
             creation_fingerprint,
             pending_genesis_event_id: None,
             genesis_comment_id: Some(comment.id),
             state_revision: 1,
+            head_event_id: Some(event_id.clone()),
+            head_comment_id: Some(comment.id),
+            history_hash: Some(history_hash.clone()),
         };
         let completed_body = projection_body(description.as_deref(), &completed_metadata)?;
         let status_label = format!("work-tracker:status:{}", status.as_str());
@@ -461,7 +488,31 @@ impl GitHubLedger {
             &fields,
         )?;
 
-        let (item, history) = materialize_genesis(issue.number, &event, &comment);
+        let item = WorkItem {
+            id: issue.number,
+            title: title.clone(),
+            description: description.clone(),
+            status,
+            created_at: comment.created_at,
+            updated_at: comment.created_at,
+            archived_at: None,
+            deleted_at: None,
+            purge_after: None,
+        };
+        let history = HistoryEntry {
+            id: comment.id,
+            work_item_id: issue.number,
+            event_id: Some(event_id),
+            kind: "created".to_owned(),
+            actor,
+            github_actor: Some(event.github_actor),
+            note,
+            occurred_at: comment.created_at,
+            changes: event.changes,
+            previous_history_hash: None,
+            history_hash: Some(history_hash),
+            state_revision: Some(1),
+        };
         self.cache
             .finish_github_creation(&request_json, &item, &history)?;
         Ok(item)
@@ -490,6 +541,7 @@ impl GitHubLedger {
             ConditionalResult::Modified { values, etag } => (values, etag),
         };
         let mut synchronized = Vec::new();
+        let mut projection_updates = Vec::new();
         let mut removed_item_ids = Vec::new();
         let mut cursor = None;
         for issue in issues {
@@ -529,9 +581,6 @@ impl GitHubLedger {
             if metadata.pending_genesis_event_id.is_some() {
                 continue;
             }
-            let comment_id = metadata
-                .genesis_comment_id
-                .ok_or_else(|| metadata_collision(issue.number))?;
             let comments: Vec<LedgerComment> = self.github.api_paginated_json(
                 "GET",
                 &format!(
@@ -539,23 +588,23 @@ impl GitHubLedger {
                     self.repository, issue.number
                 ),
             )?;
-            let comment = comments
-                .into_iter()
-                .find(|comment| comment.id == comment_id)
-                .ok_or_else(|| metadata_collision(issue.number))?;
-            let event = parse_event(&comment.body).map_err(|_| metadata_collision(issue.number))?;
-            if event.schema_version != 1
-                || event.kind != "created"
-                || event.event_id != metadata.event_id
-                || event.github_actor != comment.user.login
-                || event.occurred_at_source != "github_comment.created_at"
-            {
-                return Err(metadata_collision(issue.number).into());
+            let history = replay_trusted_history(issue.number, &comments)?;
+            let legacy_genesis = self.cache.legacy_github_genesis_evidence(issue.number)?;
+            let projection_needs_update = projection_head_needs_update(
+                issue.number,
+                &metadata,
+                &history,
+                legacy_genesis.as_ref(),
+            )?;
+            let item = materialize_item(issue.number, &history)?;
+            validate_status_label(&issue, item.status)?;
+            if projection_needs_update {
+                projection_updates.push((issue, metadata, history.clone()));
             }
-            validate_status_label(&issue, event.initial_values.status)?;
-
-            let (item, history) = materialize_genesis(issue.number, &event, &comment);
             synchronized.push((item, history));
+        }
+        for (issue, metadata, history) in projection_updates {
+            self.project_history_head(&issue, metadata, &history)?;
         }
         let advanced = cursor.is_some_and(|cursor| previous_cursor.is_none_or(|old| cursor > old));
         self.cache.replace_github_cache_batch(
@@ -671,7 +720,7 @@ impl GitHubLedger {
     fn find_genesis_comment(
         &self,
         issue_number: i64,
-        expected: &GenesisEvent,
+        expected: &CanonicalEvent,
     ) -> Result<Option<LedgerComment>> {
         let comments: Vec<LedgerComment> = self.github.api_paginated_json(
             "GET",
@@ -682,7 +731,7 @@ impl GitHubLedger {
         )?;
         let mut found = None;
         for comment in comments {
-            if !comment.body.contains(EVENT_MARKER) {
+            if !has_metadata(&comment.body, EVENT_MARKER) {
                 continue;
             }
             let event = parse_event(&comment.body).map_err(|_| {
@@ -720,12 +769,8 @@ impl GitHubLedger {
         Ok(found)
     }
 
-    fn publish_genesis(&self, issue_number: i64, event: &GenesisEvent) -> Result<LedgerComment> {
-        let body = format!(
-            "Work Tracker History Entry: created by {}\n\n<!-- {EVENT_MARKER}\n{}\n-->",
-            event.actor,
-            serde_json::to_string(event)?
-        );
+    fn publish_genesis(&self, issue_number: i64, event: &CanonicalEvent) -> Result<LedgerComment> {
+        let body = event_comment_body(event)?;
         let comment: LedgerComment = self.github.api_json(
             "POST",
             &format!("repos/{}/issues/{issue_number}/comments", self.repository),
@@ -742,6 +787,110 @@ impl GitHubLedger {
             .into());
         }
         Ok(comment)
+    }
+
+    fn load_work_item_issue(&self, issue_number: i64) -> Result<(LedgerIssue, ProjectionMetadata)> {
+        let issue: LedgerIssue = self.github.api_json(
+            "GET",
+            &format!("repos/{}/issues/{issue_number}", self.repository),
+            &[],
+        )?;
+        let metadata = validate_completed_issue(&issue)?;
+        Ok((issue, metadata))
+    }
+
+    fn load_comments(&self, issue_number: i64) -> Result<Vec<LedgerComment>> {
+        self.github.api_paginated_json(
+            "GET",
+            &format!(
+                "repos/{}/issues/{issue_number}/comments?per_page=100",
+                self.repository
+            ),
+        )
+    }
+
+    fn project_history_head(
+        &self,
+        issue: &LedgerIssue,
+        mut metadata: ProjectionMetadata,
+        history: &[HistoryEntry],
+    ) -> Result<()> {
+        let head = history
+            .last()
+            .context("Work Tracker history has no genesis entry")?;
+        metadata.head_event_id = head.event_id.clone();
+        metadata.head_comment_id = Some(head.id);
+        metadata.history_hash = head.history_hash.clone();
+        let visible = projection_visible_text(&issue.body)?;
+        let body = projection_body(Some(visible), &metadata)?;
+        self.github.api_empty(
+            "PATCH",
+            &format!("repos/{}/issues/{}", self.repository, issue.number),
+            &[("body", body.as_str())],
+        )
+    }
+
+    fn append_note(
+        &mut self,
+        issue_number: i64,
+        message: &str,
+        actor: &str,
+        requested_event_id: Option<&str>,
+    ) -> Result<HistoryEntry> {
+        let message = normalized_required(message, "message")?;
+        let actor = normalized_required(actor, "actor")?;
+        let event_id = requested_event_id
+            .map(|value| normalized_required(value, "event ID"))
+            .transpose()?
+            .unwrap_or_else(|| new_event_id("note"));
+        let github_actor = self.github.authenticated_user()?;
+        let (issue, metadata) = self.load_work_item_issue(issue_number)?;
+        if status_from_issue(&issue)? == Status::Archived {
+            bail!("work item {issue_number} is archived and cannot be modified");
+        }
+        let comments = self.load_comments(issue_number)?;
+        let history = replay_trusted_history(issue_number, &comments)?;
+        let legacy_genesis = self.cache.legacy_github_genesis_evidence(issue_number)?;
+        projection_head_needs_update(issue_number, &metadata, &history, legacy_genesis.as_ref())?;
+        let event = CanonicalEvent {
+            schema_version: 1,
+            event_id: event_id.clone(),
+            kind: "noted".to_owned(),
+            actor,
+            github_actor,
+            note: Some(message),
+            changes: json!({}),
+        };
+        if let Some(existing) = history
+            .iter()
+            .find(|entry| entry.event_id.as_deref() == Some(event_id.as_str()))
+        {
+            validate_retry(existing, &event)?;
+            self.project_history_head(&issue, metadata, &history)?;
+            self.cache.replace_github_history(issue_number, &history)?;
+            return Ok(existing.clone());
+        }
+
+        let body = event_comment_body(&event)?;
+        let comment: LedgerComment = self.github.api_json(
+            "POST",
+            &format!("repos/{}/issues/{issue_number}/comments", self.repository),
+            &[("body", body.as_str())],
+        )?;
+        if comment.user.login != event.github_actor {
+            return Err(metadata_collision(issue_number).into());
+        }
+        let comments = self.load_comments(issue_number)?;
+        let history = replay_trusted_history(issue_number, &comments)?;
+        projection_head_needs_update(issue_number, &metadata, &history, legacy_genesis.as_ref())?;
+        let entry = history
+            .iter()
+            .find(|entry| entry.event_id.as_deref() == Some(event_id.as_str()))
+            .cloned()
+            .context("published note was not reconstructed from GitHub")?;
+        self.project_history_head(&issue, metadata, &history)?;
+        self.cache.replace_github_history(issue_number, &history)?;
+        Ok(entry)
     }
 }
 
@@ -797,11 +946,18 @@ impl Ledger for GitHubLedger {
         bail!("GitHub-backed Status mutation is not implemented yet")
     }
 
-    fn add_note(&mut self, _id: i64, _message: &str, _actor: &str) -> Result<HistoryEntry> {
-        bail!("GitHub-backed notes are not implemented yet")
+    fn add_note(
+        &mut self,
+        id: i64,
+        message: &str,
+        actor: &str,
+        event_id: Option<&str>,
+    ) -> Result<HistoryEntry> {
+        self.append_note(id, message, actor, event_id)
     }
 
-    fn history(&self, id: i64) -> Result<Vec<HistoryEntry>> {
+    fn history(&mut self, id: i64) -> Result<Vec<HistoryEntry>> {
+        self.synchronize()?;
         self.cache.history(id)
     }
 }
@@ -1235,8 +1391,8 @@ fn classify_failure(failure: GhFailure) -> GitHubError {
     )
 }
 
-fn new_event_id() -> String {
-    format!("genesis-{}", Uuid::new_v4())
+fn new_event_id(kind: &str) -> String {
+    format!("{kind}-{}", Uuid::new_v4())
 }
 
 fn creation_fingerprint(request_json: &str) -> String {
@@ -1259,49 +1415,75 @@ fn parse_projection(body: &str) -> Result<ProjectionMetadata> {
         .context("invalid Work Tracker projection metadata")
 }
 
-fn parse_event(body: &str) -> Result<GenesisEvent> {
-    serde_json::from_str(extract_metadata(body, EVENT_MARKER)?)
-        .context("invalid Work Tracker event metadata")
+fn parse_event(body: &str) -> Result<CanonicalEvent> {
+    let encoded = extract_metadata(body, EVENT_MARKER)?;
+    let value: Value =
+        serde_json::from_str(encoded).context("invalid Work Tracker event metadata")?;
+    let schema_version = value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .context("Work Tracker event is missing schema_version")?;
+    if schema_version != 1 {
+        return Err(GitHubError::new(
+            "github_unknown_event_schema",
+            format!("unsupported Work Tracker event schema version {schema_version}"),
+        )
+        .into());
+    }
+    if let Ok(event) = serde_json::from_value::<CanonicalEvent>(value.clone()) {
+        return Ok(event);
+    }
+    let legacy: LegacyGenesisEvent =
+        serde_json::from_value(value).context("invalid Work Tracker event metadata")?;
+    if legacy.kind != "created"
+        || legacy.occurred_at_source != "github_comment.created_at"
+        || legacy.schema_version != 1
+    {
+        bail!("invalid Work Tracker legacy genesis event");
+    }
+    Ok(CanonicalEvent {
+        schema_version: 1,
+        event_id: legacy.event_id,
+        kind: legacy.kind,
+        actor: legacy.actor,
+        github_actor: legacy.github_actor,
+        note: legacy.note,
+        changes: json!({
+            "title": legacy.initial_values.title,
+            "description": legacy.initial_values.description,
+            "status": legacy.initial_values.status,
+        }),
+    })
 }
 
-fn materialize_genesis(
-    issue_number: i64,
-    event: &GenesisEvent,
-    comment: &LedgerComment,
-) -> (WorkItem, HistoryEntry) {
-    let archived_at =
-        (event.initial_values.status == Status::Archived).then_some(comment.created_at);
-    let item = WorkItem {
+fn materialize_item(issue_number: i64, history: &[HistoryEntry]) -> Result<WorkItem> {
+    let genesis = history
+        .first()
+        .context("Work Tracker history has no genesis entry")?;
+    let values: GenesisValues =
+        serde_json::from_value(genesis.changes.clone()).context("invalid genesis changes")?;
+    let updated_at = history
+        .last()
+        .map(|entry| entry.occurred_at)
+        .unwrap_or(genesis.occurred_at);
+    let archived_at = (values.status == Status::Archived).then_some(updated_at);
+    Ok(WorkItem {
         id: issue_number,
-        title: event.initial_values.title.clone(),
-        description: event.initial_values.description.clone(),
-        status: event.initial_values.status,
-        created_at: comment.created_at,
-        updated_at: comment.created_at,
+        title: values.title,
+        description: values.description,
+        status: values.status,
+        created_at: genesis.occurred_at,
+        updated_at,
         archived_at,
         deleted_at: archived_at,
         purge_after: None,
-    };
-    let history = HistoryEntry {
-        id: comment.id,
-        work_item_id: issue_number,
-        kind: "created".to_owned(),
-        actor: event.actor.clone(),
-        note: event.note.clone(),
-        occurred_at: comment.created_at,
-        changes: json!({
-            "title": event.initial_values.title,
-            "description": event.initial_values.description,
-            "status": event.initial_values.status,
-        }),
-    };
-    (item, history)
+    })
 }
 
 fn extract_metadata<'a>(body: &'a str, marker: &str) -> Result<&'a str> {
     let prefix = format!("<!-- {marker}\n");
     let start = body
-        .find(&prefix)
+        .rfind(&prefix)
         .map(|index| index + prefix.len())
         .with_context(|| format!("missing {marker} metadata"))?;
     let end = body[start..]
@@ -1309,6 +1491,263 @@ fn extract_metadata<'a>(body: &'a str, marker: &str) -> Result<&'a str> {
         .map(|index| start + index)
         .with_context(|| format!("unterminated {marker} metadata"))?;
     Ok(&body[start..end])
+}
+
+fn has_metadata(body: &str, marker: &str) -> bool {
+    body.contains(&format!("<!-- {marker}\n"))
+}
+
+fn event_comment_body(event: &CanonicalEvent) -> Result<String> {
+    let note = event
+        .note
+        .as_deref()
+        .map(|note| format!("\n\nNote: {note}"))
+        .unwrap_or_default();
+    Ok(format!(
+        "Work Tracker History Entry: {} by {}{note}\n\n<!-- {EVENT_MARKER}\n{}\n-->",
+        event.kind,
+        event.actor,
+        serde_json::to_string(event)?
+    ))
+}
+
+fn history_hash(
+    previous_hash: Option<&str>,
+    event: &CanonicalEvent,
+    comment_id: i64,
+) -> Result<String> {
+    let canonical = serde_json::to_vec(event)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"work-tracker-history-v1");
+    hash_part(&mut hasher, previous_hash.unwrap_or("").as_bytes());
+    hash_part(&mut hasher, &canonical);
+    hash_part(&mut hasher, &comment_id.to_be_bytes());
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn hash_part(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+fn replay_history(issue_number: i64, comments: &[LedgerComment]) -> Result<Vec<HistoryEntry>> {
+    let mut comments = comments.to_vec();
+    comments.sort_by_key(|comment| comment.id);
+    let mut history = Vec::new();
+    let mut accepted = HashMap::<String, CanonicalEvent>::new();
+    let mut previous_hash: Option<String> = None;
+    let mut state_revision = 0_u64;
+    for comment in comments {
+        if !has_metadata(&comment.body, EVENT_MARKER) {
+            continue;
+        }
+        let event = parse_event(&comment.body)?;
+        if event.github_actor != comment.user.login {
+            return Err(metadata_collision(issue_number).into());
+        }
+        if let Some(prior) = accepted.get(&event.event_id) {
+            if prior == &event {
+                continue;
+            }
+            return Err(metadata_collision(issue_number).into());
+        }
+        match event.kind.as_str() {
+            "created" if history.is_empty() => {
+                if !event.changes.is_object() {
+                    return Err(metadata_collision(issue_number).into());
+                }
+                state_revision = 1;
+            }
+            "noted" if !history.is_empty() => {
+                if event.note.is_none() || event.changes != json!({}) {
+                    return Err(metadata_collision(issue_number).into());
+                }
+            }
+            _ => return Err(metadata_collision(issue_number).into()),
+        }
+        let current_hash = history_hash(previous_hash.as_deref(), &event, comment.id)?;
+        history.push(HistoryEntry {
+            id: comment.id,
+            work_item_id: issue_number,
+            event_id: Some(event.event_id.clone()),
+            kind: event.kind.clone(),
+            actor: event.actor.clone(),
+            github_actor: Some(event.github_actor.clone()),
+            note: event.note.clone(),
+            occurred_at: comment.created_at,
+            changes: event.changes.clone(),
+            previous_history_hash: previous_hash.clone(),
+            history_hash: Some(current_hash.clone()),
+            state_revision: Some(state_revision),
+        });
+        previous_hash = Some(current_hash);
+        accepted.insert(event.event_id.clone(), event);
+    }
+    if history.first().is_none_or(|entry| entry.kind != "created") {
+        return Err(metadata_collision(issue_number).into());
+    }
+    Ok(history)
+}
+
+fn replay_trusted_history(
+    issue_number: i64,
+    comments: &[LedgerComment],
+) -> Result<Vec<HistoryEntry>> {
+    replay_history(issue_number, comments).map_err(|error| {
+        if error
+            .downcast_ref::<GitHubError>()
+            .is_some_and(|error| error.code() == "github_unknown_event_schema")
+        {
+            error
+        } else {
+            ledger_integrity_error(issue_number, format!("history replay failed: {error:#}")).into()
+        }
+    })
+}
+
+fn projection_head_needs_update(
+    issue_number: i64,
+    metadata: &ProjectionMetadata,
+    history: &[HistoryEntry],
+    legacy_genesis: Option<&HistoryEntry>,
+) -> Result<bool> {
+    let genesis = history
+        .first()
+        .ok_or_else(|| ledger_integrity_error(issue_number, "history has no genesis entry"))?;
+    if metadata.genesis_comment_id != Some(genesis.id)
+        || genesis.event_id.as_deref() != Some(metadata.event_id.as_str())
+        || genesis.kind != "created"
+    {
+        return Err(ledger_integrity_error(
+            issue_number,
+            "the replayed genesis does not match the stored projection",
+        )
+        .into());
+    }
+
+    let head = history
+        .last()
+        .context("Work Tracker history has no genesis entry")?;
+    match (
+        metadata.head_event_id.as_deref(),
+        metadata.head_comment_id,
+        metadata.history_hash.as_deref(),
+    ) {
+        (None, None, None) => {
+            if legacy_genesis.is_some_and(|evidence| legacy_genesis_matches(evidence, genesis)) {
+                Ok(true)
+            } else {
+                Err(ledger_integrity_error(
+                    issue_number,
+                    "the projection is missing a trusted history head and no matching pre-head cache evidence exists",
+                )
+                .into())
+            }
+        }
+        (Some(event_id), Some(comment_id), Some(history_hash)) => {
+            let projected = history
+                .iter()
+                .find(|entry| entry.id == comment_id && entry.event_id.as_deref() == Some(event_id))
+                .ok_or_else(|| {
+                    ledger_integrity_error(
+                        issue_number,
+                        "the stored projection head is absent from replayed history",
+                    )
+                })?;
+            if projected.history_hash.as_deref() != Some(history_hash)
+                || projected.state_revision != Some(metadata.state_revision)
+            {
+                return Err(ledger_integrity_error(
+                    issue_number,
+                    "the replayed hash chain does not match the stored projection head",
+                )
+                .into());
+            }
+            Ok(projected.id != head.id)
+        }
+        _ => Err(
+            ledger_integrity_error(issue_number, "the stored projection head is incomplete").into(),
+        ),
+    }
+}
+
+fn legacy_genesis_matches(evidence: &HistoryEntry, replayed: &HistoryEntry) -> bool {
+    evidence.id == replayed.id
+        && evidence.work_item_id == replayed.work_item_id
+        && evidence.kind == replayed.kind
+        && evidence.actor == replayed.actor
+        && evidence.note == replayed.note
+        && evidence.occurred_at == replayed.occurred_at
+        && evidence.changes == replayed.changes
+        && evidence.event_id.is_none()
+        && evidence.github_actor.is_none()
+        && evidence.previous_history_hash.is_none()
+        && evidence.history_hash.is_none()
+        && evidence.state_revision.is_none()
+}
+
+fn validate_retry(entry: &HistoryEntry, event: &CanonicalEvent) -> Result<()> {
+    if entry.kind != event.kind
+        || entry.actor != event.actor
+        || entry.github_actor.as_deref() != Some(event.github_actor.as_str())
+        || entry.note != event.note
+        || entry.changes != event.changes
+    {
+        return Err(GitHubError::new(
+            "github_metadata_collision",
+            format!(
+                "event ID {} was already used for different content",
+                event.event_id
+            ),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn projection_visible_text(body: &str) -> Result<&str> {
+    let marker = format!("\n\n<!-- {PROJECTION_MARKER}\n");
+    body.rfind(&marker)
+        .map(|index| &body[..index])
+        .context("missing Work Tracker projection metadata")
+}
+
+fn validate_completed_issue(issue: &LedgerIssue) -> Result<ProjectionMetadata> {
+    let has_item_label = issue
+        .labels
+        .iter()
+        .any(|label| label.name.eq_ignore_ascii_case("work-tracker:item"));
+    let metadata = parse_projection(&issue.body).map_err(|_| metadata_collision(issue.number))?;
+    if !has_item_label
+        || metadata.schema_version != 1
+        || metadata.kind != "work_item"
+        || metadata.pending_genesis_event_id.is_some()
+        || metadata.genesis_comment_id.is_none()
+        || metadata.state_revision == 0
+    {
+        return Err(metadata_collision(issue.number).into());
+    }
+    status_from_issue(issue)?;
+    Ok(metadata)
+}
+
+fn status_from_issue(issue: &LedgerIssue) -> Result<Status> {
+    let statuses = issue
+        .labels
+        .iter()
+        .filter_map(|label| {
+            LABELS[1..]
+                .iter()
+                .find(|(name, _, _)| label.name.eq_ignore_ascii_case(name))
+                .map(|(name, _, _)| name.trim_start_matches("work-tracker:status:"))
+        })
+        .collect::<Vec<_>>();
+    if statuses.len() != 1 {
+        return Err(metadata_collision(issue.number).into());
+    }
+    statuses[0]
+        .parse()
+        .map_err(|_| metadata_collision(issue.number).into())
 }
 
 fn validate_pending_issue(
@@ -1366,6 +1805,13 @@ fn metadata_collision(issue_number: i64) -> GitHubError {
     )
 }
 
+fn ledger_integrity_error(issue_number: i64, detail: impl fmt::Display) -> GitHubError {
+    GitHubError::new(
+        "github_ledger_integrity",
+        format!("Ledger Integrity Error for GitHub issue #{issue_number}: {detail}"),
+    )
+}
+
 fn validate_reserved_labels(
     repository: &RepositoryName,
     labels: Vec<Label>,
@@ -1399,4 +1845,32 @@ fn validate_reserved_labels(
         }
     }
     Ok(existing)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_event_bytes_and_genesis_hash_match_the_schema_v1_vector() -> Result<()> {
+        let event = CanonicalEvent {
+            schema_version: 1,
+            event_id: "note-known".to_owned(),
+            kind: "noted".to_owned(),
+            actor: "agent-a".to_owned(),
+            github_actor: "octocat".to_owned(),
+            note: Some("known".to_owned()),
+            changes: json!({}),
+        };
+
+        assert_eq!(
+            serde_json::to_string(&event)?,
+            r#"{"schema_version":1,"event_id":"note-known","kind":"noted","actor":"agent-a","github_actor":"octocat","note":"known","changes":{}}"#
+        );
+        assert_eq!(
+            history_hash(None, &event, 42)?,
+            "79e879fd72adacc4ae4131da76b1cadb83afe65479ad8e5f7ca2924b0a916e40"
+        );
+        Ok(())
+    }
 }

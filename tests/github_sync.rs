@@ -5,7 +5,9 @@ use std::fs;
 use anyhow::{Context, Result};
 use chrono::{Duration, FixedOffset, TimeZone, Utc};
 use rusqlite::Connection;
+use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use support::{CliHarness, FakeGh, assert_success, stderr};
 
 fn configure_github(cli: &CliHarness) -> Result<()> {
@@ -37,6 +39,128 @@ fn projection_body(description: Option<&str>, event_id: &str, comment_id: i64) -
     )
 }
 
+#[derive(Serialize)]
+struct CanonicalGenesis<'a> {
+    schema_version: u32,
+    event_id: &'a str,
+    kind: &'a str,
+    actor: &'a str,
+    github_actor: &'a str,
+    note: &'a str,
+    changes: Value,
+}
+
+fn trusted_projection_body(
+    title: &str,
+    description: Option<&str>,
+    status: &str,
+    event_id: &str,
+    comment_id: i64,
+) -> Result<String> {
+    let canonical = serde_json::to_vec(&CanonicalGenesis {
+        schema_version: 1,
+        event_id,
+        kind: "created",
+        actor: "agent-a",
+        github_actor: "octocat",
+        note: "created remotely",
+        changes: json!({
+            "title": title,
+            "description": description,
+            "status": status,
+        }),
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"work-tracker-history-v1");
+    for part in [&[][..], canonical.as_slice(), &comment_id.to_be_bytes()] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    let hash = format!("{:x}", hasher.finalize());
+    let visible = description.unwrap_or("");
+    Ok(format!(
+        "{visible}\n\n<!-- work-tracker:projection\n{}\n-->",
+        json!({
+            "schema_version": 1,
+            "kind": "work_item",
+            "event_id": event_id,
+            "creation_fingerprint": "fingerprint-41",
+            "pending_genesis_event_id": null,
+            "genesis_comment_id": comment_id,
+            "state_revision": 1,
+            "head_event_id": event_id,
+            "head_comment_id": comment_id,
+            "history_hash": hash
+        })
+    ))
+}
+
+fn seed_v4_cache_with_genesis(
+    cli: &CliHarness,
+    title: &str,
+    description: Option<&str>,
+    status: &str,
+    comment_id: i64,
+    occurred_at: &str,
+) -> Result<()> {
+    let path = cli.github_cache_path("octocat", "work-tracker-data");
+    fs::create_dir_all(path.parent().context("cache path omitted parent")?)?;
+    let connection = Connection::open(path)?;
+    connection.execute_batch(
+        "CREATE TABLE work_items (
+             id INTEGER PRIMARY KEY,
+             title TEXT NOT NULL,
+             description TEXT,
+             status TEXT NOT NULL,
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL,
+             archived_at TEXT
+         );
+         CREATE TABLE history_entries (
+             id INTEGER PRIMARY KEY,
+             work_item_id INTEGER NOT NULL,
+             kind TEXT NOT NULL,
+             actor TEXT NOT NULL,
+             note TEXT,
+             occurred_at TEXT NOT NULL,
+             changes_json TEXT NOT NULL
+         );
+         CREATE TABLE pending_github_creations (
+             request_json TEXT PRIMARY KEY,
+             event_id TEXT NOT NULL UNIQUE,
+             issue_number INTEGER
+         );
+         CREATE TABLE github_cache_state (
+             repository TEXT PRIMARY KEY,
+             sync_cursor TEXT,
+             etag TEXT
+         );
+         PRAGMA user_version = 4;",
+    )?;
+    connection.execute(
+        "INSERT INTO work_items
+         (id, title, description, status, created_at, updated_at, archived_at)
+         VALUES (41, ?1, ?2, ?3, ?4, ?4, NULL)",
+        rusqlite::params![title, description, status, occurred_at],
+    )?;
+    connection.execute(
+        "INSERT INTO history_entries
+         (id, work_item_id, kind, actor, note, occurred_at, changes_json)
+         VALUES (?1, 41, 'created', 'agent-a', 'created remotely', ?2, ?3)",
+        rusqlite::params![
+            comment_id,
+            occurred_at,
+            json!({"title": title, "description": description, "status": status}).to_string()
+        ],
+    )?;
+    connection.execute(
+        "INSERT INTO github_cache_state (repository, sync_cursor, etag)
+         VALUES ('octocat/work-tracker-data', '2026-09-22T15:00:00.000Z', 'v4-etag')",
+        [],
+    )?;
+    Ok(())
+}
+
 fn genesis_body(title: &str, description: Option<&str>, status: &str, event_id: &str) -> String {
     format!(
         "Work Tracker History Entry: created by agent-a\n\n<!-- work-tracker:event\n{}\n-->",
@@ -62,11 +186,19 @@ fn json_stdout(output: &std::process::Output) -> Result<Value> {
 }
 
 #[test]
-fn empty_cache_rebuilds_list_and_accepted_genesis_history() -> Result<()> {
+fn migrated_v4_cache_replays_history_and_bootstraps_the_legacy_projection() -> Result<()> {
     let cli = CliHarness::new()?;
     configure_github(&cli)?;
     let gh = FakeGh::new()?;
     let event_id = "11111111-1111-4111-8111-111111111111";
+    seed_v4_cache_with_genesis(
+        &cli,
+        "Watch CI",
+        Some("Wait for the suite"),
+        "waiting",
+        9001,
+        "2026-09-22T14:00:00Z",
+    )?;
     let body = projection_body(Some("Wait for the suite"), event_id, 9001);
     gh.respond(
         1,
@@ -101,39 +233,6 @@ fn empty_cache_rebuilds_list_and_accepted_genesis_history() -> Result<()> {
         .to_string(),
         "",
     )?;
-    gh.respond(
-        3,
-        0,
-        &json!([[{
-            "number": 41,
-            "body": projection_body(Some("Wait for the suite"), event_id, 9001),
-            "labels": [
-                {"name": "work-tracker:item"},
-                {"name": "work-tracker:status:waiting"}
-            ],
-            "updated_at": "2026-09-22T15:00:00Z"
-        }]])
-        .to_string(),
-        "",
-    )?;
-    gh.respond(
-        4,
-        0,
-        &json!([[{
-            "id": 9001,
-            "created_at": "2026-09-22T14:00:00Z",
-            "user": {"login": "octocat"},
-            "body": genesis_body(
-                "Watch CI",
-                Some("Wait for the suite"),
-                "waiting",
-                event_id
-            )
-        }]])
-        .to_string(),
-        "",
-    )?;
-
     let listed = cli.run_with_fake_gh(&gh, ["--json", "list", "--all"])?;
     assert_success(&listed)?;
     assert_eq!(stderr(&listed)?, "");
@@ -144,7 +243,14 @@ fn empty_cache_rebuilds_list_and_accepted_genesis_history() -> Result<()> {
     assert_eq!(items[0]["description"], "Wait for the suite");
     assert_eq!(items[0]["status"], "waiting");
 
-    let history = cli.run_with_fake_gh(&gh, ["--json", "history", "41"])?;
+    let cache = cli.github_cache_path("octocat", "work-tracker-data");
+    let history = cli.run([
+        "--json",
+        "--database",
+        cache.to_str().context("cache path was not UTF-8")?,
+        "history",
+        "41",
+    ])?;
     assert_success(&history)?;
     let entries = json_stdout(&history)?;
     assert_eq!(
@@ -158,6 +264,71 @@ fn empty_cache_rebuilds_list_and_accepted_genesis_history() -> Result<()> {
     assert_eq!(entries[0]["kind"], "created");
     assert_eq!(entries[0]["actor"], "agent-a");
     assert_eq!(entries[0]["note"], "created remotely");
+    let calls = gh.calls()?;
+    assert_eq!(
+        calls
+            .matches("\tPATCH\trepos/octocat/work-tracker-data/issues/41")
+            .count(),
+        1,
+        "history replay should bootstrap the trusted head on a legacy projection"
+    );
+    assert!(calls.contains(&format!("\"head_event_id\":\"{event_id}\"")));
+    assert!(calls.contains("\"head_comment_id\":9001"));
+    assert!(calls.contains("\"history_hash\":"));
+    Ok(())
+}
+
+#[test]
+fn unknown_headless_projection_is_not_automatically_rebaselined() -> Result<()> {
+    let cli = CliHarness::new()?;
+    configure_github(&cli)?;
+    let gh = FakeGh::new()?;
+    let event_id = "11111111-1111-4111-8111-111111111111";
+    gh.respond(
+        1,
+        0,
+        &json!([[{
+            "number": 41,
+            "title": "Watch CI",
+            "body": projection_body(None, event_id, 9001),
+            "labels": [
+                {"name": "work-tracker:item"},
+                {"name": "work-tracker:status:waiting"}
+            ],
+            "updated_at": "2026-09-22T15:00:00Z"
+        }]])
+        .to_string(),
+        "",
+    )?;
+    gh.respond(
+        2,
+        0,
+        &json!([[{
+            "id": 9001,
+            "created_at": "2026-09-22T14:00:00Z",
+            "user": {"login": "octocat"},
+            "body": genesis_body("Watch CI", None, "waiting", event_id)
+        }]])
+        .to_string(),
+        "",
+    )?;
+
+    let failed = cli.run_with_fake_gh(&gh, ["--json", "list", "--all"])?;
+    assert!(!failed.status.success());
+    let diagnostic: Value = serde_json::from_slice(&failed.stderr)?;
+    assert_eq!(diagnostic["error"]["code"], "github_ledger_integrity");
+    assert!(
+        diagnostic["error"]["message"]
+            .as_str()
+            .context("integrity diagnostic omitted message")?
+            .contains("missing a trusted history head")
+    );
+    let calls = gh.calls()?;
+    assert!(!calls.contains("\tPATCH\trepos/octocat/work-tracker-data/issues/41"));
+    let connection = Connection::open(cli.github_cache_path("octocat", "work-tracker-data"))?;
+    let count: i64 =
+        connection.query_row("SELECT count(*) FROM work_items", [], |row| row.get(0))?;
+    assert_eq!(count, 0);
     Ok(())
 }
 
@@ -170,7 +341,7 @@ fn subsequent_sync_uses_the_committed_cursor_and_tolerates_duplicate_observation
     let second_event = "22222222-2222-4222-8222-222222222222";
     let first_issue = json!({
         "number": 41,
-        "body": projection_body(None, first_event, 9001),
+        "body": trusted_projection_body("Existing wait", None, "waiting", first_event, 9001)?,
         "labels": [
             {"name": "work-tracker:item"},
             {"name": "work-tracker:status:waiting"}
@@ -189,7 +360,13 @@ fn subsequent_sync_uses_the_committed_cursor_and_tolerates_duplicate_observation
 
     let second_issue = json!({
         "number": 42,
-        "body": projection_body(Some("Needs a decision"), second_event, 9002),
+        "body": trusted_projection_body(
+            "New blocker",
+            Some("Needs a decision"),
+            "blocked",
+            second_event,
+            9002
+        )?,
         "labels": [
             {"name": "work-tracker:item"},
             {"name": "work-tracker:status:blocked"}
@@ -244,7 +421,7 @@ fn unchanged_incremental_query_reuses_etag_and_accepts_not_modified() -> Result<
         0,
         &json!([[{
             "number": 41,
-            "body": projection_body(None, event_id, 9001),
+            "body": trusted_projection_body("Stable item", None, "active", event_id, 9001)?,
             "labels": [
                 {"name": "work-tracker:item"},
                 {"name": "work-tracker:status:active"}
@@ -316,7 +493,7 @@ fn paginated_sync_ignores_foreign_issues_and_reads_paginated_comments() -> Resul
             "HTTP/2.0 200 OK\r\n\r\n{}",
             json!([{
                 "number": 41,
-                "body": projection_body(None, event_id, 9001),
+                "body": trusted_projection_body("Tracked item", None, "pending", event_id, 9001)?,
                 "labels": [
                     {"name": "work-tracker:item"},
                     {"name": "work-tracker:status:pending"}
@@ -403,7 +580,7 @@ fn item_that_becomes_foreign_is_removed_with_the_incremental_cursor() -> Result<
         0,
         &json!([[{
             "number": 41,
-            "body": projection_body(None, event_id, 9001),
+            "body": trusted_projection_body("Was tracked", None, "active", event_id, 9001)?,
             "labels": [
                 {"name": "work-tracker:item"},
                 {"name": "work-tracker:status:active"}
@@ -481,7 +658,13 @@ fn interrupted_cache_commit_rolls_back_items_history_and_cursor_then_retries() -
         0,
         &json!([[{
             "number": 41,
-            "body": projection_body(None, first_event, 9001),
+            "body": trusted_projection_body(
+                "Existing item",
+                None,
+                "active",
+                first_event,
+                9001
+            )?,
             "labels": [
                 {"name": "work-tracker:item"},
                 {"name": "work-tracker:status:active"}
@@ -516,7 +699,7 @@ fn interrupted_cache_commit_rolls_back_items_history_and_cursor_then_retries() -
 
     let second_issue = json!({
         "number": 42,
-        "body": projection_body(None, second_event, 9002),
+        "body": trusted_projection_body("New item", None, "blocked", second_event, 9002)?,
         "labels": [
             {"name": "work-tracker:item"},
             {"name": "work-tracker:status:blocked"}
@@ -587,19 +770,19 @@ fn github_lists_preserve_filters_limits_attention_order_and_viewer_local_day() -
     ];
     let issues = statuses
         .iter()
-        .map(|(number, status, _, occurred_at, comment_id)| {
+        .map(|(number, status, title, occurred_at, comment_id)| {
             let event_id = format!("{number:08}-1111-4111-8111-111111111111");
-            json!({
+            Ok(json!({
                 "number": number,
-                "body": projection_body(None, &event_id, *comment_id),
+                "body": trusted_projection_body(title, None, status, &event_id, *comment_id)?,
                 "labels": [
                     {"name": "work-tracker:item"},
                     {"name": format!("work-tracker:status:{status}")}
                 ],
                 "updated_at": occurred_at.to_rfc3339()
-            })
+            }))
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
     gh.respond(1, 0, &json!([issues]).to_string(), "")?;
     for (index, (number, status, title, occurred_at, comment_id)) in statuses.iter().enumerate() {
         let event_id = format!("{number:08}-1111-4111-8111-111111111111");
