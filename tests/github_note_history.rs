@@ -394,7 +394,19 @@ fn history_replays_github_comment_order_ignores_discussion_and_populates_the_cac
         "41",
     ])?;
     assert_success(&cached)?;
-    assert_eq!(json(&cached)?, Value::Array(expected));
+    assert_eq!(json(&cached)?, Value::Array(expected.clone()));
+
+    let offline_gh = FakeGh::new()?;
+    let offline = cli.run_with_fake_gh(&offline_gh, ["--json", "--offline", "history", "41"])?;
+    assert_success(&offline)?;
+    assert_eq!(json(&offline)?, Value::Array(expected));
+    let warning: Value =
+        serde_json::from_slice(&offline.stderr).context("offline warning was not valid JSON")?;
+    assert_eq!(warning["warning"]["code"], "offline_cache");
+    ensure!(
+        offline_gh.calls().is_err(),
+        "offline trusted history contacted GitHub"
+    );
 
     let human = cli.run([
         "--database",

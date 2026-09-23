@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::{
     db::SqliteLedger,
     domain::{HistoryEntry, Status, WorkItem, normalized_optional, normalized_required},
-    ledger::{Ledger, ListFilter},
+    ledger::{Ledger, ListFilter, ReadHealth, ReadHealthErrorKind, ReadPolicy},
 };
 
 const PROJECTION_MARKER: &str = "work-tracker:projection";
@@ -181,19 +181,35 @@ enum GhFailureKind {
 
 #[derive(Debug)]
 pub struct GitHubError {
-    code: &'static str,
+    kind: GitHubErrorKind,
     message: String,
     details: Option<Value>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitHubErrorKind {
+    CliMissing,
+    Unauthenticated,
+    PermissionDenied,
+    NotFound,
+    ApiFailure,
+    LedgerIntegrity,
+    UnknownEventSchema,
+    IncompatibleMetadata,
+    MetadataCollision,
+    InvalidVisibility,
+    IncompatibleRepository,
+    StateConflict,
+}
+
 impl GitHubError {
-    pub fn code(&self) -> &'static str {
-        self.code
+    pub fn kind(&self) -> GitHubErrorKind {
+        self.kind
     }
 
-    fn new(code: &'static str, message: impl Into<String>) -> Self {
+    fn new(kind: GitHubErrorKind, message: impl Into<String>) -> Self {
         Self {
-            code,
+            kind,
             message: message.into(),
             details: None,
         }
@@ -206,6 +222,27 @@ impl GitHubError {
 
     pub fn details(&self) -> Option<&Value> {
         self.details.as_ref()
+    }
+
+    fn is_availability_failure(&self) -> bool {
+        matches!(
+            self.kind,
+            GitHubErrorKind::ApiFailure | GitHubErrorKind::CliMissing
+        )
+    }
+}
+
+impl GitHubErrorKind {
+    pub(crate) fn read_health_error_kind(self) -> Option<ReadHealthErrorKind> {
+        match self {
+            GitHubErrorKind::MetadataCollision => Some(ReadHealthErrorKind::MetadataCollision),
+            GitHubErrorKind::IncompatibleMetadata => {
+                Some(ReadHealthErrorKind::IncompatibleMetadata)
+            }
+            GitHubErrorKind::LedgerIntegrity => Some(ReadHealthErrorKind::LedgerIntegrity),
+            GitHubErrorKind::UnknownEventSchema => Some(ReadHealthErrorKind::UnknownEventSchema),
+            _ => None,
+        }
     }
 }
 
@@ -343,13 +380,17 @@ impl Default for GitHub {
 }
 
 impl GitHubLedger {
-    pub(crate) fn open(repository: RepositoryName, cache_path: &Path) -> Result<Self> {
+    pub(crate) fn open(
+        repository: RepositoryName,
+        cache_path: &Path,
+        executable: &Path,
+    ) -> Result<Self> {
         let cache = SqliteLedger::open(cache_path)?;
         let recover_pending_remotely =
             !cache.github_cache_is_initialized(&repository.to_string())?;
         Ok(Self {
             repository,
-            github: GitHub::new(),
+            github: GitHub::with_executable(executable),
             cache,
             recover_pending_remotely,
         })
@@ -370,6 +411,7 @@ impl GitHubLedger {
         }
         let description = normalized_optional(description);
         let note = normalized_optional(note);
+        let github_actor = self.github.authenticated_user()?;
         let request = CreationRequest {
             title: &title,
             description: description.as_deref(),
@@ -380,7 +422,6 @@ impl GitHubLedger {
         let request_json = serde_json::to_string(&request)?;
         let creation_fingerprint = creation_fingerprint(&request_json);
         let existing = self.cache.pending_github_creation(&request_json)?;
-        let github_actor = self.github.authenticated_user()?;
         let (event_id, known_issue, retrying, recovered_issue) = if let Some(pending) = existing {
             (pending.event_id, pending.issue_number, true, None)
         } else if self.recover_pending_remotely {
@@ -534,7 +575,7 @@ impl GitHubLedger {
         Ok(item)
     }
 
-    fn synchronize(&mut self) -> Result<()> {
+    fn synchronize(&mut self) -> Result<DateTime<Utc>> {
         let repository = self.repository.to_string();
         let previous_cursor = self.cache.github_sync_cursor(&repository)?;
         let previous_etag = self.cache.github_sync_etag(&repository)?;
@@ -553,7 +594,12 @@ impl GitHubLedger {
             .github
             .api_conditional_paginated_json::<LedgerIssue>(&endpoint, previous_etag.as_deref())?
         {
-            ConditionalResult::NotModified => return Ok(()),
+            ConditionalResult::NotModified => {
+                let synchronized_at = Utc::now();
+                self.cache
+                    .mark_github_sync_success(&repository, synchronized_at)?;
+                return Ok(synchronized_at);
+            }
             ConditionalResult::Modified { values, etag } => (values, etag),
         };
         let mut synchronized = Vec::new();
@@ -563,7 +609,7 @@ impl GitHubLedger {
         for issue in issues {
             let issue_updated_at = issue.updated_at.ok_or_else(|| {
                 GitHubError::new(
-                    "github_incompatible_metadata",
+                    GitHubErrorKind::IncompatibleMetadata,
                     format!("GitHub issue #{} omitted updated_at", issue.number),
                 )
             })?;
@@ -625,13 +671,16 @@ impl GitHubLedger {
             self.project_history_head(&issue, metadata, &history)?;
         }
         let advanced = cursor.is_some_and(|cursor| previous_cursor.is_none_or(|old| cursor > old));
+        let synchronized_at = Utc::now();
         self.cache.replace_github_cache_batch(
             &repository,
             &synchronized,
             &removed_item_ids,
             cursor,
             (!advanced).then_some(response_etag.as_deref()).flatten(),
-        )
+            synchronized_at,
+        )?;
+        Ok(synchronized_at)
     }
 
     fn load_pending_issue(
@@ -724,7 +773,7 @@ impl GitHubLedger {
                 validate_status_label(&issue, status)?;
                 if found.is_some() {
                     return Err(GitHubError::new(
-                        "github_metadata_collision",
+                        GitHubErrorKind::MetadataCollision,
                         format!("multiple GitHub issues claim pending creation {identity}"),
                     )
                     .into());
@@ -754,7 +803,7 @@ impl GitHubLedger {
             }
             let event = parse_event(&comment.body).map_err(|_| {
                 GitHubError::new(
-                    "github_metadata_collision",
+                    GitHubErrorKind::MetadataCollision,
                     format!("issue #{issue_number} contains invalid Work Tracker event metadata"),
                 )
             })?;
@@ -763,7 +812,7 @@ impl GitHubLedger {
                 expected.github_actor = event.github_actor.clone();
                 if event != expected || event.github_actor != comment.user.login {
                     return Err(GitHubError::new(
-                        "github_metadata_collision",
+                        GitHubErrorKind::MetadataCollision,
                         format!(
                             "issue #{issue_number} genesis event {} does not match the pending creation",
                             expected.event_id
@@ -773,7 +822,7 @@ impl GitHubLedger {
                 }
                 if found.is_some() {
                     return Err(GitHubError::new(
-                        "github_metadata_collision",
+                        GitHubErrorKind::MetadataCollision,
                         format!(
                             "issue #{issue_number} contains duplicate event {}",
                             expected.event_id
@@ -796,7 +845,7 @@ impl GitHubLedger {
         )?;
         if comment.user.login != event.github_actor {
             return Err(GitHubError::new(
-                "github_metadata_collision",
+                GitHubErrorKind::MetadataCollision,
                 format!(
                     "GitHub created issue #{issue_number} genesis as {}, expected {}",
                     comment.user.login, event.github_actor
@@ -862,6 +911,7 @@ impl GitHubLedger {
     ) -> Result<WorkItem> {
         let actor = normalized_required(actor, "actor")?;
         let note = normalized_optional(note);
+        let github_actor = self.github.authenticated_user()?;
         let (issue, metadata) = self.load_work_item_issue(issue_number)?;
         let comments = self.load_comments(issue_number)?;
         let history = replay_trusted_history(issue_number, &comments)?;
@@ -909,7 +959,6 @@ impl GitHubLedger {
             .map(|value| normalized_required(value, "event ID"))
             .transpose()?
             .unwrap_or_else(|| new_event_id("update"));
-        let github_actor = self.github.authenticated_user()?;
         let expected_state_revision = history
             .last()
             .and_then(|entry| entry.state_revision)
@@ -959,7 +1008,7 @@ impl GitHubLedger {
             .and_then(|entry| entry.state_revision)
             .context("Work Tracker history head omitted State Revision")?;
         Err(GitHubError::new(
-            "github_state_conflict",
+            GitHubErrorKind::StateConflict,
             format!(
                 "Rejected Mutation for work item {issue_number}: expected State Revision {expected_state_revision}, current State Revision is {current_revision}; current values are title={:?}, description={:?}, Status={}; refresh current values and retry only by submitting a new proposal",
                 item.title,
@@ -1048,6 +1097,54 @@ impl GitHubLedger {
 }
 
 impl Ledger for GitHubLedger {
+    fn prepare_read(&mut self, policy: ReadPolicy) -> Result<ReadHealth> {
+        let repository = self.repository.to_string();
+        let last_successful_sync_at = self.cache.github_last_successful_sync_at(&repository)?;
+        if policy == ReadPolicy::Offline {
+            return Ok(match last_successful_sync_at {
+                Some(last_successful_sync_at) => ReadHealth::Stale {
+                    last_successful_sync_at,
+                    reason: "GitHub synchronization was intentionally skipped (--offline)"
+                        .to_owned(),
+                    offline: true,
+                },
+                None => ReadHealth::Unavailable {
+                    reason: "the cache has never completed a successful GitHub synchronization"
+                        .to_owned(),
+                },
+            });
+        }
+
+        match self.synchronize() {
+            Ok(synchronized_at) => Ok(ReadHealth::Fresh { synchronized_at }),
+            Err(error) if policy == ReadPolicy::Fresh => Err(error),
+            Err(error) => {
+                let github_error = error.downcast_ref::<GitHubError>();
+                let reason = format!("{error:#}");
+                if let Some(error_kind) =
+                    github_error.and_then(|error| error.kind().read_health_error_kind())
+                {
+                    return Ok(ReadHealth::Integrity {
+                        last_successful_sync_at,
+                        reason,
+                        error_kind,
+                    });
+                }
+                if github_error.is_some_and(GitHubError::is_availability_failure) {
+                    return Ok(match last_successful_sync_at {
+                        Some(last_successful_sync_at) => ReadHealth::Stale {
+                            last_successful_sync_at,
+                            reason,
+                            offline: false,
+                        },
+                        None => ReadHealth::Unavailable { reason },
+                    });
+                }
+                Err(error)
+            }
+        }
+    }
+
     fn create(
         &mut self,
         title: &str,
@@ -1069,12 +1166,10 @@ impl Ledger for GitHubLedger {
         include_archived: bool,
         limit: usize,
     ) -> Result<Vec<WorkItem>> {
-        self.synchronize()?;
         self.cache.list(filter, include_archived, limit)
     }
 
     fn daily_view(&mut self, include_archived: bool) -> Result<Vec<WorkItem>> {
-        self.synchronize()?;
         self.cache.daily_view(include_archived)
     }
 
@@ -1111,7 +1206,6 @@ impl Ledger for GitHubLedger {
     }
 
     fn history(&mut self, id: i64) -> Result<Vec<HistoryEntry>> {
-        self.synchronize()?;
         self.cache.history(id)
     }
 }
@@ -1120,6 +1214,13 @@ impl GitHub {
     pub fn new() -> Self {
         Self {
             executable: "gh".to_owned(),
+            authenticated_login: RefCell::new(None),
+        }
+    }
+
+    fn with_executable(executable: &Path) -> Self {
+        Self {
+            executable: executable.to_string_lossy().into_owned(),
             authenticated_login: RefCell::new(None),
         }
     }
@@ -1168,7 +1269,7 @@ impl GitHub {
                             || failure.stderr.to_ascii_lowercase().contains("http 422") =>
                     {
                         return Err(GitHubError::new(
-                            "github_permission_denied",
+                            GitHubErrorKind::PermissionDenied,
                             format!(
                                 "could not access or create GitHub repository {requested}: {}",
                                 failure.stderr.trim()
@@ -1187,14 +1288,14 @@ impl GitHub {
     pub fn validate_repository(&self, repository: &Repository) -> Result<()> {
         if !repository.private {
             return Err(GitHubError::new(
-                "github_invalid_visibility",
+                GitHubErrorKind::InvalidVisibility,
                 format!("GitHub repository {} is not private", repository.full_name),
             )
             .into());
         }
         if !repository.has_issues {
             return Err(GitHubError::new(
-                "github_incompatible_repository",
+                GitHubErrorKind::IncompatibleRepository,
                 format!(
                     "GitHub repository {} does not have issues enabled",
                     repository.full_name
@@ -1204,7 +1305,7 @@ impl GitHub {
         }
         if !(repository.permissions.admin || repository.permissions.push) {
             return Err(GitHubError::new(
-                "github_permission_denied",
+                GitHubErrorKind::PermissionDenied,
                 format!(
                     "GitHub repository {} does not grant write permission",
                     repository.full_name
@@ -1244,7 +1345,7 @@ impl GitHub {
             Ok(repository) => repository,
             Err(failure) if failure.kind == GhFailureKind::NotFound => {
                 return Err(GitHubError::new(
-                    "github_permission_denied",
+                    GitHubErrorKind::PermissionDenied,
                     format!(
                         "could not access GitHub repository {name}: {}",
                         failure.stderr.trim()
@@ -1274,7 +1375,7 @@ impl GitHub {
         )?;
         if let Some(foreign) = pulls.first() {
             return Err(GitHubError::new(
-                "github_incompatible_repository",
+                GitHubErrorKind::IncompatibleRepository,
                 format!(
                     "GitHub repository {repository} contains unsupported pull request #{}",
                     foreign.number
@@ -1289,7 +1390,7 @@ impl GitHub {
                 .any(|label| label.name.eq_ignore_ascii_case("work-tracker:item"))
         }) {
             return Err(GitHubError::new(
-                "github_incompatible_repository",
+                GitHubErrorKind::IncompatibleRepository,
                 format!(
                     "GitHub repository {repository} contains unsupported issue #{}",
                     foreign.number
@@ -1310,7 +1411,7 @@ impl GitHub {
                 != 1
         }) {
             return Err(GitHubError::new(
-                "github_incompatible_repository",
+                GitHubErrorKind::IncompatibleRepository,
                 format!(
                     "GitHub repository {repository} issue #{} does not have exactly one Work Tracker Status label",
                     invalid.number
@@ -1533,14 +1634,15 @@ fn parse_included_response(output: &[u8]) -> Result<IncludedResponse<'_>> {
 }
 
 fn classify_failure(failure: GhFailure) -> GitHubError {
-    let code = match failure.kind {
-        GhFailureKind::MissingCli => "github_cli_missing",
-        GhFailureKind::Unauthenticated => "github_unauthenticated",
-        GhFailureKind::PermissionDenied => "github_permission_denied",
-        GhFailureKind::NotFound | GhFailureKind::Other => "github_api_failure",
+    let kind = match failure.kind {
+        GhFailureKind::MissingCli => GitHubErrorKind::CliMissing,
+        GhFailureKind::Unauthenticated => GitHubErrorKind::Unauthenticated,
+        GhFailureKind::PermissionDenied => GitHubErrorKind::PermissionDenied,
+        GhFailureKind::NotFound => GitHubErrorKind::NotFound,
+        GhFailureKind::Other => GitHubErrorKind::ApiFailure,
     };
     GitHubError::new(
-        code,
+        kind,
         format!("GitHub API request failed: {}", failure.stderr.trim()),
     )
 }
@@ -1579,7 +1681,7 @@ fn parse_event(body: &str) -> Result<CanonicalEvent> {
         .context("Work Tracker event is missing schema_version")?;
     if schema_version != 1 {
         return Err(GitHubError::new(
-            "github_unknown_event_schema",
+            GitHubErrorKind::UnknownEventSchema,
             format!("unsupported Work Tracker event schema version {schema_version}"),
         )
         .into());
@@ -1848,7 +1950,7 @@ fn replay_trusted_history(
     replay_history(issue_number, comments).map_err(|error| {
         if error
             .downcast_ref::<GitHubError>()
-            .is_some_and(|error| error.code() == "github_unknown_event_schema")
+            .is_some_and(|error| error.kind() == GitHubErrorKind::UnknownEventSchema)
         {
             error
         } else {
@@ -1946,7 +2048,7 @@ fn validate_retry(entry: &HistoryEntry, event: &CanonicalEvent) -> Result<()> {
         || entry.changes != event.changes
     {
         return Err(GitHubError::new(
-            "github_metadata_collision",
+            GitHubErrorKind::MetadataCollision,
             format!(
                 "event ID {} was already used for different content",
                 event.event_id
@@ -2065,14 +2167,14 @@ fn validate_status_label(issue: &LedgerIssue, status: Status) -> Result<()> {
 
 fn metadata_collision(issue_number: i64) -> GitHubError {
     GitHubError::new(
-        "github_metadata_collision",
+        GitHubErrorKind::MetadataCollision,
         format!("GitHub issue #{issue_number} has conflicting Work Tracker metadata"),
     )
 }
 
 fn ledger_integrity_error(issue_number: i64, detail: impl fmt::Display) -> GitHubError {
     GitHubError::new(
-        "github_ledger_integrity",
+        GitHubErrorKind::LedgerIntegrity,
         format!("Ledger Integrity Error for GitHub issue #{issue_number}: {detail}"),
     )
 }
@@ -2090,7 +2192,7 @@ fn validate_reserved_labels(
         let Some(label) = existing.get(&expected.to_ascii_lowercase()) else {
             if require_all {
                 return Err(GitHubError::new(
-                    "github_incompatible_repository",
+                    GitHubErrorKind::IncompatibleRepository,
                     format!("GitHub repository {repository} is missing reserved label {expected}"),
                 )
                 .into());
@@ -2101,7 +2203,7 @@ fn validate_reserved_labels(
             || label.description.as_deref() != Some(description)
         {
             return Err(GitHubError::new(
-                "github_incompatible_repository",
+                GitHubErrorKind::IncompatibleRepository,
                 format!(
                     "GitHub repository {repository} has an incompatible reserved label {expected}"
                 ),

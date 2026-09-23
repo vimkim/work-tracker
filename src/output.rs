@@ -1,12 +1,119 @@
-use anyhow::Result;
-use chrono::Local;
+use anyhow::{Error, Result};
+use chrono::{Local, Utc};
 use serde::Serialize;
+use serde_json::json;
 
-use crate::domain::{HistoryEntry, WorkItem};
+use crate::{
+    domain::{HistoryEntry, WorkItem},
+    github::{GitHubError, GitHubErrorKind},
+    ledger::{ReadHealth, ReadHealthError, ReadHealthErrorKind, ReadHealthKind},
+};
 
 pub fn print_json(value: &impl Serialize) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
+}
+
+pub fn print_read_warning(health: &ReadHealth, json_output: bool) {
+    let (code, label) = match health.kind() {
+        ReadHealthKind::Stale => (
+            if health.is_offline() {
+                "offline_cache"
+            } else {
+                "stale_cache"
+            },
+            "STALE CACHE",
+        ),
+        ReadHealthKind::Integrity => ("ledger_integrity", "LEDGER INTEGRITY ERROR"),
+        ReadHealthKind::Local | ReadHealthKind::Fresh | ReadHealthKind::Unavailable => return,
+    };
+    let mut message = label.to_owned();
+    if let Some(synchronized_at) = health.last_successful_sync_at() {
+        message.push_str(&format!(
+            ": last successful synchronization was {}",
+            synchronized_at.to_rfc3339()
+        ));
+    }
+    if let Some(reason) = health.reason() {
+        message.push_str(&format!(": {reason}"));
+    }
+    let stale_age_seconds = health
+        .last_successful_sync_at()
+        .map(|time| Utc::now().signed_duration_since(*time).num_seconds().max(0));
+    if json_output {
+        eprintln!(
+            "{}",
+            json!({
+                "warning": {
+                    "code": code,
+                    "message": message,
+                    "last_successful_sync_at": health.last_successful_sync_at(),
+                    "stale_age_seconds": stale_age_seconds,
+                }
+            })
+        );
+    } else {
+        eprintln!("warning: {message}");
+    }
+}
+
+pub fn print_error(error: &Error, json_output: bool) {
+    if !json_output {
+        eprintln!("error: {error:#}");
+        return;
+    }
+    if let Some(github_error) = error.downcast_ref::<GitHubError>() {
+        let mut diagnostic = json!({
+            "code": github_error_code(github_error.kind()),
+            "message": format!("{error:#}"),
+        });
+        if let (Some(target), Some(details)) = (diagnostic.as_object_mut(), github_error.details())
+            && let Some(details) = details.as_object()
+        {
+            target.extend(details.clone());
+        }
+        eprintln!("{}", json!({"error": diagnostic}));
+    } else if let Some(read_error) = error.downcast_ref::<ReadHealthError>() {
+        eprintln!(
+            "{}",
+            json!({"error": {
+                "code": read_health_error_code(read_error.kind()),
+                "message": format!("{error:#}"),
+            }})
+        );
+    } else {
+        eprintln!("{}", json!({"error": format!("{error:#}")}));
+    }
+}
+
+fn github_error_code(kind: GitHubErrorKind) -> &'static str {
+    if let Some(read_error_kind) = kind.read_health_error_kind() {
+        return read_health_error_code(read_error_kind);
+    }
+    match kind {
+        GitHubErrorKind::CliMissing => "github_cli_missing",
+        GitHubErrorKind::Unauthenticated => "github_unauthenticated",
+        GitHubErrorKind::PermissionDenied => "github_permission_denied",
+        GitHubErrorKind::NotFound => "github_not_found",
+        GitHubErrorKind::ApiFailure => "github_api_failure",
+        GitHubErrorKind::InvalidVisibility => "github_invalid_visibility",
+        GitHubErrorKind::IncompatibleRepository => "github_incompatible_repository",
+        GitHubErrorKind::StateConflict => "github_state_conflict",
+        GitHubErrorKind::LedgerIntegrity
+        | GitHubErrorKind::UnknownEventSchema
+        | GitHubErrorKind::IncompatibleMetadata
+        | GitHubErrorKind::MetadataCollision => unreachable!("handled as a read-health error kind"),
+    }
+}
+
+fn read_health_error_code(kind: ReadHealthErrorKind) -> &'static str {
+    match kind {
+        ReadHealthErrorKind::CacheUnavailable => "cache_unavailable",
+        ReadHealthErrorKind::LedgerIntegrity => "github_ledger_integrity",
+        ReadHealthErrorKind::MetadataCollision => "github_metadata_collision",
+        ReadHealthErrorKind::IncompatibleMetadata => "github_incompatible_metadata",
+        ReadHealthErrorKind::UnknownEventSchema => "github_unknown_event_schema",
+    }
 }
 
 pub fn print_item(item: &WorkItem) {

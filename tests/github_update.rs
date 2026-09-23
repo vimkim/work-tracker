@@ -128,8 +128,9 @@ fn accepted_field_update_advances_revision_once_and_records_exact_changes() -> R
     initialize(&cli, &gh)?;
     let (projection, genesis) = create_item(&cli, &gh)?;
 
+    gh.respond(17, 0, r#"{"login":"octocat"}"#, "")?;
     gh.respond(
-        17,
+        18,
         0,
         &serde_json::json!({
             "number": 41,
@@ -144,7 +145,7 @@ fn accepted_field_update_advances_revision_once_and_records_exact_changes() -> R
         "",
     )?;
     gh.respond(
-        18,
+        19,
         0,
         &serde_json::json!([[{
             "id": 9001,
@@ -155,7 +156,6 @@ fn accepted_field_update_advances_revision_once_and_records_exact_changes() -> R
         .to_string(),
         "",
     )?;
-    gh.respond(19, 0, r#"{"login":"octocat"}"#, "")?;
     gh.respond(
         20,
         0,
@@ -275,8 +275,9 @@ fn no_op_field_update_publishes_no_proposal_and_appends_no_history() -> Result<(
     let gh = FakeGh::new()?;
     initialize(&cli, &gh)?;
     let (projection, genesis) = create_item(&cli, &gh)?;
+    gh.respond(17, 0, r#"{"login":"octocat"}"#, "")?;
     gh.respond(
-        17,
+        18,
         0,
         &serde_json::json!({
             "number": 41,
@@ -291,7 +292,7 @@ fn no_op_field_update_publishes_no_proposal_and_appends_no_history() -> Result<(
         "",
     )?;
     gh.respond(
-        18,
+        19,
         0,
         &serde_json::json!([[{
             "id": 9001,
@@ -377,8 +378,9 @@ fn first_proposal_in_comment_order_wins_and_stale_loser_gets_current_state() -> 
         Some("my attempt"),
         loser_changes,
     );
+    gh.respond(17, 0, r#"{"login":"octocat"}"#, "")?;
     gh.respond(
-        17,
+        18,
         0,
         &serde_json::json!({
             "number": 41,
@@ -393,7 +395,7 @@ fn first_proposal_in_comment_order_wins_and_stale_loser_gets_current_state() -> 
         "",
     )?;
     gh.respond(
-        18,
+        19,
         0,
         &serde_json::json!([[{
             "id": 9001,
@@ -404,7 +406,6 @@ fn first_proposal_in_comment_order_wins_and_stale_loser_gets_current_state() -> 
         .to_string(),
         "",
     )?;
-    gh.respond(19, 0, r#"{"login":"octocat"}"#, "")?;
     gh.respond(
         20,
         0,
@@ -527,8 +528,9 @@ fn first_proposal_in_comment_order_wins_and_stale_loser_gets_current_state() -> 
         Some("still needed after refresh"),
         retry_changes.clone(),
     );
+    gh.respond(23, 0, r#"{"login":"octocat"}"#, "")?;
     gh.respond(
-        23,
+        24,
         0,
         &serde_json::json!({
             "number": 41,
@@ -562,8 +564,7 @@ fn first_proposal_in_comment_order_wins_and_stale_loser_gets_current_state() -> 
             "body": loser
         }
     ]);
-    gh.respond(24, 0, &serde_json::json!([prior_comments]).to_string(), "")?;
-    gh.respond(25, 0, r#"{"login":"octocat"}"#, "")?;
+    gh.respond(25, 0, &serde_json::json!([prior_comments]).to_string(), "")?;
     gh.respond(
         26,
         0,
@@ -668,14 +669,14 @@ fn accepted_event_survives_projection_failure_and_sync_repairs_it() -> Result<()
         "user": {"login": "octocat"},
         "body": update
     });
-    gh.respond(17, 0, &issue.to_string(), "")?;
+    gh.respond(17, 0, r#"{"login":"octocat"}"#, "")?;
+    gh.respond(18, 0, &issue.to_string(), "")?;
     gh.respond(
-        18,
+        19,
         0,
         &serde_json::json!([[genesis_comment]]).to_string(),
         "",
     )?;
-    gh.respond(19, 0, r#"{"login":"octocat"}"#, "")?;
     gh.respond(
         20,
         0,
@@ -751,5 +752,64 @@ fn accepted_event_survives_projection_failure_and_sync_repairs_it() -> Result<()
     ensure!(calls.contains("\t--field\tbody=Recovered details"));
     ensure!(calls.contains("\"state_revision\":2"));
     ensure!(calls.contains("\"head_event_id\":\"update-before-patch-failure\""));
+    Ok(())
+}
+
+#[test]
+fn update_requires_successful_online_preflight_before_reading_or_recording_state() -> Result<()> {
+    let cli = CliHarness::new()?;
+    let gh = FakeGh::new()?;
+    initialize(&cli, &gh)?;
+    create_item(&cli, &gh)?;
+    gh.respond(17, 1, "", "temporary service outage")?;
+
+    let failed = cli.run_with_fake_gh(
+        &gh,
+        [
+            "--json",
+            "update",
+            "41",
+            "--title",
+            "Must not be proposed",
+            "--actor",
+            "agent-b",
+        ],
+    )?;
+    ensure!(!failed.status.success());
+    assert_eq!(failed.stdout, b"");
+    let error: Value = serde_json::from_slice(&failed.stderr)?;
+    assert_eq!(error["error"]["code"], "github_api_failure");
+
+    let calls = gh.calls()?;
+    assert_eq!(
+        calls
+            .matches("\tGET\trepos/octocat/work-tracker-data/issues/41")
+            .count(),
+        0,
+        "preflight failure must happen before loading remote state"
+    );
+    assert_eq!(
+        calls
+            .matches("\tPOST\trepos/octocat/work-tracker-data/issues/41/comments")
+            .count(),
+        1,
+        "only the genesis comment should exist"
+    );
+    let cache = cli.github_cache_path("octocat", "work-tracker-data");
+    let history = cli.run([
+        "--json",
+        "--database",
+        cache.to_str().context("cache path was not UTF-8")?,
+        "history",
+        "41",
+    ])?;
+    assert_success(&history)?;
+    assert_eq!(
+        json(&history)?
+            .as_array()
+            .context("history was not an array")?
+            .len(),
+        1
+    );
     Ok(())
 }

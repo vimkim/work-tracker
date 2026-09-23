@@ -6,7 +6,7 @@ use std::{
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
-use crate::domain::Status;
+use crate::{domain::Status, ledger::ReadPolicy};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -27,6 +27,14 @@ pub struct Cli {
     /// Emit machine-readable JSON.
     #[arg(long, global = true)]
     pub json: bool,
+
+    /// Require a successful GitHub synchronization before reading.
+    #[arg(long, global = true, conflicts_with = "offline")]
+    pub fresh: bool,
+
+    /// Read only from the local cache without contacting GitHub.
+    #[arg(long, global = true, conflicts_with = "fresh")]
+    pub offline: bool,
 
     /// Use this GitHub ledger for the current command without changing the default.
     #[arg(
@@ -103,6 +111,17 @@ impl ActorArgs {
             .or_else(|| env::var("USER").ok())
             .filter(|actor| !actor.trim().is_empty())
             .unwrap_or_else(|| "unknown".to_owned())
+    }
+}
+
+impl Cli {
+    pub fn read_policy(&self) -> Result<ReadPolicy> {
+        match (self.fresh, self.offline) {
+            (true, true) => anyhow::bail!("--fresh and --offline cannot be used together"),
+            (true, false) => Ok(ReadPolicy::Fresh),
+            (false, true) => Ok(ReadPolicy::Offline),
+            (false, false) => Ok(ReadPolicy::PreferFresh),
+        }
     }
 }
 
@@ -280,6 +299,29 @@ mod tests {
         let error = Cli::try_parse_from(["work-tracker", "list", "--all", "--status", "done"])
             .expect_err("--all and --status must not combine");
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn fresh_and_offline_are_global_flags() -> Result<()> {
+        let fresh = Cli::try_parse_from(["work-tracker", "show", "--fresh", "7"])?;
+        assert!(fresh.fresh);
+        assert!(!fresh.offline);
+
+        let offline = Cli::try_parse_from(["work-tracker", "--offline", "history", "7"])?;
+        assert!(offline.offline);
+        assert!(!offline.fresh);
+
+        let conflicting = Cli::try_parse_from(["work-tracker", "--fresh", "list", "--offline"])?;
+        assert!(conflicting.read_policy().is_err());
+
+        let clap_conflict = Cli::try_parse_from(["work-tracker", "--fresh", "--offline", "list"])
+            .expect_err("same-scope freshness flags must conflict in clap");
+        assert_eq!(
+            clap_conflict.kind(),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+
+        Ok(())
     }
 
     #[test]

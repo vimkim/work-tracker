@@ -9,10 +9,10 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     domain::{HistoryEntry, Status, WorkItem, normalized_optional, normalized_required},
-    ledger::{Ledger, ListFilter},
+    ledger::{Ledger, ListFilter, ReadHealth, ReadPolicy},
 };
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// SQL list of the statuses that make a Work Item actionable. Keep in sync with
 /// `Status::is_actionable`.
@@ -48,17 +48,24 @@ impl SqliteLedger {
                 migrate_github_creation_recovery(&connection)?;
                 migrate_github_sync_state(&connection)?;
                 migrate_trusted_history(&connection)?;
+                migrate_github_freshness_state(&connection)?;
             }
             2 => {
                 migrate_github_creation_recovery(&connection)?;
                 migrate_github_sync_state(&connection)?;
                 migrate_trusted_history(&connection)?;
+                migrate_github_freshness_state(&connection)?;
             }
             3 => {
                 migrate_github_sync_state(&connection)?;
                 migrate_trusted_history(&connection)?;
+                migrate_github_freshness_state(&connection)?;
             }
-            4 => migrate_trusted_history(&connection)?,
+            4 => {
+                migrate_trusted_history(&connection)?;
+                migrate_github_freshness_state(&connection)?;
+            }
+            5 => migrate_legacy_schema_5(&connection)?,
             SCHEMA_VERSION => {}
             version => bail!("unsupported database schema version {version}"),
         }
@@ -166,6 +173,45 @@ impl SqliteLedger {
             .map_err(Into::into)
     }
 
+    pub(crate) fn github_last_successful_sync_at(
+        &self,
+        repository: &str,
+    ) -> Result<Option<DateTime<Utc>>> {
+        let value: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT last_successful_sync_at FROM github_cache_state WHERE repository = ?1",
+                params![repository],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        value
+            .map(|value| {
+                DateTime::parse_from_rfc3339(&value)
+                    .map(|value| value.with_timezone(&Utc))
+                    .with_context(|| {
+                        format!("invalid last successful GitHub synchronization time {value}")
+                    })
+            })
+            .transpose()
+    }
+
+    pub(crate) fn mark_github_sync_success(
+        &self,
+        repository: &str,
+        synchronized_at: DateTime<Utc>,
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO github_cache_state (repository, last_successful_sync_at)
+             VALUES (?1, ?2)
+             ON CONFLICT(repository) DO UPDATE SET
+               last_successful_sync_at = excluded.last_successful_sync_at",
+            params![repository, timestamp(synchronized_at)],
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn legacy_github_genesis_evidence(
         &self,
         work_item_id: i64,
@@ -222,6 +268,7 @@ impl SqliteLedger {
         removed_item_ids: &[i64],
         cursor: Option<DateTime<Utc>>,
         etag: Option<&str>,
+        synchronized_at: DateTime<Utc>,
     ) -> Result<()> {
         let transaction = self
             .connection
@@ -258,8 +305,9 @@ impl SqliteLedger {
             insert_github_history(&transaction, history)?;
         }
         transaction.execute(
-            "INSERT INTO github_cache_state (repository, sync_cursor, etag)
-             VALUES (?1, ?2, ?3)
+            "INSERT INTO github_cache_state
+             (repository, sync_cursor, etag, last_successful_sync_at)
+             VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(repository) DO UPDATE SET
                sync_cursor = CASE
                  WHEN excluded.sync_cursor IS NULL THEN github_cache_state.sync_cursor
@@ -267,8 +315,9 @@ impl SqliteLedger {
                  WHEN excluded.sync_cursor > github_cache_state.sync_cursor THEN excluded.sync_cursor
                  ELSE github_cache_state.sync_cursor
                END,
-               etag = excluded.etag",
-            params![repository, cursor.map(timestamp), etag],
+               etag = excluded.etag,
+               last_successful_sync_at = excluded.last_successful_sync_at",
+            params![repository, cursor.map(timestamp), etag, timestamp(synchronized_at)],
         )?;
         transaction.commit()?;
         Ok(())
@@ -431,12 +480,13 @@ fn create_schema(connection: &Connection) -> Result<()> {
             );
 
             CREATE TABLE IF NOT EXISTS github_cache_state (
-                repository  TEXT PRIMARY KEY,
-                sync_cursor TEXT,
-                etag        TEXT
+                repository              TEXT PRIMARY KEY,
+                sync_cursor             TEXT,
+                etag                    TEXT,
+                last_successful_sync_at TEXT
             );
 
-            PRAGMA user_version = 5;
+            PRAGMA user_version = 6;
             ",
     )?;
     Ok(())
@@ -583,7 +633,82 @@ fn migrate_trusted_history(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_github_freshness_state(connection: &Connection) -> Result<()> {
+    connection.execute_batch("BEGIN IMMEDIATE;")?;
+    let locked_version: i64 =
+        connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if locked_version >= 6 {
+        connection.execute_batch("COMMIT;")?;
+        return Ok(());
+    }
+    if locked_version != 5 {
+        connection.execute_batch("ROLLBACK;")?;
+        bail!("cannot migrate database schema version {locked_version}");
+    }
+    connection.execute_batch(
+        "ALTER TABLE github_cache_state ADD COLUMN last_successful_sync_at TEXT;
+         PRAGMA user_version = 6;
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
+/// Both ticket branches independently used schema version 5. Accept either
+/// shape and install the missing half while retaining trusted-history's forced
+/// full replay whenever its columns are introduced.
+fn migrate_legacy_schema_5(connection: &Connection) -> Result<()> {
+    connection.execute_batch("BEGIN IMMEDIATE;")?;
+    let locked_version: i64 =
+        connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if locked_version >= 6 {
+        connection.execute_batch("COMMIT;")?;
+        return Ok(());
+    }
+    if locked_version != 5 {
+        connection.execute_batch("ROLLBACK;")?;
+        bail!("cannot migrate database schema version {locked_version}");
+    }
+
+    let has_trusted_history = table_has_column(connection, "history_entries", "event_id")?;
+    let has_freshness =
+        table_has_column(connection, "github_cache_state", "last_successful_sync_at")?;
+    if !has_trusted_history {
+        connection.execute_batch(
+            "ALTER TABLE history_entries ADD COLUMN event_id TEXT;
+             ALTER TABLE history_entries ADD COLUMN github_actor TEXT;
+             ALTER TABLE history_entries ADD COLUMN previous_history_hash TEXT;
+             ALTER TABLE history_entries ADD COLUMN history_hash TEXT;
+             ALTER TABLE history_entries ADD COLUMN state_revision INTEGER;
+             UPDATE github_cache_state
+             SET sync_cursor = NULL, etag = NULL, last_successful_sync_at = NULL;",
+        )?;
+    }
+    if !has_freshness {
+        connection.execute_batch(
+            "ALTER TABLE github_cache_state ADD COLUMN last_successful_sync_at TEXT;",
+        )?;
+    }
+    connection.execute_batch("PRAGMA user_version = 6; COMMIT;")?;
+    Ok(())
+}
+
+fn table_has_column(connection: &Connection, table: &str, column: &str) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2
+             )",
+            params![table, column],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
 impl Ledger for SqliteLedger {
+    fn prepare_read(&mut self, _policy: ReadPolicy) -> Result<ReadHealth> {
+        Ok(ReadHealth::Local)
+    }
+
     fn create(
         &mut self,
         title: &str,
@@ -1042,6 +1167,87 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(trusted_columns, 5);
+        Ok(())
+    }
+
+    #[test]
+    fn ticket_6_schema_5_adds_freshness_as_schema_6() -> Result<()> {
+        let connection = Connection::open_in_memory()?;
+        connection.execute_batch(
+            "CREATE TABLE history_entries (
+                 id INTEGER PRIMARY KEY,
+                 event_id TEXT,
+                 github_actor TEXT,
+                 previous_history_hash TEXT,
+                 history_hash TEXT,
+                 state_revision INTEGER
+             );
+             CREATE TABLE github_cache_state (
+                 repository TEXT PRIMARY KEY,
+                 sync_cursor TEXT,
+                 etag TEXT
+             );
+             PRAGMA user_version = 5;",
+        )?;
+
+        migrate_legacy_schema_5(&connection)?;
+
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        assert_eq!(version, 6);
+        assert!(table_has_column(
+            &connection,
+            "github_cache_state",
+            "last_successful_sync_at"
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn ticket_8_schema_5_adds_trusted_history_and_requires_a_fresh_replay() -> Result<()> {
+        let connection = Connection::open_in_memory()?;
+        connection.execute_batch(
+            "CREATE TABLE history_entries (
+                 id INTEGER PRIMARY KEY,
+                 work_item_id INTEGER NOT NULL,
+                 kind TEXT NOT NULL,
+                 actor TEXT NOT NULL,
+                 note TEXT,
+                 occurred_at TEXT NOT NULL,
+                 changes_json TEXT NOT NULL
+             );
+             CREATE TABLE github_cache_state (
+                 repository TEXT PRIMARY KEY,
+                 sync_cursor TEXT,
+                 etag TEXT,
+                 last_successful_sync_at TEXT
+             );
+             INSERT INTO github_cache_state VALUES (
+                 'octocat/work-tracker-data',
+                 '2026-09-23T01:00:00.000Z',
+                 'old-etag',
+                 '2026-09-23T01:01:00.000Z'
+             );
+             PRAGMA user_version = 5;",
+        )?;
+
+        migrate_legacy_schema_5(&connection)?;
+
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        assert_eq!(version, 6);
+        let trusted_columns: i64 = connection.query_row(
+            "SELECT count(*) FROM pragma_table_info('history_entries')
+             WHERE name IN ('event_id', 'github_actor', 'previous_history_hash',
+                            'history_hash', 'state_revision')",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(trusted_columns, 5);
+        let state: (Option<String>, Option<String>, Option<String>) = connection.query_row(
+            "SELECT sync_cursor, etag, last_successful_sync_at FROM github_cache_state",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(state, (None, None, None));
         Ok(())
     }
 
