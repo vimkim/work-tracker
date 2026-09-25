@@ -7,12 +7,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Debug)]
-pub(crate) struct DomainValidationError {
+pub struct DomainValidationError {
     message: String,
 }
 
 impl DomainValidationError {
-    pub(crate) fn new(message: impl Into<String>) -> Self {
+    pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
         }

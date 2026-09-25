@@ -5,7 +5,7 @@ use anyhow::Result;
 use work_tracker::{
     cli::{self, Cli, Command, InitBackend, ListArgs},
     config::{self, AppConfig},
-    domain::Status,
+    domain::{DomainValidationError, Status},
     github::{GitHub, RepositoryName},
     ledger::{LedgerConfig, ListFilter},
     output, web,
@@ -34,7 +34,10 @@ async fn run(cli: Cli) -> Result<()> {
     let read_policy = cli.read_policy()?;
     if let Command::Init(args) = &cli.command {
         if cli.offline {
-            anyhow::bail!("GitHub initialization is unavailable in --offline mode");
+            return Err(DomainValidationError::new(
+                "GitHub initialization is unavailable in --offline mode",
+            )
+            .into());
         }
         return match &args.backend {
             InitBackend::Github(args) => init_github(&cli, args.target.as_deref()),
@@ -69,7 +72,10 @@ async fn run(cli: Cli) -> Result<()> {
         }
     };
     if github_backend && cli.offline && is_write_command(&cli.command) {
-        anyhow::bail!("GitHub-backed writes are unavailable in --offline mode");
+        return Err(DomainValidationError::new(
+            "GitHub-backed writes are unavailable in --offline mode",
+        )
+        .into());
     }
     if github_backend
         && !matches!(

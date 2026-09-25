@@ -245,7 +245,12 @@ fn offline_write_fails_before_invoking_github() -> Result<()> {
 
     ensure!(!output.status.success());
     ensure!(output.stdout.is_empty());
-    ensure!(stderr(&output)?.contains("writes are unavailable in --offline mode"));
+    let error: Value = serde_json::from_slice(&output.stderr)?;
+    assert_eq!(error["error"]["code"], "domain_validation_failed");
+    assert_eq!(
+        error["error"]["message"],
+        "GitHub-backed writes are unavailable in --offline mode"
+    );
     ensure!(gh.calls().is_err(), "offline write unexpectedly invoked gh");
     Ok(())
 }
@@ -287,10 +292,16 @@ fn offline_initialization_fails_without_invoking_github() -> Result<()> {
     let cli = CliHarness::new()?;
     let gh = FakeGh::new()?;
 
-    let output = cli.run_with_fake_gh(&gh, ["--offline", "init", "github"])?;
+    let output = cli.run_with_fake_gh(&gh, ["--json", "--offline", "init", "github"])?;
 
     ensure!(!output.status.success());
-    ensure!(stderr(&output)?.contains("unavailable in --offline mode"));
+    ensure!(output.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&output.stderr)?;
+    assert_eq!(error["error"]["code"], "domain_validation_failed");
+    assert_eq!(
+        error["error"]["message"],
+        "GitHub initialization is unavailable in --offline mode"
+    );
     ensure!(
         gh.calls().is_err(),
         "offline initialization unexpectedly invoked gh"
