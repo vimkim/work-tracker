@@ -75,17 +75,3 @@ pub fn config_path() -> Result<PathBuf> {
         .context("failed to determine current directory")?
         .join("work-tracker-config.json"))
 }
-
-pub fn github_cache_path(repository: &RepositoryName) -> Result<PathBuf> {
-    let base = if let Some(base) = env::var_os("XDG_DATA_HOME") {
-        PathBuf::from(base)
-    } else if let Some(home) = env::var_os("HOME") {
-        PathBuf::from(home).join(".local/share")
-    } else {
-        env::current_dir().context("failed to determine current directory")?
-    };
-    Ok(base
-        .join("work-tracker/github")
-        .join(repository.owner())
-        .join(format!("{}.db", repository.name())))
-}

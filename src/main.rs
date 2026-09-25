@@ -3,7 +3,7 @@ use std::str::FromStr;
 
 use anyhow::Result;
 use work_tracker::{
-    cli::{self, Cli, Command, InitBackend, ListArgs},
+    cli::{self, Cli, Command, CommandAccess, InitBackend, ListArgs},
     config::{self, AppConfig},
     domain::{DomainValidationError, Status},
     github::{GitHub, RepositoryName},
@@ -62,7 +62,7 @@ async fn run(cli: Cli) -> Result<()> {
                     .map(|config| config.default_repository.clone())
             });
         if let Some(repository) = selected {
-            let cache = config::github_cache_path(&repository)?;
+            let cache = cli::github_cache_path(&repository)?;
             cli::prepare_database_path(&cache)?;
             (LedgerConfig::github(repository, cache), true)
         } else {
@@ -71,32 +71,12 @@ async fn run(cli: Cli) -> Result<()> {
             (LedgerConfig::sqlite(database), false)
         }
     };
-    if github_backend && cli.offline && is_write_command(&cli.command) {
+    if github_backend && cli.offline && cli.command.access() == CommandAccess::Write {
         return Err(DomainValidationError::new(
             "GitHub-backed writes are unavailable in --offline mode",
         )
         .into());
     }
-    if github_backend
-        && !matches!(
-            &cli.command,
-            Command::Add(_)
-                | Command::Show(_)
-                | Command::List(_)
-                | Command::Today(_)
-                | Command::Update(_)
-                | Command::Status(_)
-                | Command::Note(_)
-                | Command::Archive(_)
-                | Command::History(_)
-                | Command::Rejected(_)
-                | Command::Doctor(_)
-                | Command::Recover(_)
-        )
-    {
-        anyhow::bail!("the GitHub ledger does not support this mutation yet");
-    }
-
     if let Command::Serve(args) = &cli.command {
         ledger_config.open()?;
         return web::serve(ledger_config, &args.bind, read_policy).await;
@@ -105,7 +85,7 @@ async fn run(cli: Cli) -> Result<()> {
     // Online doctor performs its own complete authoritative diagnosis, including timeline
     // evidence. Offline doctor must pass through the ordinary read preparation so it is
     // constrained to durable cache state and never invokes GitHub.
-    let prepare_read = is_read_command(&cli.command)
+    let prepare_read = cli.command.access() == CommandAccess::Read
         && (!matches!(cli.command, Command::Doctor(_)) || cli.offline);
     let read_health = if prepare_read {
         Some(ledger.prepare_read(read_policy)?)
@@ -248,30 +228,6 @@ async fn run(cli: Cli) -> Result<()> {
     }
 }
 
-fn is_read_command(command: &Command) -> bool {
-    matches!(
-        command,
-        Command::Show(_)
-            | Command::List(_)
-            | Command::Today(_)
-            | Command::History(_)
-            | Command::Rejected(_)
-            | Command::Doctor(_)
-    )
-}
-
-fn is_write_command(command: &Command) -> bool {
-    matches!(
-        command,
-        Command::Add(_)
-            | Command::Update(_)
-            | Command::Status(_)
-            | Command::Note(_)
-            | Command::Archive(_)
-            | Command::Recover(_)
-    )
-}
-
 fn show_path(cli: &Cli) -> Result<()> {
     if let Some(database) = cli.database.as_ref() {
         return output::print_sqlite_path(database, cli.json);
@@ -294,7 +250,7 @@ fn show_path(cli: &Cli) -> Result<()> {
         .as_ref()
         .or_else(|| app_config.as_ref().map(|config| &config.default_repository));
     if let Some(repository) = repository {
-        let cache = config::github_cache_path(repository)?;
+        let cache = cli::github_cache_path(repository)?;
         return output::print_github_path(repository, &cache, cli.json);
     }
 
@@ -316,7 +272,7 @@ fn init_github(cli: &Cli, positional_repository: Option<&str>) -> Result<()> {
     github.validate_repository(&repository)?;
     github.provision_metadata(&repository.full_name, created)?;
 
-    let cache = config::github_cache_path(&repository.full_name)?;
+    let cache = cli::github_cache_path(&repository.full_name)?;
     cli::prepare_database_path(&cache)?;
     LedgerConfig::github(repository.full_name.clone(), &cache).prepare_github_cache(created)?;
 

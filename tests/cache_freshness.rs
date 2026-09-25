@@ -260,7 +260,33 @@ fn fresh_and_offline_cannot_be_combined() -> Result<()> {
     let cli = CliHarness::new()?;
     let output = cli.run(["--json", "--fresh", "list", "--offline"])?;
     ensure!(!output.status.success());
-    ensure!(stderr(&output)?.contains("cannot be used together"));
+    ensure!(output.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&output.stderr)?;
+    assert_eq!(error["error"]["code"], "domain_validation_failed");
+    assert_eq!(
+        error["error"]["message"],
+        "--fresh and --offline cannot be used together"
+    );
+    Ok(())
+}
+
+#[test]
+fn configured_github_dashboard_reaches_the_server_entrypoint() -> Result<()> {
+    let cli = CliHarness::new()?;
+    configure_github(&cli)?;
+
+    let output = cli.run(["--json", "serve", "--bind", "not-a-socket-address"])?;
+
+    ensure!(!output.status.success());
+    ensure!(output.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&output.stderr)?;
+    ensure!(
+        error["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("invalid bind address")),
+        "configured GitHub dashboard did not reach its server entrypoint: {}",
+        stderr(&output)?
+    );
     Ok(())
 }
 

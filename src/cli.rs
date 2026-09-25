@@ -8,7 +8,8 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
 use crate::{
-    domain::{RepairMode, Status},
+    domain::{DomainValidationError, RepairMode, Status},
+    github::RepositoryName,
     ledger::ReadPolicy,
 };
 
@@ -123,6 +124,35 @@ pub enum Command {
     Serve(ServeArgs),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandAccess {
+    Control,
+    Read,
+    Write,
+    Dashboard,
+}
+
+impl Command {
+    pub fn access(&self) -> CommandAccess {
+        match self {
+            Self::Init(_) | Self::Path => CommandAccess::Control,
+            Self::Show(_)
+            | Self::List(_)
+            | Self::Today(_)
+            | Self::History(_)
+            | Self::Rejected(_)
+            | Self::Doctor(_) => CommandAccess::Read,
+            Self::Add(_)
+            | Self::Update(_)
+            | Self::Status(_)
+            | Self::Note(_)
+            | Self::Archive(_)
+            | Self::Recover(_) => CommandAccess::Write,
+            Self::Serve(_) => CommandAccess::Dashboard,
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 pub struct InitArgs {
     #[command(subcommand)]
@@ -162,7 +192,10 @@ impl ActorArgs {
 impl Cli {
     pub fn read_policy(&self) -> Result<ReadPolicy> {
         match (self.fresh, self.offline) {
-            (true, true) => anyhow::bail!("--fresh and --offline cannot be used together"),
+            (true, true) => Err(DomainValidationError::new(
+                "--fresh and --offline cannot be used together",
+            )
+            .into()),
             (true, false) => Ok(ReadPolicy::Fresh),
             (false, true) => Ok(ReadPolicy::Offline),
             (false, false) => Ok(ReadPolicy::PreferFresh),
@@ -335,6 +368,20 @@ pub fn database_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
     Ok(env::current_dir()
         .context("failed to determine current directory")?
         .join("work-tracker.db"))
+}
+
+pub fn github_cache_path(repository: &RepositoryName) -> Result<PathBuf> {
+    let base = if let Some(base) = env::var_os("XDG_DATA_HOME") {
+        PathBuf::from(base)
+    } else if let Some(home) = env::var_os("HOME") {
+        PathBuf::from(home).join(".local/share")
+    } else {
+        env::current_dir().context("failed to determine current directory")?
+    };
+    Ok(base
+        .join("work-tracker/github")
+        .join(repository.owner())
+        .join(format!("{}.db", repository.name())))
 }
 
 pub fn prepare_database_path(path: &Path) -> Result<()> {
