@@ -6,46 +6,6 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug)]
-pub struct DomainValidationError {
-    message: String,
-}
-
-impl DomainValidationError {
-    pub fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-}
-
-impl fmt::Display for DomainValidationError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for DomainValidationError {}
-
-pub(crate) fn normalized_required(value: &str, field: &str) -> Result<String> {
-    let value = value.trim();
-    if value.is_empty() {
-        return Err(DomainValidationError::new(format!("{field} cannot be empty")).into());
-    }
-    Ok(value.to_owned())
-}
-
-pub(crate) fn normalized_optional(value: Option<&str>) -> Option<String> {
-    value.and_then(|value| {
-        let value = value.trim();
-        (!value.is_empty()).then(|| value.to_owned())
-    })
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 #[value(rename_all = "snake_case")]
@@ -56,9 +16,7 @@ pub enum Status {
     Blocked,
     Done,
     Cancelled,
-    #[serde(alias = "deleted")]
-    #[value(alias = "deleted")]
-    Archived,
+    Deleted,
 }
 
 impl Status {
@@ -70,7 +28,7 @@ impl Status {
             Self::Blocked => "blocked",
             Self::Done => "done",
             Self::Cancelled => "cancelled",
-            Self::Archived => "archived",
+            Self::Deleted => "deleted",
         }
     }
 
@@ -99,7 +57,7 @@ impl FromStr for Status {
             "blocked" => Ok(Self::Blocked),
             "done" => Ok(Self::Done),
             "cancelled" => Ok(Self::Cancelled),
-            "archived" | "deleted" => Ok(Self::Archived),
+            "deleted" => Ok(Self::Deleted),
             _ => bail!("invalid status: {value}"),
         }
     }
@@ -113,170 +71,18 @@ pub struct WorkItem {
     pub status: Status,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    pub archived_at: Option<DateTime<Utc>>,
-    /// Deprecated compatibility alias for `archived_at`.
     pub deleted_at: Option<DateTime<Utc>>,
-    /// Deprecated compatibility field. Archival is retained indefinitely.
     pub purge_after: Option<DateTime<Utc>>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub ledger_integrity_error: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EvidenceTrust {
-    Trusted,
-    Untrusted,
-}
-
-impl EvidenceTrust {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Trusted => "trusted",
-            Self::Untrusted => "untrusted",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryEntry {
     pub id: i64,
     pub work_item_id: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub event_id: Option<String>,
     pub kind: String,
     pub actor: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub github_actor: Option<String>,
     pub note: Option<String>,
     pub occurred_at: DateTime<Utc>,
-    pub changes: Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub previous_history_hash: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub history_hash: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub state_revision: Option<u64>,
-    pub trust: EvidenceTrust,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum IntegrityBreakKind {
-    EditedEvent,
-    DeletedEvent,
-    BrokenHashContinuity,
-    HeadMismatch,
-    UnknownSchemaVersion,
-    UnreadableEvent,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum IntegrityHealth {
-    Healthy,
-    LedgerIntegrityError,
-}
-
-impl IntegrityHealth {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Healthy => "healthy",
-            Self::LedgerIntegrityError => "ledger_integrity_error",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
-#[serde(rename_all = "snake_case")]
-#[value(rename_all = "kebab-case")]
-pub enum RepairMode {
-    RestoreExactCopy,
-    Rebaseline,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RecoveryOutcome {
-    ExactRestoration,
-    Rebaseline,
-}
-
-impl RecoveryOutcome {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::ExactRestoration => "exact_restoration",
-            Self::Rebaseline => "rebaseline",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RecoveryReport {
-    pub work_item_id: i64,
-    pub outcome: RecoveryOutcome,
-    pub archived: bool,
-    pub full_history_revalidated: bool,
-    pub projection_rebuilt: bool,
-    pub trusted_event_count: usize,
-    pub untrusted_event_count: usize,
-}
-
-impl RepairMode {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::RestoreExactCopy => "restore_exact_copy",
-            Self::Rebaseline => "rebaseline",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IntegrityBreak {
-    pub kind: IntegrityBreakKind,
-    pub github_comment_id: Option<i64>,
-    pub event_id: Option<String>,
-    pub github_actor: Option<String>,
-    pub expected_hash: Option<String>,
-    pub observed_hash: Option<String>,
-    pub cached_exact_copy: Option<String>,
-    pub observed_copy: Option<String>,
-    pub detail: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IntegrityDoctorReport {
-    pub work_item_id: i64,
-    pub integrity_health: IntegrityHealth,
-    pub archived: bool,
-    pub first_break: Option<IntegrityBreak>,
-    pub trusted_event_count: usize,
-    pub untrusted_event_count: usize,
-    pub timeline_evidence: Vec<Value>,
-    pub eligible_repair_modes: Vec<RepairMode>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub observed_evidence: Vec<ObservedIntegrityEvidence>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ObservedIntegrityEvidence {
-    pub github_comment_id: i64,
-    pub github_actor: String,
-    pub body: String,
-    pub observed_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RejectedMutation {
-    pub id: i64,
-    pub work_item_id: i64,
-    pub event_id: String,
-    pub actor: String,
-    pub github_actor: String,
-    pub note: Option<String>,
-    pub occurred_at: DateTime<Utc>,
-    pub expected_state_revision: u64,
-    pub current_state_revision: u64,
     pub changes: Value,
 }
 

@@ -1,120 +1,64 @@
 use std::process::ExitCode;
-use std::str::FromStr;
 
 use anyhow::Result;
+use clap::Parser;
+use serde_json::json;
 use work_tracker::{
-    cli::{self, Cli, Command, CommandAccess, InitBackend, ListArgs},
-    config::{self, AppConfig},
-    domain::{DomainValidationError, Status},
-    github::{GitHub, RepositoryName},
-    ledger::{LedgerConfig, ListFilter},
+    cli::{self, Cli, Command, ListArgs},
+    db::{ListFilter, Tracker},
+    domain::Status,
     output, web,
 };
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let cli = match cli::parse() {
-        Ok(cli) => cli,
-        Err(error) => {
-            output::print_cli_error(error.error(), error.json_output());
-            return ExitCode::from(error.exit_code());
-        }
-    };
+    let cli = Cli::parse();
     let json_output = cli.json;
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            output::print_error(&error, json_output);
+            if json_output {
+                eprintln!("{}", json!({"error": format!("{error:#}")}));
+            } else {
+                eprintln!("error: {error:#}");
+            }
             ExitCode::FAILURE
         }
     }
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    let read_policy = cli.read_policy()?;
-    if let Command::Init(args) = &cli.command {
-        if cli.offline {
-            return Err(DomainValidationError::new(
-                "GitHub initialization is unavailable in --offline mode",
-            )
-            .into());
-        }
-        return match &args.backend {
-            InitBackend::Github(args) => init_github(&cli, args.target.as_deref()),
-        };
+    let database = cli::database_path(cli.database)?;
+    cli::prepare_database_path(&database)?;
+
+    if let Command::Serve(args) = &cli.command {
+        Tracker::open(&database)?;
+        return web::serve(database, &args.bind).await;
     }
     if matches!(cli.command, Command::Path) {
-        return show_path(&cli);
-    }
-    let app_config = AppConfig::load(&config::config_path()?)?;
-    let (ledger_config, github_backend) = if let Some(database) = cli.database.as_ref() {
-        cli::prepare_database_path(database)?;
-        (LedgerConfig::sqlite(database), false)
-    } else {
-        let selected = cli
-            .repository
-            .as_deref()
-            .map(RepositoryName::from_str)
-            .transpose()?
-            .or_else(|| {
-                app_config
-                    .as_ref()
-                    .map(|config| config.default_repository.clone())
-            });
-        if let Some(repository) = selected {
-            let cache = cli::github_cache_path(&repository)?;
-            cli::prepare_database_path(&cache)?;
-            (LedgerConfig::github(repository, cache), true)
-        } else {
-            let database = cli::database_path(None)?;
-            cli::prepare_database_path(&database)?;
-            (LedgerConfig::sqlite(database), false)
+        if cli.json {
+            return output::print_json(&json!({"database": database}));
         }
-    };
-    if github_backend && cli.offline && cli.command.access() == CommandAccess::Write {
-        return Err(DomainValidationError::new(
-            "GitHub-backed writes are unavailable in --offline mode",
-        )
-        .into());
+        println!("{}", database.display());
+        return Ok(());
     }
-    if let Command::Serve(args) = &cli.command {
-        ledger_config.open()?;
-        return web::serve(ledger_config, &args.bind, read_policy).await;
-    }
-    let mut ledger = ledger_config.open()?;
-    // Online doctor performs its own complete authoritative diagnosis, including timeline
-    // evidence. Offline doctor must pass through the ordinary read preparation so it is
-    // constrained to durable cache state and never invokes GitHub.
-    let prepare_read = cli.command.access() == CommandAccess::Read
-        && (!matches!(cli.command, Command::Doctor(_)) || cli.offline);
-    let read_health = if prepare_read {
-        Some(ledger.prepare_read(read_policy)?)
-    } else {
-        None
-    };
-    if let Some(health) = read_health.as_ref() {
-        if let Some(error) = health.unreadable_error() {
-            return Err(error.into());
-        }
-        output::print_read_warning(health, cli.json);
-    }
+
+    let mut tracker = Tracker::open(&database)?;
     match cli.command {
         Command::Add(args) => {
-            let item = ledger.create_with_event_id(
+            let item = tracker.create(
                 &args.title,
                 args.description.as_deref(),
                 args.status,
                 &args.actor.resolved(),
                 args.note.as_deref(),
-                args.event_id.as_deref(),
             )?;
-            output::print_projection_repair_warning(&ledger.take_projection_repairs(), cli.json);
             show_item(&item, cli.json)
         }
-        Command::Show(args) => show_item(&ledger.get(args.id)?, cli.json),
+        Command::Show(args) => show_item(&tracker.get(args.id)?, cli.json),
         Command::List(args) => {
             let filter = list_filter(&args);
-            let items = ledger.list(filter, args.include_archived, args.limit)?;
+            let items = tracker.list(filter, args.include_deleted, args.limit)?;
             if cli.json {
                 output::print_json(&items)
             } else if filter == ListFilter::Actionable {
@@ -126,7 +70,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Today(args) => {
-            let items = ledger.daily_view(args.include_archived)?;
+            let items = tracker.daily_view(args.include_deleted)?;
             show_items(&items, cli.json)
         }
         Command::Update(args) => {
@@ -135,36 +79,26 @@ async fn run(cli: Cli) -> Result<()> {
             } else {
                 args.description.as_deref().map(Some)
             };
-            let item = ledger.update_with_event_id(
+            let item = tracker.update(
                 args.id,
                 args.title.as_deref(),
                 description,
                 &args.actor.resolved(),
                 args.note.as_deref(),
-                args.event_id.as_deref(),
             )?;
-            output::print_projection_repair_warning(&ledger.take_projection_repairs(), cli.json);
             show_item(&item, cli.json)
         }
         Command::Status(args) => {
-            let item = ledger.set_status_with_event_id(
+            let item = tracker.set_status(
                 args.id,
                 args.status,
                 &args.actor.resolved(),
                 args.note.as_deref(),
-                args.event_id.as_deref(),
             )?;
-            output::print_projection_repair_warning(&ledger.take_projection_repairs(), cli.json);
             show_item(&item, cli.json)
         }
         Command::Note(args) => {
-            let entry = ledger.add_note(
-                args.id,
-                &args.message,
-                &args.actor.resolved(),
-                args.event_id.as_deref(),
-            )?;
-            output::print_projection_repair_warning(&ledger.take_projection_repairs(), cli.json);
+            let entry = tracker.add_note(args.id, &args.message, &args.actor.resolved())?;
             if cli.json {
                 output::print_json(&entry)
             } else {
@@ -172,19 +106,17 @@ async fn run(cli: Cli) -> Result<()> {
                 Ok(())
             }
         }
-        Command::Archive(args) => {
-            let item = ledger.set_status_with_event_id(
+        Command::Delete(args) => {
+            let item = tracker.set_status(
                 args.id,
-                Status::Archived,
+                Status::Deleted,
                 &args.actor.resolved(),
                 args.note.as_deref(),
-                args.event_id.as_deref(),
             )?;
-            output::print_projection_repair_warning(&ledger.take_projection_repairs(), cli.json);
             show_item(&item, cli.json)
         }
         Command::History(args) => {
-            let entries = ledger.history(args.id)?;
+            let entries = tracker.history(args.id)?;
             if cli.json {
                 output::print_json(&entries)
             } else {
@@ -192,107 +124,8 @@ async fn run(cli: Cli) -> Result<()> {
                 Ok(())
             }
         }
-        Command::Rejected(args) => {
-            let rejected = ledger.rejected_mutations(args.id)?;
-            if cli.json {
-                output::print_json(&rejected)
-            } else {
-                output::print_rejected_mutations(&rejected);
-                Ok(())
-            }
-        }
-        Command::Doctor(args) => {
-            let report = ledger.doctor(args.id)?;
-            if cli.json {
-                output::print_json(&report)
-            } else {
-                output::print_doctor_report(&report);
-                Ok(())
-            }
-        }
-        Command::Recover(args) => {
-            let report = ledger.recover(
-                args.id,
-                args.mode,
-                args.actor.actor.as_deref(),
-                args.reason.as_deref(),
-            )?;
-            if cli.json {
-                output::print_json(&report)
-            } else {
-                output::print_recovery_report(&report);
-                Ok(())
-            }
-        }
-        Command::Init(_) | Command::Path | Command::Serve(_) => unreachable!(),
+        Command::Path | Command::Serve(_) => unreachable!(),
     }
-}
-
-fn show_path(cli: &Cli) -> Result<()> {
-    if let Some(database) = cli.database.as_ref() {
-        return output::print_sqlite_path(database, cli.json);
-    }
-    let app_config = AppConfig::load(&config::config_path()?)?;
-    let requested_override = cli
-        .repository
-        .as_deref()
-        .map(RepositoryName::from_str)
-        .transpose()?;
-    let explicit = if cli.offline {
-        requested_override
-    } else {
-        requested_override
-            .as_ref()
-            .map(|repository| GitHub::new().validate_existing_repository(repository))
-            .transpose()?
-    };
-    let repository = explicit
-        .as_ref()
-        .or_else(|| app_config.as_ref().map(|config| &config.default_repository));
-    if let Some(repository) = repository {
-        let cache = cli::github_cache_path(repository)?;
-        return output::print_github_path(repository, &cache, cli.json);
-    }
-
-    let database = cli::database_path(None)?;
-    output::print_sqlite_path(&database, cli.json)
-}
-
-fn init_github(cli: &Cli, positional_repository: Option<&str>) -> Result<()> {
-    let config_path = config::config_path()?;
-    let existing_config = AppConfig::load(&config_path)?;
-    let github = GitHub::new();
-    let explicit_repository = positional_repository.or(cli.repository.as_deref());
-    let requested = match (explicit_repository, existing_config.as_ref()) {
-        (Some(repository), _) => repository.parse()?,
-        (None, Some(config)) => config.default_repository.clone(),
-        (None, None) => format!("{}/work-tracker-data", github.authenticated_user()?).parse()?,
-    };
-    let (repository, created) = github.ensure_repository(&requested)?;
-    github.validate_repository(&repository)?;
-    github.provision_metadata(&repository.full_name, created)?;
-
-    let cache = cli::github_cache_path(&repository.full_name)?;
-    cli::prepare_database_path(&cache)?;
-    LedgerConfig::github(repository.full_name.clone(), &cache).prepare_github_cache(created)?;
-
-    let is_default = existing_config.as_ref().is_none_or(|config| {
-        config
-            .default_repository
-            .eq_ignore_case(&repository.full_name)
-    });
-    if existing_config.is_none() {
-        AppConfig::new(repository.full_name.clone()).save(&config_path)?;
-    }
-
-    output::print_github_initialization(
-        &repository.full_name,
-        repository.private,
-        created,
-        is_default,
-        &cache,
-        cli.json,
-    )
 }
 
 fn list_filter(args: &ListArgs) -> ListFilter {

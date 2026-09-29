@@ -1,21 +1,15 @@
 use std::{path::Path, str::FromStr, time::Duration as StdDuration};
 
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Local, LocalResult, NaiveTime, TimeZone, Utc};
+use chrono::{DateTime, Duration, Local, LocalResult, NaiveTime, TimeZone, Utc};
 use rusqlite::{
     Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params, types::Type,
 };
 use serde_json::{Map, Value, json};
 
-use crate::{
-    domain::{
-        DomainValidationError, EvidenceTrust, HistoryEntry, IntegrityDoctorReport,
-        RejectedMutation, Status, WorkItem, normalized_optional, normalized_required,
-    },
-    ledger::{Ledger, ListFilter, ReadHealth, ReadPolicy},
-};
+use crate::domain::{HistoryEntry, Status, WorkItem};
 
-const SCHEMA_VERSION: i64 = 9;
+const RETENTION_DAYS: i64 = 60;
 
 /// SQL list of the statuses that make a Work Item actionable. Keep in sync with
 /// `Status::is_actionable`.
@@ -33,76 +27,72 @@ const STATUS_PRIORITY_ORDER: &str = "CASE status
                updated_at DESC,
                id DESC";
 
-pub(crate) struct SqliteLedger {
+/// Which Work Items `Tracker::list` returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListFilter {
+    /// Only Actionable Work Items: pending, active, waiting, or blocked.
+    Actionable,
+    /// Every status, including done and cancelled.
+    All,
+    /// Exactly one status.
+    Status(Status),
+}
+
+pub struct Tracker {
     connection: Connection,
 }
 
-impl SqliteLedger {
+impl Tracker {
     pub fn open(path: &Path) -> Result<Self> {
         let connection = Connection::open(path)
             .with_context(|| format!("failed to open database {}", path.display()))?;
         connection.busy_timeout(StdDuration::from_secs(5))?;
-        let schema_version: i64 =
-            connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        match schema_version {
-            0 => create_schema(&connection)?,
-            1 => {
-                migrate_deleted_items_to_archived(&connection)?;
-                migrate_github_creation_recovery(&connection)?;
-                migrate_github_sync_state(&connection)?;
-                migrate_trusted_history(&connection)?;
-                migrate_github_freshness_state(&connection)?;
-                migrate_rejected_mutations(&connection)?;
-                migrate_integrity_evidence(&connection)?;
-                migrate_work_item_scoped_history_identity(&connection)?;
-            }
-            2 => {
-                migrate_github_creation_recovery(&connection)?;
-                migrate_github_sync_state(&connection)?;
-                migrate_trusted_history(&connection)?;
-                migrate_github_freshness_state(&connection)?;
-                migrate_rejected_mutations(&connection)?;
-                migrate_integrity_evidence(&connection)?;
-                migrate_work_item_scoped_history_identity(&connection)?;
-            }
-            3 => {
-                migrate_github_sync_state(&connection)?;
-                migrate_trusted_history(&connection)?;
-                migrate_github_freshness_state(&connection)?;
-                migrate_rejected_mutations(&connection)?;
-                migrate_integrity_evidence(&connection)?;
-                migrate_work_item_scoped_history_identity(&connection)?;
-            }
-            4 => {
-                migrate_trusted_history(&connection)?;
-                migrate_github_freshness_state(&connection)?;
-                migrate_rejected_mutations(&connection)?;
-                migrate_integrity_evidence(&connection)?;
-                migrate_work_item_scoped_history_identity(&connection)?;
-            }
-            5 => {
-                migrate_legacy_schema_5(&connection)?;
-                migrate_rejected_mutations(&connection)?;
-                migrate_integrity_evidence(&connection)?;
-                migrate_work_item_scoped_history_identity(&connection)?;
-            }
-            6 => {
-                migrate_rejected_mutations(&connection)?;
-                migrate_integrity_evidence(&connection)?;
-                migrate_work_item_scoped_history_identity(&connection)?;
-            }
-            7 => {
-                migrate_integrity_evidence(&connection)?;
-                migrate_work_item_scoped_history_identity(&connection)?;
-            }
-            8 => migrate_work_item_scoped_history_identity(&connection)?,
-            SCHEMA_VERSION => {}
-            version => bail!("unsupported database schema version {version}"),
-        }
-        connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
+        connection.pragma_update(None, "journal_mode", "WAL")?;
+        connection.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS work_items (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                title         TEXT NOT NULL CHECK (length(trim(title)) > 0),
+                description   TEXT,
+                status        TEXT NOT NULL CHECK (
+                    status IN ('pending', 'active', 'waiting', 'blocked', 'done', 'cancelled', 'deleted')
+                ),
+                created_at    TEXT NOT NULL,
+                updated_at    TEXT NOT NULL,
+                deleted_at    TEXT,
+                purge_after   TEXT,
+                CHECK (
+                    (status = 'deleted' AND deleted_at IS NOT NULL AND purge_after IS NOT NULL)
+                    OR
+                    (status != 'deleted' AND deleted_at IS NULL AND purge_after IS NULL)
+                )
+            );
 
-        Ok(Self { connection })
+            CREATE TABLE IF NOT EXISTS history_entries (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                work_item_id  INTEGER NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+                kind          TEXT NOT NULL,
+                actor         TEXT NOT NULL CHECK (length(trim(actor)) > 0),
+                note          TEXT,
+                occurred_at   TEXT NOT NULL,
+                changes_json  TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_work_items_status_updated
+                ON work_items(status, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_work_items_purge_after
+                ON work_items(purge_after) WHERE status = 'deleted';
+            CREATE INDEX IF NOT EXISTS idx_history_work_item
+                ON history_entries(work_item_id, id);
+
+            PRAGMA user_version = 1;
+            ",
+        )?;
+
+        let tracker = Self { connection };
+        tracker.purge_expired(Utc::now())?;
+        Ok(tracker)
     }
 
     #[cfg(test)]
@@ -110,957 +100,7 @@ impl SqliteLedger {
         Self::open(Path::new(":memory:"))
     }
 
-    pub(crate) fn pending_github_creation(
-        &self,
-        request_json: &str,
-    ) -> Result<Option<PendingGithubCreation>> {
-        self.connection
-            .query_row(
-                "SELECT event_id, issue_number FROM pending_github_creations
-                 WHERE request_json = ?1",
-                params![request_json],
-                |row| {
-                    Ok(PendingGithubCreation {
-                        event_id: row.get(0)?,
-                        issue_number: row.get(1)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(Into::into)
-    }
-
-    pub(crate) fn pending_github_creation_request(&self, event_id: &str) -> Result<Option<String>> {
-        self.connection
-            .query_row(
-                "SELECT request_json FROM pending_github_creations WHERE event_id = ?1",
-                params![event_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(Into::into)
-    }
-
-    pub(crate) fn begin_github_creation(&self, request_json: &str, event_id: &str) -> Result<()> {
-        self.connection.execute(
-            "INSERT INTO pending_github_creations (request_json, event_id)
-             VALUES (?1, ?2)",
-            params![request_json, event_id],
-        )?;
-        Ok(())
-    }
-
-    pub(crate) fn remember_github_issue(
-        &self,
-        request_json: &str,
-        issue_number: i64,
-    ) -> Result<()> {
-        self.connection.execute(
-            "UPDATE pending_github_creations SET issue_number = ?1
-             WHERE request_json = ?2",
-            params![issue_number, request_json],
-        )?;
-        Ok(())
-    }
-
-    pub(crate) fn github_cache_is_initialized(&self, repository: &str) -> Result<bool> {
-        self.connection
-            .query_row(
-                "SELECT 1 FROM github_cache_state WHERE repository = ?1",
-                params![repository],
-                |_| Ok(()),
-            )
-            .optional()
-            .map(|row| row.is_some())
-            .map_err(Into::into)
-    }
-
-    pub(crate) fn mark_github_cache_initialized(&self, repository: &str) -> Result<()> {
-        self.connection.execute(
-            "INSERT OR IGNORE INTO github_cache_state (repository) VALUES (?1)",
-            params![repository],
-        )?;
-        Ok(())
-    }
-
-    pub(crate) fn github_sync_cursor(&self, repository: &str) -> Result<Option<DateTime<Utc>>> {
-        let value: Option<String> = self
-            .connection
-            .query_row(
-                "SELECT sync_cursor FROM github_cache_state WHERE repository = ?1",
-                params![repository],
-                |row| row.get(0),
-            )
-            .optional()?
-            .flatten();
-        value
-            .map(|value| {
-                DateTime::parse_from_rfc3339(&value)
-                    .map(|value| value.with_timezone(&Utc))
-                    .with_context(|| format!("invalid GitHub synchronization cursor {value}"))
-            })
-            .transpose()
-    }
-
-    pub(crate) fn github_sync_etag(&self, repository: &str) -> Result<Option<String>> {
-        self.connection
-            .query_row(
-                "SELECT etag FROM github_cache_state WHERE repository = ?1",
-                params![repository],
-                |row| row.get(0),
-            )
-            .optional()
-            .map(|value| value.flatten())
-            .map_err(Into::into)
-    }
-
-    pub(crate) fn github_last_successful_sync_at(
-        &self,
-        repository: &str,
-    ) -> Result<Option<DateTime<Utc>>> {
-        let value: Option<String> = self
-            .connection
-            .query_row(
-                "SELECT last_successful_sync_at FROM github_cache_state WHERE repository = ?1",
-                params![repository],
-                |row| row.get(0),
-            )
-            .optional()?
-            .flatten();
-        value
-            .map(|value| {
-                DateTime::parse_from_rfc3339(&value)
-                    .map(|value| value.with_timezone(&Utc))
-                    .with_context(|| {
-                        format!("invalid last successful GitHub synchronization time {value}")
-                    })
-            })
-            .transpose()
-    }
-
-    pub(crate) fn mark_github_sync_success(
-        &self,
-        repository: &str,
-        synchronized_at: DateTime<Utc>,
-    ) -> Result<()> {
-        self.connection.execute(
-            "INSERT INTO github_cache_state (repository, last_successful_sync_at)
-             VALUES (?1, ?2)
-             ON CONFLICT(repository) DO UPDATE SET
-               last_successful_sync_at = excluded.last_successful_sync_at",
-            params![repository, timestamp(synchronized_at)],
-        )?;
-        Ok(())
-    }
-
-    pub(crate) fn legacy_github_genesis_evidence(
-        &self,
-        work_item_id: i64,
-    ) -> Result<Option<HistoryEntry>> {
-        self.connection
-            .query_row(
-                "SELECT id, work_item_id, event_id, kind, actor, github_actor, note, occurred_at,
-                        changes_json, previous_history_hash, history_hash, state_revision,
-                        evidence_trust
-                 FROM history_entries
-                 WHERE work_item_id = ?1 AND kind = 'created' AND event_id IS NULL",
-                params![work_item_id],
-                row_to_history,
-            )
-            .optional()
-            .map_err(Into::into)
-    }
-
-    pub(crate) fn github_event_evidence(
-        &self,
-        work_item_id: i64,
-    ) -> Result<Vec<GithubEventEvidence>> {
-        let mut statement = self.connection.prepare(
-            "SELECT comment_id, event_id, github_actor, body, history_hash
-             FROM github_event_evidence
-             WHERE work_item_id = ?1
-             ORDER BY comment_id",
-        )?;
-        let rows = statement.query_map(params![work_item_id], |row| {
-            Ok(GithubEventEvidence {
-                comment_id: row.get(0)?,
-                event_id: row.get(1)?,
-                github_actor: row.get(2)?,
-                body: row.get(3)?,
-                history_hash: row.get(4)?,
-            })
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
-    }
-
-    pub(crate) fn github_cached_evidence_work_item_ids(&self) -> Result<Vec<i64>> {
-        let mut statement = self.connection.prepare(
-            "SELECT DISTINCT work_item_id FROM github_event_evidence ORDER BY work_item_id",
-        )?;
-        let rows = statement.query_map([], |row| row.get(0))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
-    }
-
-    pub(crate) fn github_integrity_report(
-        &self,
-        work_item_id: i64,
-    ) -> Result<Option<IntegrityDoctorReport>> {
-        let report: Option<String> = self
-            .connection
-            .query_row(
-                "SELECT report_json FROM github_integrity_errors WHERE work_item_id = ?1",
-                params![work_item_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        report
-            .map(|report| serde_json::from_str(&report).context("invalid cached integrity report"))
-            .transpose()
-    }
-
-    pub(crate) fn first_github_integrity_report(&self) -> Result<Option<IntegrityDoctorReport>> {
-        let report: Option<String> = self
-            .connection
-            .query_row(
-                "SELECT report_json FROM github_integrity_errors ORDER BY work_item_id LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        report
-            .map(|report| serde_json::from_str(&report).context("invalid cached integrity report"))
-            .transpose()
-    }
-
-    pub(crate) fn record_github_integrity(&mut self, report: &IntegrityDoctorReport) -> Result<()> {
-        self.preserve_github_integrity(None, report)
-    }
-
-    pub(crate) fn preserve_github_integrity(
-        &mut self,
-        snapshot: Option<&GithubCacheItem>,
-        report: &IntegrityDoctorReport,
-    ) -> Result<()> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(snapshot) = snapshot {
-            replace_github_item_in_transaction(&transaction, snapshot)?;
-        }
-        transaction.execute(
-            "INSERT INTO github_integrity_errors (work_item_id, report_json)
-             VALUES (?1, ?2)
-             ON CONFLICT(work_item_id) DO UPDATE SET report_json = excluded.report_json",
-            params![report.work_item_id, serde_json::to_string(report)?],
-        )?;
-        transaction.commit()?;
-        Ok(())
-    }
-
-    pub(crate) fn finish_github_creation(
-        &mut self,
-        request_json: &str,
-        item: &WorkItem,
-        history: &HistoryEntry,
-        evidence: &GithubEventEvidence,
-    ) -> Result<()> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
-            "INSERT INTO work_items
-             (id, title, description, status, created_at, updated_at, archived_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                item.id,
-                item.title,
-                item.description,
-                item.status.as_str(),
-                timestamp(item.created_at),
-                timestamp(item.updated_at),
-                item.archived_at.map(timestamp),
-            ],
-        )?;
-        insert_github_history_entry(&transaction, history)?;
-        insert_github_event_evidence(&transaction, item.id, evidence)?;
-        transaction.execute(
-            "DELETE FROM pending_github_creations WHERE request_json = ?1",
-            params![request_json],
-        )?;
-        transaction.commit()?;
-        Ok(())
-    }
-
-    pub(crate) fn finish_github_creation_recovery(
-        &mut self,
-        request_json: &str,
-        cached: &GithubCacheItem,
-    ) -> Result<()> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        replace_github_item_in_transaction(&transaction, cached)?;
-        transaction.execute(
-            "DELETE FROM pending_github_creations WHERE request_json = ?1",
-            params![request_json],
-        )?;
-        transaction.commit()?;
-        Ok(())
-    }
-
-    pub(crate) fn replace_github_cache_batch(
-        &mut self,
-        repository: &str,
-        items: &[GithubCacheItem],
-        cleanup: GithubCacheCleanup<'_>,
-        cursor: Option<DateTime<Utc>>,
-        etag: Option<&str>,
-        synchronized_at: DateTime<Utc>,
-    ) -> Result<()> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for id in cleanup.removed_item_ids {
-            transaction.execute("DELETE FROM work_items WHERE id = ?1", params![id])?;
-        }
-        for item in items {
-            replace_github_item_in_transaction(&transaction, item)?;
-        }
-        for request_json in cleanup.completed_creation_requests {
-            transaction.execute(
-                "DELETE FROM pending_github_creations WHERE request_json = ?1",
-                params![request_json],
-            )?;
-        }
-        transaction.execute(
-            "INSERT INTO github_cache_state
-             (repository, sync_cursor, etag, last_successful_sync_at)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(repository) DO UPDATE SET
-               sync_cursor = CASE
-                 WHEN excluded.sync_cursor IS NULL THEN github_cache_state.sync_cursor
-                 WHEN github_cache_state.sync_cursor IS NULL THEN excluded.sync_cursor
-                 WHEN excluded.sync_cursor > github_cache_state.sync_cursor THEN excluded.sync_cursor
-                 ELSE github_cache_state.sync_cursor
-               END,
-               etag = excluded.etag,
-               last_successful_sync_at = excluded.last_successful_sync_at",
-            params![repository, cursor.map(timestamp), etag, timestamp(synchronized_at)],
-        )?;
-        transaction.commit()?;
-        Ok(())
-    }
-
-    pub(crate) fn replace_github_item(&mut self, item: &GithubCacheItem) -> Result<()> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        replace_github_item_in_transaction(&transaction, item)?;
-        transaction.commit()?;
-        Ok(())
-    }
-
-    pub(crate) fn complete_github_recovery(&mut self, item: &GithubCacheItem) -> Result<()> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        replace_github_item_in_transaction(&transaction, item)?;
-        transaction.execute(
-            "DELETE FROM github_integrity_errors WHERE work_item_id = ?1",
-            params![item.item.id],
-        )?;
-        transaction.commit()?;
-        Ok(())
-    }
-}
-
-pub(crate) struct GithubCacheItem {
-    pub item: WorkItem,
-    pub history: Vec<HistoryEntry>,
-    pub rejected: Vec<RejectedMutation>,
-    pub evidence: Vec<GithubEventEvidence>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct GithubEventEvidence {
-    pub comment_id: i64,
-    pub event_id: Option<String>,
-    pub github_actor: String,
-    pub body: String,
-    pub history_hash: Option<String>,
-}
-
-pub(crate) struct GithubCacheCleanup<'a> {
-    pub removed_item_ids: &'a [i64],
-    pub completed_creation_requests: &'a [String],
-}
-
-fn replace_github_item_in_transaction(
-    transaction: &Transaction<'_>,
-    cached: &GithubCacheItem,
-) -> Result<()> {
-    let item = &cached.item;
-    transaction.execute(
-        "INSERT INTO work_items
-         (id, title, description, status, created_at, updated_at, archived_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-         ON CONFLICT(id) DO UPDATE SET
-           title = excluded.title,
-           description = excluded.description,
-           status = excluded.status,
-           created_at = excluded.created_at,
-           updated_at = excluded.updated_at,
-           archived_at = excluded.archived_at",
-        params![
-            item.id,
-            item.title,
-            item.description,
-            item.status.as_str(),
-            timestamp(item.created_at),
-            timestamp(item.updated_at),
-            item.archived_at.map(timestamp),
-        ],
-    )?;
-    transaction.execute(
-        "DELETE FROM history_entries WHERE work_item_id = ?1",
-        params![item.id],
-    )?;
-    insert_github_history(transaction, &cached.history)?;
-    transaction.execute(
-        "DELETE FROM rejected_mutations WHERE work_item_id = ?1",
-        params![item.id],
-    )?;
-    insert_rejected_mutations(transaction, &cached.rejected)?;
-    if !cached.evidence.is_empty() {
-        transaction.execute(
-            "DELETE FROM github_event_evidence WHERE work_item_id = ?1",
-            params![item.id],
-        )?;
-        for evidence in &cached.evidence {
-            insert_github_event_evidence(transaction, item.id, evidence)?;
-        }
-    }
-    Ok(())
-}
-
-fn insert_github_event_evidence(
-    transaction: &Transaction<'_>,
-    work_item_id: i64,
-    evidence: &GithubEventEvidence,
-) -> Result<()> {
-    transaction.execute(
-        "INSERT INTO github_event_evidence
-         (work_item_id, comment_id, event_id, github_actor, body, history_hash)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
-            work_item_id,
-            evidence.comment_id,
-            evidence.event_id,
-            evidence.github_actor,
-            evidence.body,
-            evidence.history_hash,
-        ],
-    )?;
-    Ok(())
-}
-
-fn insert_rejected_mutations(
-    transaction: &Transaction<'_>,
-    rejected: &[RejectedMutation],
-) -> Result<()> {
-    for mutation in rejected {
-        transaction.execute(
-            "INSERT INTO rejected_mutations
-             (id, work_item_id, event_id, actor, github_actor, note, occurred_at,
-              expected_state_revision, current_state_revision, changes_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                mutation.id,
-                mutation.work_item_id,
-                mutation.event_id,
-                mutation.actor,
-                mutation.github_actor,
-                mutation.note,
-                timestamp(mutation.occurred_at),
-                mutation.expected_state_revision,
-                mutation.current_state_revision,
-                serde_json::to_string(&mutation.changes)?,
-            ],
-        )?;
-    }
-    Ok(())
-}
-
-fn insert_github_history(transaction: &Transaction<'_>, history: &[HistoryEntry]) -> Result<()> {
-    for entry in history {
-        insert_github_history_entry(transaction, entry)?;
-    }
-    Ok(())
-}
-
-fn insert_github_history_entry(transaction: &Transaction<'_>, entry: &HistoryEntry) -> Result<()> {
-    transaction.execute(
-        "INSERT INTO history_entries
-         (id, work_item_id, event_id, kind, actor, github_actor, note, occurred_at,
-          changes_json, previous_history_hash, history_hash, state_revision, evidence_trust)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-        params![
-            entry.id,
-            entry.work_item_id,
-            entry.event_id,
-            entry.kind,
-            entry.actor,
-            entry.github_actor,
-            entry.note,
-            timestamp(entry.occurred_at),
-            serde_json::to_string(&entry.changes)?,
-            entry.previous_history_hash,
-            entry.history_hash,
-            entry.state_revision,
-            match entry.trust {
-                EvidenceTrust::Trusted => "trusted",
-                EvidenceTrust::Untrusted => "untrusted",
-            },
-        ],
-    )?;
-    Ok(())
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct PendingGithubCreation {
-    pub event_id: String,
-    pub issue_number: Option<i64>,
-}
-
-fn create_schema(connection: &Connection) -> Result<()> {
-    connection.execute_batch(
-        "
-            CREATE TABLE IF NOT EXISTS work_items (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                title         TEXT NOT NULL CHECK (length(trim(title)) > 0),
-                description   TEXT,
-                status        TEXT NOT NULL CHECK (
-                    status IN ('pending', 'active', 'waiting', 'blocked', 'done', 'cancelled', 'archived')
-                ),
-                created_at    TEXT NOT NULL,
-                updated_at    TEXT NOT NULL,
-                archived_at   TEXT,
-                CHECK (
-                    (status = 'archived' AND archived_at IS NOT NULL)
-                    OR
-                    (status != 'archived' AND archived_at IS NULL)
-                )
-            );
-
-            CREATE TABLE IF NOT EXISTS history_entries (
-                id            INTEGER NOT NULL,
-                work_item_id  INTEGER NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
-                kind          TEXT NOT NULL,
-                actor         TEXT NOT NULL CHECK (length(trim(actor)) > 0),
-                note          TEXT,
-                occurred_at   TEXT NOT NULL,
-                changes_json  TEXT NOT NULL,
-                event_id      TEXT,
-                github_actor  TEXT,
-                previous_history_hash TEXT,
-                history_hash  TEXT,
-                state_revision INTEGER
-                ,evidence_trust TEXT NOT NULL DEFAULT 'trusted',
-                PRIMARY KEY (work_item_id, id)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_work_items_status_updated
-                ON work_items(status, updated_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_history_work_item
-                ON history_entries(work_item_id, id);
-
-            CREATE TABLE IF NOT EXISTS pending_github_creations (
-                request_json  TEXT PRIMARY KEY,
-                event_id      TEXT NOT NULL UNIQUE,
-                issue_number  INTEGER
-            );
-
-            CREATE TABLE IF NOT EXISTS github_cache_state (
-                repository              TEXT PRIMARY KEY,
-                sync_cursor             TEXT,
-                etag                    TEXT,
-                last_successful_sync_at TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS rejected_mutations (
-                id                      INTEGER PRIMARY KEY,
-                work_item_id            INTEGER NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
-                event_id                TEXT NOT NULL,
-                actor                   TEXT NOT NULL,
-                github_actor            TEXT NOT NULL,
-                note                    TEXT,
-                occurred_at             TEXT NOT NULL,
-                expected_state_revision INTEGER NOT NULL,
-                current_state_revision  INTEGER NOT NULL,
-                changes_json            TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_rejected_work_item
-                ON rejected_mutations(work_item_id, id);
-
-            CREATE TABLE IF NOT EXISTS github_event_evidence (
-                work_item_id INTEGER NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
-                comment_id   INTEGER NOT NULL,
-                event_id     TEXT,
-                github_actor TEXT NOT NULL,
-                body         TEXT NOT NULL,
-                history_hash TEXT,
-                PRIMARY KEY (work_item_id, comment_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS github_integrity_errors (
-                work_item_id INTEGER PRIMARY KEY REFERENCES work_items(id) ON DELETE CASCADE,
-                report_json  TEXT NOT NULL
-            );
-
-            PRAGMA user_version = 9;
-            ",
-    )?;
-    Ok(())
-}
-
-fn migrate_deleted_items_to_archived(connection: &Connection) -> Result<()> {
-    connection.execute_batch("BEGIN IMMEDIATE;")?;
-    let locked_version: i64 =
-        connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if locked_version >= 2 {
-        connection.execute_batch("COMMIT;")?;
-        return Ok(());
-    }
-    if locked_version != 1 {
-        connection.execute_batch("ROLLBACK;")?;
-        bail!("cannot migrate database schema version {locked_version}");
-    }
-
-    // Keep this v1-to-v2 schema snapshot self-contained. Future schema versions
-    // must add a new migration instead of changing the historical v2 target.
-    connection.execute_batch(
-        "
-        CREATE TABLE work_items_v2 (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            title         TEXT NOT NULL CHECK (length(trim(title)) > 0),
-            description   TEXT,
-            status        TEXT NOT NULL CHECK (
-                status IN ('pending', 'active', 'waiting', 'blocked', 'done', 'cancelled', 'archived')
-            ),
-            created_at    TEXT NOT NULL,
-            updated_at    TEXT NOT NULL,
-            archived_at   TEXT,
-            CHECK (
-                (status = 'archived' AND archived_at IS NOT NULL)
-                OR
-                (status != 'archived' AND archived_at IS NULL)
-            )
-        );
-        CREATE TABLE history_entries_v2 (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            work_item_id  INTEGER NOT NULL REFERENCES work_items_v2(id) ON DELETE CASCADE,
-            kind          TEXT NOT NULL,
-            actor         TEXT NOT NULL CHECK (length(trim(actor)) > 0),
-            note          TEXT,
-            occurred_at   TEXT NOT NULL,
-            changes_json  TEXT NOT NULL
-        );
-        INSERT INTO work_items_v2
-            (id, title, description, status, created_at, updated_at, archived_at)
-        SELECT id, title, description,
-               CASE status WHEN 'deleted' THEN 'archived' ELSE status END,
-               created_at, updated_at,
-               CASE status WHEN 'deleted' THEN deleted_at ELSE NULL END
-        FROM work_items;
-        INSERT INTO history_entries_v2
-            (id, work_item_id, kind, actor, note, occurred_at, changes_json)
-        SELECT id, work_item_id, kind, actor, note, occurred_at, changes_json
-        FROM history_entries;
-        DROP TABLE history_entries;
-        DROP TABLE work_items;
-        ALTER TABLE work_items_v2 RENAME TO work_items;
-        ALTER TABLE history_entries_v2 RENAME TO history_entries;
-        CREATE INDEX idx_work_items_status_updated
-            ON work_items(status, updated_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_history_work_item
-            ON history_entries(work_item_id, id);
-        PRAGMA user_version = 2;
-        COMMIT;
-        ",
-    )?;
-    Ok(())
-}
-
-fn migrate_github_creation_recovery(connection: &Connection) -> Result<()> {
-    connection.execute_batch("BEGIN IMMEDIATE;")?;
-    let locked_version: i64 =
-        connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if locked_version >= 3 {
-        connection.execute_batch("COMMIT;")?;
-        return Ok(());
-    }
-    if locked_version != 2 {
-        connection.execute_batch("ROLLBACK;")?;
-        bail!("cannot migrate database schema version {locked_version}");
-    }
-    connection.execute_batch(
-        "CREATE TABLE IF NOT EXISTS pending_github_creations (
-             request_json  TEXT PRIMARY KEY,
-             event_id      TEXT NOT NULL UNIQUE,
-             issue_number  INTEGER
-         );
-         CREATE TABLE IF NOT EXISTS github_cache_state (
-             repository TEXT PRIMARY KEY
-         );
-         PRAGMA user_version = 3;
-         COMMIT;",
-    )?;
-    Ok(())
-}
-
-fn migrate_github_sync_state(connection: &Connection) -> Result<()> {
-    connection.execute_batch("BEGIN IMMEDIATE;")?;
-    let locked_version: i64 =
-        connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if locked_version >= 4 {
-        connection.execute_batch("COMMIT;")?;
-        return Ok(());
-    }
-    if locked_version != 3 {
-        connection.execute_batch("ROLLBACK;")?;
-        bail!("cannot migrate database schema version {locked_version}");
-    }
-    connection.execute_batch(
-        "ALTER TABLE github_cache_state ADD COLUMN sync_cursor TEXT;
-         ALTER TABLE github_cache_state ADD COLUMN etag TEXT;
-         PRAGMA user_version = 4;
-         COMMIT;",
-    )?;
-    Ok(())
-}
-
-fn migrate_trusted_history(connection: &Connection) -> Result<()> {
-    connection.execute_batch("BEGIN IMMEDIATE;")?;
-    let locked_version: i64 =
-        connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if locked_version >= 5 {
-        connection.execute_batch("COMMIT;")?;
-        return Ok(());
-    }
-    if locked_version != 4 {
-        connection.execute_batch("ROLLBACK;")?;
-        bail!("cannot migrate database schema version {locked_version}");
-    }
-    connection.execute_batch(
-        "ALTER TABLE history_entries ADD COLUMN event_id TEXT;
-         ALTER TABLE history_entries ADD COLUMN github_actor TEXT;
-         ALTER TABLE history_entries ADD COLUMN previous_history_hash TEXT;
-         ALTER TABLE history_entries ADD COLUMN history_hash TEXT;
-         ALTER TABLE history_entries ADD COLUMN state_revision INTEGER;
-         UPDATE github_cache_state SET sync_cursor = NULL, etag = NULL;
-         PRAGMA user_version = 5;
-         COMMIT;",
-    )?;
-    Ok(())
-}
-
-fn migrate_github_freshness_state(connection: &Connection) -> Result<()> {
-    connection.execute_batch("BEGIN IMMEDIATE;")?;
-    let locked_version: i64 =
-        connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if locked_version >= 6 {
-        connection.execute_batch("COMMIT;")?;
-        return Ok(());
-    }
-    if locked_version != 5 {
-        connection.execute_batch("ROLLBACK;")?;
-        bail!("cannot migrate database schema version {locked_version}");
-    }
-    connection.execute_batch(
-        "ALTER TABLE github_cache_state ADD COLUMN last_successful_sync_at TEXT;
-         PRAGMA user_version = 6;
-         COMMIT;",
-    )?;
-    Ok(())
-}
-
-/// Both ticket branches independently used schema version 5. Accept either
-/// shape and install the missing half while retaining trusted-history's forced
-/// full replay whenever its columns are introduced.
-fn migrate_legacy_schema_5(connection: &Connection) -> Result<()> {
-    connection.execute_batch("BEGIN IMMEDIATE;")?;
-    let locked_version: i64 =
-        connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if locked_version >= 6 {
-        connection.execute_batch("COMMIT;")?;
-        return Ok(());
-    }
-    if locked_version != 5 {
-        connection.execute_batch("ROLLBACK;")?;
-        bail!("cannot migrate database schema version {locked_version}");
-    }
-
-    let has_trusted_history = table_has_column(connection, "history_entries", "event_id")?;
-    let has_freshness =
-        table_has_column(connection, "github_cache_state", "last_successful_sync_at")?;
-    if !has_trusted_history {
-        connection.execute_batch(
-            "ALTER TABLE history_entries ADD COLUMN event_id TEXT;
-             ALTER TABLE history_entries ADD COLUMN github_actor TEXT;
-             ALTER TABLE history_entries ADD COLUMN previous_history_hash TEXT;
-             ALTER TABLE history_entries ADD COLUMN history_hash TEXT;
-             ALTER TABLE history_entries ADD COLUMN state_revision INTEGER;
-             UPDATE github_cache_state
-             SET sync_cursor = NULL, etag = NULL, last_successful_sync_at = NULL;",
-        )?;
-    }
-    if !has_freshness {
-        connection.execute_batch(
-            "ALTER TABLE github_cache_state ADD COLUMN last_successful_sync_at TEXT;",
-        )?;
-    }
-    connection.execute_batch("PRAGMA user_version = 6; COMMIT;")?;
-    Ok(())
-}
-
-fn migrate_rejected_mutations(connection: &Connection) -> Result<()> {
-    connection.execute_batch("BEGIN IMMEDIATE;")?;
-    let locked_version: i64 =
-        connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if locked_version >= 7 {
-        connection.execute_batch("COMMIT;")?;
-        return Ok(());
-    }
-    if locked_version != 6 {
-        connection.execute_batch("ROLLBACK;")?;
-        bail!("cannot migrate database schema version {locked_version}");
-    }
-    connection.execute_batch(
-        "CREATE TABLE rejected_mutations (
-             id                      INTEGER PRIMARY KEY,
-             work_item_id            INTEGER NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
-             event_id                TEXT NOT NULL,
-             actor                   TEXT NOT NULL,
-             github_actor            TEXT NOT NULL,
-             note                    TEXT,
-             occurred_at             TEXT NOT NULL,
-             expected_state_revision INTEGER NOT NULL,
-             current_state_revision  INTEGER NOT NULL,
-             changes_json            TEXT NOT NULL
-         );
-         CREATE INDEX idx_rejected_work_item
-             ON rejected_mutations(work_item_id, id);
-         UPDATE github_cache_state
-         SET sync_cursor = NULL, etag = NULL, last_successful_sync_at = NULL;
-         PRAGMA user_version = 7;
-         COMMIT;",
-    )?;
-    Ok(())
-}
-
-fn migrate_integrity_evidence(connection: &Connection) -> Result<()> {
-    connection.execute_batch("BEGIN IMMEDIATE;")?;
-    let locked_version: i64 =
-        connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if locked_version >= 8 {
-        connection.execute_batch("COMMIT;")?;
-        return Ok(());
-    }
-    if locked_version != 7 {
-        connection.execute_batch("ROLLBACK;")?;
-        bail!("cannot migrate database schema version {locked_version}");
-    }
-    connection.execute_batch(
-        "CREATE TABLE github_event_evidence (
-             work_item_id INTEGER NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
-             comment_id   INTEGER NOT NULL,
-             event_id     TEXT,
-             github_actor TEXT NOT NULL,
-             body         TEXT NOT NULL,
-             history_hash TEXT,
-             PRIMARY KEY (work_item_id, comment_id)
-         );
-         CREATE TABLE github_integrity_errors (
-             work_item_id INTEGER PRIMARY KEY REFERENCES work_items(id) ON DELETE CASCADE,
-             report_json  TEXT NOT NULL
-         );
-         ALTER TABLE history_entries
-         ADD COLUMN evidence_trust TEXT NOT NULL DEFAULT 'trusted';
-         UPDATE github_cache_state
-         SET sync_cursor = NULL, etag = NULL, last_successful_sync_at = NULL;
-         PRAGMA user_version = 8;
-         COMMIT;",
-    )?;
-    Ok(())
-}
-
-fn migrate_work_item_scoped_history_identity(connection: &Connection) -> Result<()> {
-    connection.execute_batch("BEGIN IMMEDIATE;")?;
-    let locked_version: i64 =
-        connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if locked_version >= 9 {
-        connection.execute_batch("COMMIT;")?;
-        return Ok(());
-    }
-    if locked_version != 8 {
-        connection.execute_batch("ROLLBACK;")?;
-        bail!("cannot migrate database schema version {locked_version}");
-    }
-    connection.execute_batch(
-        "CREATE TABLE history_entries_v9 (
-             id                    INTEGER NOT NULL,
-             work_item_id          INTEGER NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
-             kind                  TEXT NOT NULL,
-             actor                 TEXT NOT NULL CHECK (length(trim(actor)) > 0),
-             note                  TEXT,
-             occurred_at           TEXT NOT NULL,
-             changes_json          TEXT NOT NULL,
-             event_id              TEXT,
-             github_actor          TEXT,
-             previous_history_hash TEXT,
-             history_hash          TEXT,
-             state_revision        INTEGER,
-             evidence_trust        TEXT NOT NULL DEFAULT 'trusted',
-             PRIMARY KEY (work_item_id, id)
-         );
-         INSERT INTO history_entries_v9
-             (id, work_item_id, kind, actor, note, occurred_at, changes_json,
-              event_id, github_actor, previous_history_hash, history_hash,
-              state_revision, evidence_trust)
-         SELECT id, work_item_id, kind, actor, note, occurred_at, changes_json,
-                event_id, github_actor, previous_history_hash, history_hash,
-                state_revision, evidence_trust
-         FROM history_entries;
-         DROP TABLE history_entries;
-         ALTER TABLE history_entries_v9 RENAME TO history_entries;
-         CREATE INDEX idx_history_work_item
-             ON history_entries(work_item_id, id);
-         PRAGMA user_version = 9;
-         COMMIT;",
-    )?;
-    Ok(())
-}
-
-fn table_has_column(connection: &Connection, table: &str, column: &str) -> Result<bool> {
-    connection
-        .query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2
-             )",
-            params![table, column],
-            |row| row.get(0),
-        )
-        .map_err(Into::into)
-}
-
-impl Ledger for SqliteLedger {
-    fn prepare_read(&mut self, _policy: ReadPolicy) -> Result<ReadHealth> {
-        Ok(ReadHealth::Local)
-    }
-
-    fn create(
+    pub fn create(
         &mut self,
         title: &str,
         description: Option<&str>,
@@ -1070,11 +110,8 @@ impl Ledger for SqliteLedger {
     ) -> Result<WorkItem> {
         let title = normalized_required(title, "title")?;
         let actor = normalized_required(actor, "actor")?;
-        if status == Status::Archived {
-            return Err(DomainValidationError::new(
-                "a work item cannot be created with archived status",
-            )
-            .into());
+        if status == Status::Deleted {
+            bail!("a work item cannot be created with deleted status");
         }
         let description = normalized_optional(description);
         let now = Utc::now();
@@ -1084,8 +121,8 @@ impl Ledger for SqliteLedger {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "INSERT INTO work_items
-             (title, description, status, created_at, updated_at, archived_at)
-             VALUES (?1, ?2, ?3, ?4, ?4, NULL)",
+             (title, description, status, created_at, updated_at, deleted_at, purge_after)
+             VALUES (?1, ?2, ?3, ?4, ?4, NULL, NULL)",
             params![title, description, status.as_str(), timestamp],
         )?;
         let id = transaction.last_insert_rowid();
@@ -1102,14 +139,14 @@ impl Ledger for SqliteLedger {
         self.get(id)
     }
 
-    fn get(&self, id: i64) -> Result<WorkItem> {
+    pub fn get(&self, id: i64) -> Result<WorkItem> {
         get_item(&self.connection, id)?.with_context(|| format!("work item {id} not found"))
     }
 
-    fn list(
-        &mut self,
+    pub fn list(
+        &self,
         filter: ListFilter,
-        include_archived: bool,
+        include_deleted: bool,
         limit: usize,
     ) -> Result<Vec<WorkItem>> {
         let (status, actionable_only) = match filter {
@@ -1117,43 +154,43 @@ impl Ledger for SqliteLedger {
             ListFilter::All => (None, false),
             ListFilter::Status(status) => (Some(status.as_str()), false),
         };
-        let include_archived = include_archived || filter == ListFilter::Status(Status::Archived);
+        let include_deleted = include_deleted || filter == ListFilter::Status(Status::Deleted);
         let mut statement = self.connection.prepare(&format!(
-            "SELECT id, title, description, status, created_at, updated_at, archived_at
+            "SELECT id, title, description, status, created_at, updated_at, deleted_at, purge_after
              FROM work_items
              WHERE (?1 IS NULL OR status = ?1)
                AND (NOT ?2 OR status IN {ACTIONABLE_STATUSES})
-               AND (?3 OR status != 'archived')
+               AND (?3 OR status != 'deleted')
              ORDER BY {STATUS_PRIORITY_ORDER}
              LIMIT ?4"
         ))?;
         let rows = statement.query_map(
-            params![status, actionable_only, include_archived, limit as i64],
+            params![status, actionable_only, include_deleted, limit as i64],
             row_to_item,
         )?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
 
-    fn daily_view(&mut self, include_archived: bool) -> Result<Vec<WorkItem>> {
-        let (start, end) = local_day_bounds(daily_view_now()?)?;
+    pub fn daily_view(&self, include_deleted: bool) -> Result<Vec<WorkItem>> {
+        let (start, end) = local_day_bounds(Utc::now())?;
         let mut statement = self.connection.prepare(&format!(
-            "SELECT id, title, description, status, created_at, updated_at, archived_at
+            "SELECT id, title, description, status, created_at, updated_at, deleted_at, purge_after
              FROM work_items
              WHERE (updated_at >= ?1 AND updated_at < ?2
                     OR status IN {ACTIONABLE_STATUSES})
-               AND (?3 OR status != 'archived')
+               AND (?3 OR status != 'deleted')
              ORDER BY {STATUS_PRIORITY_ORDER}"
         ))?;
         let rows = statement.query_map(
-            params![timestamp(start), timestamp(end), include_archived],
+            params![timestamp(start), timestamp(end), include_deleted],
             row_to_item,
         )?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
 
-    fn update(
+    pub fn update(
         &mut self,
         id: i64,
         title: Option<&str>,
@@ -1216,7 +253,7 @@ impl Ledger for SqliteLedger {
         self.get(id)
     }
 
-    fn set_status(
+    pub fn set_status(
         &mut self,
         id: i64,
         status: Status,
@@ -1229,23 +266,28 @@ impl Ledger for SqliteLedger {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current = get_item_from_transaction(&transaction, id)?
             .with_context(|| format!("work item {id} not found"))?;
-        ensure_mutable(&current)?;
         if current.status == status {
             transaction.commit()?;
             return Ok(current);
         }
+        ensure_mutable(&current)?;
 
         let now = Utc::now();
-        let (archived_at, kind) = if status == Status::Archived {
-            (Some(timestamp(now)), "archived")
+        let (deleted_at, purge_after, kind) = if status == Status::Deleted {
+            let purge_after = now + Duration::days(RETENTION_DAYS);
+            (
+                Some(timestamp(now)),
+                Some(timestamp(purge_after)),
+                "deleted",
+            )
         } else {
-            (None, "status_changed")
+            (None, None, "status_changed")
         };
         transaction.execute(
             "UPDATE work_items
-             SET status = ?1, updated_at = ?2, archived_at = ?3
-             WHERE id = ?4",
-            params![status.as_str(), timestamp(now), archived_at, id],
+             SET status = ?1, updated_at = ?2, deleted_at = ?3, purge_after = ?4
+             WHERE id = ?5",
+            params![status.as_str(), timestamp(now), deleted_at, purge_after, id],
         )?;
         insert_history(
             &transaction,
@@ -1260,13 +302,7 @@ impl Ledger for SqliteLedger {
         self.get(id)
     }
 
-    fn add_note(
-        &mut self,
-        id: i64,
-        message: &str,
-        actor: &str,
-        _event_id: Option<&str>,
-    ) -> Result<HistoryEntry> {
+    pub fn add_note(&mut self, id: i64, message: &str, actor: &str) -> Result<HistoryEntry> {
         let actor = normalized_required(actor, "actor")?;
         let message = normalized_required(message, "message")?;
         let transaction = self
@@ -1276,7 +312,7 @@ impl Ledger for SqliteLedger {
             .with_context(|| format!("work item {id} not found"))?;
         ensure_mutable(&current)?;
         let now = Utc::now();
-        let history_id = insert_history(
+        insert_history(
             &transaction,
             id,
             "noted",
@@ -1289,6 +325,7 @@ impl Ledger for SqliteLedger {
             "UPDATE work_items SET updated_at = ?1 WHERE id = ?2",
             params![timestamp(now), id],
         )?;
+        let history_id = transaction.last_insert_rowid();
         transaction.commit()?;
         self.history(id)?
             .into_iter()
@@ -1296,12 +333,10 @@ impl Ledger for SqliteLedger {
             .context("new history entry not found")
     }
 
-    fn history(&mut self, id: i64) -> Result<Vec<HistoryEntry>> {
+    pub fn history(&self, id: i64) -> Result<Vec<HistoryEntry>> {
         self.get(id)?;
         let mut statement = self.connection.prepare(
-            "SELECT id, work_item_id, event_id, kind, actor, github_actor, note, occurred_at,
-                    changes_json, previous_history_hash, history_hash, state_revision,
-                    evidence_trust
+            "SELECT id, work_item_id, kind, actor, note, occurred_at, changes_json
              FROM history_entries
              WHERE work_item_id = ?1
              ORDER BY id",
@@ -1311,50 +346,44 @@ impl Ledger for SqliteLedger {
             .map_err(Into::into)
     }
 
-    fn rejected_mutations(&mut self, id: i64) -> Result<Vec<RejectedMutation>> {
-        self.get(id)?;
-        let mut statement = self.connection.prepare(
-            "SELECT id, work_item_id, event_id, actor, github_actor, note, occurred_at,
-                    expected_state_revision, current_state_revision, changes_json
-             FROM rejected_mutations
-             WHERE work_item_id = ?1
-             ORDER BY id",
-        )?;
-        let rows = statement.query_map(params![id], row_to_rejected_mutation)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
+    pub fn purge_expired(&self, now: DateTime<Utc>) -> Result<usize> {
+        self.connection
+            .execute(
+                "DELETE FROM work_items
+                 WHERE status = 'deleted' AND purge_after <= ?1",
+                params![timestamp(now)],
+            )
             .map_err(Into::into)
     }
 }
 
 fn ensure_mutable(item: &WorkItem) -> Result<()> {
-    if item.status == Status::Archived {
-        return Err(DomainValidationError::new(format!(
-            "work item {} is archived and cannot be modified",
+    if item.status == Status::Deleted {
+        bail!(
+            "work item {} is deleted and cannot be modified during retention",
             item.id
-        ))
-        .into());
+        );
     }
     Ok(())
 }
 
-fn timestamp(value: DateTime<Utc>) -> String {
-    value.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+fn normalized_required(value: &str, field: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("{field} cannot be empty");
+    }
+    Ok(value.to_owned())
 }
 
-fn daily_view_now() -> Result<DateTime<Utc>> {
-    #[cfg(debug_assertions)]
-    match std::env::var("WORK_TRACKER_TEST_NOW") {
-        Ok(value) => {
-            return DateTime::parse_from_rfc3339(&value)
-                .map(|value| value.with_timezone(&Utc))
-                .with_context(|| "WORK_TRACKER_TEST_NOW must be an RFC 3339 timestamp");
-        }
-        Err(std::env::VarError::NotPresent) => {}
-        Err(std::env::VarError::NotUnicode(_)) => {
-            bail!("WORK_TRACKER_TEST_NOW must be valid UTF-8");
-        }
-    }
-    Ok(Utc::now())
+fn normalized_optional(value: Option<&str>) -> Option<String> {
+    value.and_then(|value| {
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.to_owned())
+    })
+}
+
+fn timestamp(value: DateTime<Utc>) -> String {
+    value.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 fn local_day_bounds(now: DateTime<Utc>) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
@@ -1384,18 +413,12 @@ fn insert_history(
     note: Option<String>,
     occurred_at: DateTime<Utc>,
     changes: &Value,
-) -> Result<i64> {
-    let id = transaction.query_row(
-        "SELECT COALESCE(MAX(id), 0) + 1 FROM history_entries",
-        [],
-        |row| row.get(0),
-    )?;
+) -> Result<()> {
     transaction.execute(
         "INSERT INTO history_entries
-         (id, work_item_id, kind, actor, note, occurred_at, changes_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+         (work_item_id, kind, actor, note, occurred_at, changes_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
-            id,
             work_item_id,
             kind,
             actor,
@@ -1404,13 +427,13 @@ fn insert_history(
             serde_json::to_string(changes)?
         ],
     )?;
-    Ok(id)
+    Ok(())
 }
 
 fn get_item(connection: &Connection, id: i64) -> Result<Option<WorkItem>> {
     connection
         .query_row(
-            "SELECT id, title, description, status, created_at, updated_at, archived_at
+            "SELECT id, title, description, status, created_at, updated_at, deleted_at, purge_after
              FROM work_items WHERE id = ?1",
             params![id],
             row_to_item,
@@ -1422,7 +445,7 @@ fn get_item(connection: &Connection, id: i64) -> Result<Option<WorkItem>> {
 fn get_item_from_transaction(transaction: &Transaction<'_>, id: i64) -> Result<Option<WorkItem>> {
     transaction
         .query_row(
-            "SELECT id, title, description, status, created_at, updated_at, archived_at
+            "SELECT id, title, description, status, created_at, updated_at, deleted_at, purge_after
              FROM work_items WHERE id = ?1",
             params![id],
             row_to_item,
@@ -1445,76 +468,22 @@ fn row_to_item(row: &Row<'_>) -> rusqlite::Result<WorkItem> {
         })?,
         created_at: datetime_column(row, 4)?,
         updated_at: datetime_column(row, 5)?,
-        archived_at: optional_datetime_column(row, 6)?,
         deleted_at: optional_datetime_column(row, 6)?,
-        purge_after: None,
-        ledger_integrity_error: false,
-    })
-}
-
-fn row_to_rejected_mutation(row: &Row<'_>) -> rusqlite::Result<RejectedMutation> {
-    let changes: String = row.get(9)?;
-    Ok(RejectedMutation {
-        id: row.get(0)?,
-        work_item_id: row.get(1)?,
-        event_id: row.get(2)?,
-        actor: row.get(3)?,
-        github_actor: row.get(4)?,
-        note: row.get(5)?,
-        occurred_at: datetime_column(row, 6)?,
-        expected_state_revision: row.get(7)?,
-        current_state_revision: row.get(8)?,
-        changes: serde_json::from_str(&changes).map_err(|error| conversion_error(9, error))?,
+        purge_after: optional_datetime_column(row, 7)?,
     })
 }
 
 fn row_to_history(row: &Row<'_>) -> rusqlite::Result<HistoryEntry> {
-    let changes_json: String = row.get(8)?;
-    let mut kind: String = row.get(3)?;
-    let mut changes: Value =
-        serde_json::from_str(&changes_json).map_err(|error| conversion_error(6, error))?;
-    canonicalize_archival_history(&mut kind, &mut changes);
+    let changes_json: String = row.get(6)?;
     Ok(HistoryEntry {
         id: row.get(0)?,
         work_item_id: row.get(1)?,
-        event_id: row.get(2)?,
-        kind,
-        actor: row.get(4)?,
-        github_actor: row.get(5)?,
-        note: row.get(6)?,
-        occurred_at: datetime_column(row, 7)?,
-        changes,
-        previous_history_hash: row.get(9)?,
-        history_hash: row.get(10)?,
-        state_revision: row.get(11)?,
-        trust: match row.get::<_, String>(12)?.as_str() {
-            "trusted" => EvidenceTrust::Trusted,
-            "untrusted" => EvidenceTrust::Untrusted,
-            value => {
-                return Err(conversion_error(
-                    12,
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("invalid evidence trust {value}"),
-                    ),
-                ));
-            }
-        },
+        kind: row.get(2)?,
+        actor: row.get(3)?,
+        note: row.get(4)?,
+        occurred_at: datetime_column(row, 5)?,
+        changes: serde_json::from_str(&changes_json).map_err(|error| conversion_error(6, error))?,
     })
-}
-
-fn canonicalize_archival_history(kind: &mut String, changes: &mut Value) {
-    if kind == "deleted" {
-        *kind = "archived".to_owned();
-    }
-    let Some(status_change) = changes.get_mut("status").and_then(Value::as_object_mut) else {
-        return;
-    };
-    for side in ["from", "to"] {
-        if status_change.get(side).and_then(Value::as_str) == Some("deleted") {
-            status_change.insert(side.to_owned(), Value::String("archived".to_owned()));
-        }
-    }
 }
 
 fn datetime_column(row: &Row<'_>, index: usize) -> rusqlite::Result<DateTime<Utc>> {
@@ -1548,795 +517,10 @@ fn conversion_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::ensure;
-
-    fn github_cache_item(work_item_id: i64, history_id: i64) -> GithubCacheItem {
-        let occurred_at = Utc
-            .with_ymd_and_hms(2026, 9, 23, 1, 2, 3)
-            .single()
-            .expect("valid fixture timestamp");
-        GithubCacheItem {
-            item: WorkItem {
-                id: work_item_id,
-                title: format!("Work item {work_item_id}"),
-                description: None,
-                status: Status::Active,
-                created_at: occurred_at,
-                updated_at: occurred_at,
-                archived_at: None,
-                deleted_at: None,
-                purge_after: None,
-                ledger_integrity_error: false,
-            },
-            history: vec![HistoryEntry {
-                id: history_id,
-                work_item_id,
-                event_id: None,
-                kind: "untrusted_evidence".to_owned(),
-                actor: "reviewer-a".to_owned(),
-                github_actor: Some("octocat".to_owned()),
-                note: None,
-                occurred_at,
-                changes: json!({"retained_body": "damaged"}),
-                previous_history_hash: None,
-                history_hash: None,
-                state_revision: None,
-                trust: EvidenceTrust::Untrusted,
-            }],
-            rejected: Vec::new(),
-            evidence: Vec::new(),
-        }
-    }
-
-    fn complete_github_cache_item(work_item_id: i64, history_id: i64) -> GithubCacheItem {
-        complete_github_cache_item_with_title(
-            work_item_id,
-            history_id,
-            format!("Work item {work_item_id}"),
-        )
-    }
-
-    fn complete_github_cache_item_with_title(
-        work_item_id: i64,
-        history_id: i64,
-        title: String,
-    ) -> GithubCacheItem {
-        let mut cached = github_cache_item(work_item_id, history_id);
-        let occurred_at = cached.item.updated_at;
-        cached.item.title.clone_from(&title);
-        cached.history[0].event_id = Some(format!("event-{work_item_id}"));
-        cached.history[0].kind = "created".to_owned();
-        cached.history[0].actor = "agent-a".to_owned();
-        cached.history[0].changes = json!({
-            "title": title,
-            "description": null,
-            "status": "active",
-        });
-        cached.history[0].history_hash = Some("verified-hash".to_owned());
-        cached.history[0].state_revision = Some(1);
-        cached.history[0].trust = EvidenceTrust::Trusted;
-        cached.rejected.push(RejectedMutation {
-            id: history_id + 100,
-            work_item_id,
-            event_id: format!("rejected-{work_item_id}"),
-            actor: "agent-b".to_owned(),
-            github_actor: "octocat".to_owned(),
-            note: Some("stale proposal".to_owned()),
-            occurred_at,
-            expected_state_revision: 0,
-            current_state_revision: 1,
-            changes: json!({"title": {"from": cached.item.title, "to": "Stale title"}}),
-        });
-        cached.evidence.push(GithubEventEvidence {
-            comment_id: history_id,
-            event_id: Some(format!("event-{work_item_id}")),
-            github_actor: "octocat".to_owned(),
-            body: "exact structured event body".to_owned(),
-            history_hash: Some("verified-hash".to_owned()),
-        });
-        cached
-    }
-
-    fn assert_complete_github_cache_item(
-        tracker: &mut SqliteLedger,
-        work_item_id: i64,
-        title: &str,
-        history_id: i64,
-        context: &str,
-    ) -> Result<()> {
-        assert_eq!(tracker.get(work_item_id)?.title, title, "{context}");
-        let history = tracker.history(work_item_id)?;
-        let expected_event_id = format!("event-{work_item_id}");
-        assert_eq!(history.len(), 1, "{context}");
-        assert_eq!(history[0].id, history_id, "{context}");
-        assert_eq!(history[0].kind, "created", "{context}");
-        assert_eq!(
-            history[0].event_id.as_deref(),
-            Some(expected_event_id.as_str()),
-            "{context}"
-        );
-        assert_eq!(
-            history[0].changes,
-            json!({"title": title, "description": null, "status": "active"}),
-            "{context}"
-        );
-        assert_eq!(
-            history[0].history_hash.as_deref(),
-            Some("verified-hash"),
-            "{context}"
-        );
-        assert_eq!(history[0].state_revision, Some(1), "{context}");
-        assert_eq!(history[0].trust, EvidenceTrust::Trusted, "{context}");
-        let rejected = tracker.rejected_mutations(work_item_id)?;
-        assert_eq!(rejected.len(), 1, "{context}");
-        assert_eq!(rejected[0].id, history_id + 100, "{context}");
-        assert_eq!(
-            rejected[0].event_id,
-            format!("rejected-{work_item_id}"),
-            "{context}"
-        );
-        assert_eq!(
-            rejected[0].changes,
-            json!({"title": {"from": title, "to": "Stale title"}}),
-            "{context}"
-        );
-        let evidence: (i64, Option<String>, String, String, Option<String>) =
-            tracker.connection.query_row(
-                "SELECT comment_id, event_id, github_actor, body, history_hash
-                 FROM github_event_evidence WHERE work_item_id = ?1",
-                [work_item_id],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
-            )?;
-        assert_eq!(
-            evidence,
-            (
-                history_id,
-                Some(format!("event-{work_item_id}")),
-                "octocat".to_owned(),
-                "exact structured event body".to_owned(),
-                Some("verified-hash".to_owned()),
-            ),
-            "{context}"
-        );
-        Ok(())
-    }
-
-    fn exact_cache_database_snapshot(
-        tracker: &SqliteLedger,
-    ) -> Result<Vec<(String, Vec<Vec<String>>)>> {
-        let tables = [
-            ("work_items", "id"),
-            ("history_entries", "work_item_id, id"),
-            ("rejected_mutations", "work_item_id, id"),
-            ("github_event_evidence", "work_item_id, comment_id"),
-            ("github_integrity_errors", "work_item_id"),
-            ("pending_github_creations", "request_json"),
-            ("github_cache_state", "repository"),
-            ("sqlite_sequence", "name"),
-        ];
-        let mut snapshot = Vec::with_capacity(tables.len());
-        for (table, order) in tables {
-            let mut statement = tracker
-                .connection
-                .prepare(&format!("SELECT * FROM {table} ORDER BY {order}"))?;
-            let column_count = statement.column_count();
-            let rows = statement
-                .query_map([], |row| {
-                    (0..column_count)
-                        .map(|index| {
-                            let value = match row.get_ref(index)? {
-                                rusqlite::types::ValueRef::Null => "null".to_owned(),
-                                rusqlite::types::ValueRef::Integer(value) => {
-                                    format!("integer:{value}")
-                                }
-                                rusqlite::types::ValueRef::Real(value) => {
-                                    format!("real:{:016x}", value.to_bits())
-                                }
-                                rusqlite::types::ValueRef::Text(value) => {
-                                    format!("text:{value:?}")
-                                }
-                                rusqlite::types::ValueRef::Blob(value) => {
-                                    format!("blob:{value:?}")
-                                }
-                            };
-                            Ok(value)
-                        })
-                        .collect::<rusqlite::Result<Vec<_>>>()
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            snapshot.push((table.to_owned(), rows));
-        }
-        Ok(snapshot)
-    }
-
-    fn seed_cache_failure_state(
-        tracker: &mut SqliteLedger,
-        repository: &str,
-        request_json: &str,
-        old_sync: DateTime<Utc>,
-        with_cache_state: bool,
-    ) -> Result<()> {
-        let old_item = complete_github_cache_item(41, 9001);
-        let old_current_item =
-            complete_github_cache_item_with_title(42, 9002, "Old cached Work Item 42".to_owned());
-        if with_cache_state {
-            tracker.replace_github_cache_batch(
-                repository,
-                &[old_item, old_current_item],
-                GithubCacheCleanup {
-                    removed_item_ids: &[],
-                    completed_creation_requests: &[],
-                },
-                Some(old_sync),
-                Some("old-etag"),
-                old_sync,
-            )?;
-        } else {
-            tracker.replace_github_item(&old_item)?;
-            tracker.replace_github_item(&old_current_item)?;
-        }
-        tracker.begin_github_creation(request_json, "pending-event")?;
-        Ok(())
-    }
 
     #[test]
-    fn cache_batch_failure_at_each_step_rolls_back_and_retry_converges() -> Result<()> {
-        let repository = "octocat/work-tracker-data";
-        let request_json = r#"{"title":"pending"}"#;
-        let old_sync = Utc
-            .with_ymd_and_hms(2026, 9, 23, 1, 0, 0)
-            .single()
-            .expect("valid fixture timestamp");
-        let new_sync = Utc
-            .with_ymd_and_hms(2026, 9, 23, 2, 0, 0)
-            .single()
-            .expect("valid fixture timestamp");
-        let triggers = [
-            (
-                "removed Work Item",
-                "CREATE TRIGGER interrupt_cache_step BEFORE DELETE ON work_items
-                 WHEN OLD.id = 41 BEGIN SELECT RAISE(ABORT, 'removed item'); END;",
-                true,
-            ),
-            (
-                "current Work Item",
-                "CREATE TRIGGER interrupt_cache_step BEFORE INSERT ON work_items
-                 WHEN NEW.id = 42 BEGIN SELECT RAISE(ABORT, 'current item'); END;",
-                true,
-            ),
-            (
-                "accepted history cleanup",
-                "CREATE TRIGGER interrupt_cache_step BEFORE DELETE ON history_entries
-                 WHEN OLD.work_item_id = 42 BEGIN SELECT RAISE(ABORT, 'history cleanup'); END;",
-                true,
-            ),
-            (
-                "accepted history replacement",
-                "CREATE TRIGGER interrupt_cache_step BEFORE INSERT ON history_entries
-                 WHEN NEW.work_item_id = 42 BEGIN SELECT RAISE(ABORT, 'history'); END;",
-                true,
-            ),
-            (
-                "Rejected Mutation cleanup",
-                "CREATE TRIGGER interrupt_cache_step BEFORE DELETE ON rejected_mutations
-                 WHEN OLD.work_item_id = 42 BEGIN SELECT RAISE(ABORT, 'rejected cleanup'); END;",
-                true,
-            ),
-            (
-                "Rejected Mutation replacement",
-                "CREATE TRIGGER interrupt_cache_step BEFORE INSERT ON rejected_mutations
-                 WHEN NEW.work_item_id = 42 BEGIN SELECT RAISE(ABORT, 'rejected'); END;",
-                true,
-            ),
-            (
-                "exact event evidence cleanup",
-                "CREATE TRIGGER interrupt_cache_step BEFORE DELETE ON github_event_evidence
-                 WHEN OLD.work_item_id = 42 BEGIN SELECT RAISE(ABORT, 'evidence cleanup'); END;",
-                true,
-            ),
-            (
-                "exact event evidence replacement",
-                "CREATE TRIGGER interrupt_cache_step BEFORE INSERT ON github_event_evidence
-                 WHEN NEW.work_item_id = 42 BEGIN SELECT RAISE(ABORT, 'evidence'); END;",
-                true,
-            ),
-            (
-                "completed creation cleanup",
-                "CREATE TRIGGER interrupt_cache_step BEFORE DELETE ON pending_github_creations
-                 BEGIN SELECT RAISE(ABORT, 'pending creation'); END;",
-                true,
-            ),
-            (
-                "freshness metadata update",
-                "CREATE TRIGGER interrupt_cache_step BEFORE UPDATE ON github_cache_state
-                 BEGIN SELECT RAISE(ABORT, 'freshness'); END;",
-                true,
-            ),
-            (
-                "freshness metadata insert",
-                "CREATE TRIGGER interrupt_cache_step BEFORE INSERT ON github_cache_state
-                 BEGIN SELECT RAISE(ABORT, 'freshness insert'); END;",
-                false,
-            ),
-        ];
-
-        for (step, trigger, with_cache_state) in triggers {
-            let mut tracker = SqliteLedger::open_in_memory()?;
-            seed_cache_failure_state(
-                &mut tracker,
-                repository,
-                request_json,
-                old_sync,
-                with_cache_state,
-            )?;
-            let before_failure = exact_cache_database_snapshot(&tracker)?;
-            tracker.connection.execute_batch(trigger)?;
-
-            let new_item = complete_github_cache_item(42, 9102);
-            let failed = tracker.replace_github_cache_batch(
-                repository,
-                std::slice::from_ref(&new_item),
-                GithubCacheCleanup {
-                    removed_item_ids: &[41],
-                    completed_creation_requests: &[request_json.to_owned()],
-                },
-                Some(new_sync),
-                Some("new-etag"),
-                new_sync,
-            );
-            ensure!(failed.is_err(), "{step} failure was not injected");
-            assert_eq!(
-                exact_cache_database_snapshot(&tracker)?,
-                before_failure,
-                "{step} did not roll the complete cache database back exactly"
-            );
-            ensure!(
-                tracker.get(41).is_ok(),
-                "{step} partially removed old state"
-            );
-            ensure!(
-                tracker.get(42).is_ok(),
-                "{step} removed the prior current state"
-            );
-            assert_complete_github_cache_item(&mut tracker, 41, "Work item 41", 9001, step)?;
-            assert_complete_github_cache_item(
-                &mut tracker,
-                42,
-                "Old cached Work Item 42",
-                9002,
-                step,
-            )?;
-            ensure!(
-                tracker.pending_github_creation(request_json)?.is_some(),
-                "{step} partially cleared pending creation"
-            );
-            assert_eq!(
-                tracker.github_sync_cursor(repository)?,
-                with_cache_state.then_some(old_sync),
-                "{step}"
-            );
-
-            tracker
-                .connection
-                .execute_batch("DROP TRIGGER interrupt_cache_step;")?;
-            let mut expected = SqliteLedger::open_in_memory()?;
-            seed_cache_failure_state(
-                &mut expected,
-                repository,
-                request_json,
-                old_sync,
-                with_cache_state,
-            )?;
-            expected.replace_github_cache_batch(
-                repository,
-                std::slice::from_ref(&new_item),
-                GithubCacheCleanup {
-                    removed_item_ids: &[41],
-                    completed_creation_requests: &[request_json.to_owned()],
-                },
-                Some(new_sync),
-                Some("new-etag"),
-                new_sync,
-            )?;
-            let expected_after_retry = exact_cache_database_snapshot(&expected)?;
-            tracker.replace_github_cache_batch(
-                repository,
-                std::slice::from_ref(&new_item),
-                GithubCacheCleanup {
-                    removed_item_ids: &[41],
-                    completed_creation_requests: &[request_json.to_owned()],
-                },
-                Some(new_sync),
-                Some("new-etag"),
-                new_sync,
-            )?;
-            assert_eq!(
-                exact_cache_database_snapshot(&tracker)?,
-                expected_after_retry,
-                "{step} retry did not converge to the exact expected cache database"
-            );
-            ensure!(
-                tracker.get(41).is_err(),
-                "{step} retry retained removed state"
-            );
-            assert_complete_github_cache_item(&mut tracker, 42, "Work item 42", 9102, step)?;
-            ensure!(
-                tracker.pending_github_creation(request_json)?.is_none(),
-                "{step}"
-            );
-            assert_eq!(
-                tracker.github_sync_cursor(repository)?,
-                Some(new_sync),
-                "{step}"
-            );
-            assert_eq!(
-                tracker.github_last_successful_sync_at(repository)?,
-                Some(new_sync),
-                "{step}"
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn recovery_evidence_identity_is_scoped_to_its_work_item() -> Result<()> {
-        let mut tracker = SqliteLedger::open_in_memory()?;
-        tracker.replace_github_item(&github_cache_item(41, -9002))?;
-        tracker.replace_github_item(&github_cache_item(42, -9002))?;
-
-        assert_eq!(tracker.history(41)?.len(), 1);
-        assert_eq!(tracker.history(42)?.len(), 1);
-        Ok(())
-    }
-
-    #[test]
-    fn integrity_snapshot_and_latch_roll_back_together() -> Result<()> {
-        let mut tracker = SqliteLedger::open_in_memory()?;
-        tracker.connection.execute_batch(
-            "CREATE TRIGGER reject_integrity_latch
-             BEFORE INSERT ON github_integrity_errors
-             BEGIN
-               SELECT RAISE(ABORT, 'simulated latch interruption');
-             END;",
-        )?;
-        let report = IntegrityDoctorReport {
-            work_item_id: 41,
-            integrity_health: crate::domain::IntegrityHealth::LedgerIntegrityError,
-            archived: false,
-            first_break: None,
-            trusted_event_count: 0,
-            untrusted_event_count: 1,
-            timeline_evidence: Vec::new(),
-            eligible_repair_modes: Vec::new(),
-            observed_evidence: Vec::new(),
-        };
-
-        assert!(
-            tracker
-                .preserve_github_integrity(Some(&github_cache_item(41, -9001)), &report)
-                .is_err()
-        );
-        assert!(tracker.get(41).is_err());
-        assert!(tracker.github_integrity_report(41)?.is_none());
-
-        tracker
-            .connection
-            .execute_batch("DROP TRIGGER reject_integrity_latch;")?;
-        tracker.preserve_github_integrity(Some(&github_cache_item(41, -9001)), &report)?;
-        assert_eq!(tracker.get(41)?.id, 41);
-        assert_eq!(
-            tracker
-                .github_integrity_report(41)?
-                .map(|report| report.work_item_id),
-            Some(41)
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn completing_one_recovery_preserves_repository_sync_freshness() -> Result<()> {
-        let mut tracker = SqliteLedger::open_in_memory()?;
-        let repository = "octocat/work-tracker-data";
-        let synchronized_at = Utc
-            .with_ymd_and_hms(2026, 9, 23, 1, 0, 0)
-            .single()
-            .expect("valid fixture timestamp");
-        tracker.mark_github_sync_success(repository, synchronized_at)?;
-
-        tracker.complete_github_recovery(&github_cache_item(41, -9001))?;
-
-        assert_eq!(
-            tracker.github_last_successful_sync_at(repository)?,
-            Some(synchronized_at)
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn trusted_history_migration_invalidates_the_v4_incremental_cursor() -> Result<()> {
-        let connection = Connection::open_in_memory()?;
-        connection.execute_batch(
-            "CREATE TABLE history_entries (
-                 id INTEGER PRIMARY KEY,
-                 work_item_id INTEGER NOT NULL,
-                 kind TEXT NOT NULL,
-                 actor TEXT NOT NULL,
-                 note TEXT,
-                 occurred_at TEXT NOT NULL,
-                 changes_json TEXT NOT NULL
-             );
-             CREATE TABLE github_cache_state (
-                 repository TEXT PRIMARY KEY,
-                 sync_cursor TEXT,
-                 etag TEXT
-             );
-             INSERT INTO github_cache_state VALUES
-                 ('octocat/work-tracker-data', '2026-09-23T01:00:00.000Z', 'old-etag');
-             PRAGMA user_version = 4;",
-        )?;
-
-        migrate_trusted_history(&connection)?;
-
-        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 5);
-        let state: (Option<String>, Option<String>) = connection.query_row(
-            "SELECT sync_cursor, etag FROM github_cache_state",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        assert_eq!(state, (None, None));
-        let trusted_columns: i64 = connection.query_row(
-            "SELECT count(*) FROM pragma_table_info('history_entries')
-             WHERE name IN ('event_id', 'github_actor', 'previous_history_hash',
-                            'history_hash', 'state_revision')",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(trusted_columns, 5);
-        Ok(())
-    }
-
-    #[test]
-    fn ticket_6_schema_5_adds_freshness_as_schema_6() -> Result<()> {
-        let connection = Connection::open_in_memory()?;
-        connection.execute_batch(
-            "CREATE TABLE history_entries (
-                 id INTEGER PRIMARY KEY,
-                 event_id TEXT,
-                 github_actor TEXT,
-                 previous_history_hash TEXT,
-                 history_hash TEXT,
-                 state_revision INTEGER
-             );
-             CREATE TABLE github_cache_state (
-                 repository TEXT PRIMARY KEY,
-                 sync_cursor TEXT,
-                 etag TEXT
-             );
-             PRAGMA user_version = 5;",
-        )?;
-
-        migrate_legacy_schema_5(&connection)?;
-
-        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 6);
-        assert!(table_has_column(
-            &connection,
-            "github_cache_state",
-            "last_successful_sync_at"
-        )?);
-        Ok(())
-    }
-
-    #[test]
-    fn ticket_8_schema_5_adds_trusted_history_and_requires_a_fresh_replay() -> Result<()> {
-        let connection = Connection::open_in_memory()?;
-        connection.execute_batch(
-            "CREATE TABLE history_entries (
-                 id INTEGER PRIMARY KEY,
-                 work_item_id INTEGER NOT NULL,
-                 kind TEXT NOT NULL,
-                 actor TEXT NOT NULL,
-                 note TEXT,
-                 occurred_at TEXT NOT NULL,
-                 changes_json TEXT NOT NULL
-             );
-             CREATE TABLE github_cache_state (
-                 repository TEXT PRIMARY KEY,
-                 sync_cursor TEXT,
-                 etag TEXT,
-                 last_successful_sync_at TEXT
-             );
-             INSERT INTO github_cache_state VALUES (
-                 'octocat/work-tracker-data',
-                 '2026-09-23T01:00:00.000Z',
-                 'old-etag',
-                 '2026-09-23T01:01:00.000Z'
-             );
-             PRAGMA user_version = 5;",
-        )?;
-
-        migrate_legacy_schema_5(&connection)?;
-
-        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 6);
-        let trusted_columns: i64 = connection.query_row(
-            "SELECT count(*) FROM pragma_table_info('history_entries')
-             WHERE name IN ('event_id', 'github_actor', 'previous_history_hash',
-                            'history_hash', 'state_revision')",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(trusted_columns, 5);
-        let state: (Option<String>, Option<String>, Option<String>) = connection.query_row(
-            "SELECT sync_cursor, etag, last_successful_sync_at FROM github_cache_state",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
-        assert_eq!(state, (None, None, None));
-        Ok(())
-    }
-
-    #[test]
-    fn schema_6_adds_durable_rejected_mutations_as_schema_7() -> Result<()> {
-        let connection = Connection::open_in_memory()?;
-        connection.execute_batch(
-            "CREATE TABLE work_items (id INTEGER PRIMARY KEY);
-             CREATE TABLE github_cache_state (
-                 repository TEXT PRIMARY KEY,
-                 sync_cursor TEXT,
-                 etag TEXT,
-                 last_successful_sync_at TEXT
-             );
-             INSERT INTO github_cache_state
-                 (repository, sync_cursor, etag, last_successful_sync_at)
-             VALUES ('octocat/work-tracker-data', 'cursor-6', 'etag-6',
-                     '2026-09-23T00:00:00Z');
-             PRAGMA user_version = 6;",
-        )?;
-
-        migrate_rejected_mutations(&connection)?;
-
-        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 7);
-        let columns: i64 = connection.query_row(
-            "SELECT count(*) FROM pragma_table_info('rejected_mutations')
-             WHERE name IN ('event_id', 'expected_state_revision',
-                            'current_state_revision', 'changes_json')",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(columns, 4);
-        let state: (Option<String>, Option<String>, Option<String>) = connection.query_row(
-            "SELECT sync_cursor, etag, last_successful_sync_at FROM github_cache_state",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
-        assert_eq!(state, (None, None, None));
-        Ok(())
-    }
-
-    #[test]
-    fn schema_7_adds_integrity_evidence_and_preserves_history_as_trusted() -> Result<()> {
-        let connection = Connection::open_in_memory()?;
-        connection.execute_batch(
-            "CREATE TABLE work_items (id INTEGER PRIMARY KEY);
-             CREATE TABLE history_entries (
-                 id INTEGER PRIMARY KEY,
-                 work_item_id INTEGER NOT NULL,
-                 kind TEXT NOT NULL,
-                 actor TEXT NOT NULL,
-                 note TEXT,
-                 occurred_at TEXT NOT NULL,
-                 changes_json TEXT NOT NULL,
-                 event_id TEXT,
-                 github_actor TEXT,
-                 previous_history_hash TEXT,
-                 history_hash TEXT,
-                 state_revision INTEGER
-             );
-             INSERT INTO history_entries
-                 (id, work_item_id, kind, actor, occurred_at, changes_json)
-             VALUES (9001, 41, 'created', 'agent-a',
-                     '2026-09-23T00:00:00Z', '{}');
-             CREATE TABLE github_cache_state (
-                 repository TEXT PRIMARY KEY,
-                 sync_cursor TEXT,
-                 etag TEXT,
-                 last_successful_sync_at TEXT
-             );
-             INSERT INTO github_cache_state VALUES
-                 ('octocat/work-tracker-data', 'cursor-7', 'etag-7',
-                  '2026-09-23T00:00:00Z');
-             PRAGMA user_version = 7;",
-        )?;
-
-        migrate_integrity_evidence(&connection)?;
-
-        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 8);
-        let trust: String = connection.query_row(
-            "SELECT evidence_trust FROM history_entries WHERE id = 9001",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(trust, "trusted");
-        let tables: i64 = connection.query_row(
-            "SELECT count(*) FROM sqlite_master
-             WHERE type = 'table'
-               AND name IN ('github_event_evidence', 'github_integrity_errors')",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(tables, 2);
-        let state: (Option<String>, Option<String>, Option<String>) = connection.query_row(
-            "SELECT sync_cursor, etag, last_successful_sync_at FROM github_cache_state",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
-        assert_eq!(state, (None, None, None));
-        Ok(())
-    }
-
-    #[test]
-    fn schema_8_scopes_history_identity_to_each_work_item() -> Result<()> {
-        let connection = Connection::open_in_memory()?;
-        connection.execute_batch(
-            "CREATE TABLE work_items (id INTEGER PRIMARY KEY);
-             INSERT INTO work_items VALUES (41), (42);
-             CREATE TABLE history_entries (
-                 id INTEGER PRIMARY KEY,
-                 work_item_id INTEGER NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
-                 kind TEXT NOT NULL,
-                 actor TEXT NOT NULL,
-                 note TEXT,
-                 occurred_at TEXT NOT NULL,
-                 changes_json TEXT NOT NULL,
-                 event_id TEXT,
-                 github_actor TEXT,
-                 previous_history_hash TEXT,
-                 history_hash TEXT,
-                 state_revision INTEGER,
-                 evidence_trust TEXT NOT NULL DEFAULT 'trusted'
-             );
-             INSERT INTO history_entries
-                 (id, work_item_id, kind, actor, occurred_at, changes_json, evidence_trust)
-             VALUES (-9002, 41, 'untrusted_evidence', 'reviewer-a',
-                     '2026-09-23T00:00:00Z', '{}', 'untrusted');
-             PRAGMA user_version = 8;",
-        )?;
-
-        migrate_work_item_scoped_history_identity(&connection)?;
-        connection.execute(
-            "INSERT INTO history_entries
-                 (id, work_item_id, kind, actor, occurred_at, changes_json, evidence_trust)
-             VALUES (-9002, 42, 'untrusted_evidence', 'reviewer-a',
-                     '2026-09-23T00:00:00Z', '{}', 'untrusted')",
-            [],
-        )?;
-
-        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 9);
-        let retained: i64 = connection.query_row(
-            "SELECT count(*) FROM history_entries WHERE id = -9002",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(retained, 2);
-        Ok(())
-    }
-
-    #[test]
-    fn lifecycle_records_history_and_keeps_archived_item() -> Result<()> {
-        let mut tracker = SqliteLedger::open_in_memory()?;
+    fn lifecycle_records_history_and_keeps_deleted_item() -> Result<()> {
+        let mut tracker = Tracker::open_in_memory()?;
         let item = tracker.create(
             "Watch CI",
             Some("Wait for the queued suite"),
@@ -2345,13 +529,11 @@ mod tests {
             None,
         )?;
         tracker.set_status(item.id, Status::Waiting, "agent-a", Some("CI queued"))?;
-        let archived = tracker.set_status(item.id, Status::Archived, "human", Some("obsolete"))?;
+        let deleted = tracker.set_status(item.id, Status::Deleted, "human", Some("obsolete"))?;
 
-        assert_eq!(archived.status, Status::Archived);
+        assert_eq!(deleted.status, Status::Deleted);
         assert_eq!(tracker.history(item.id)?.len(), 3);
-        assert!(archived.archived_at.is_some());
-        assert_eq!(archived.deleted_at, archived.archived_at);
-        assert!(archived.purge_after.is_none());
+        assert!(deleted.purge_after.is_some());
         assert!(tracker.list(ListFilter::All, false, 100)?.is_empty());
         assert_eq!(tracker.list(ListFilter::All, true, 100)?.len(), 1);
         Ok(())
@@ -2359,7 +541,7 @@ mod tests {
 
     #[test]
     fn repeated_status_is_idempotent() -> Result<()> {
-        let mut tracker = SqliteLedger::open_in_memory()?;
+        let mut tracker = Tracker::open_in_memory()?;
         let item = tracker.create("Compile", None, Status::Active, "agent-a", None)?;
         tracker.set_status(item.id, Status::Active, "agent-b", None)?;
         assert_eq!(tracker.history(item.id)?.len(), 1);
@@ -2367,46 +549,21 @@ mod tests {
     }
 
     #[test]
-    fn repeated_archived_status_is_rejected_as_an_ordinary_mutation() -> Result<()> {
-        let mut tracker = SqliteLedger::open_in_memory()?;
-        let item = tracker.create("Retain evidence", None, Status::Active, "agent-a", None)?;
-        tracker.set_status(item.id, Status::Archived, "agent-a", None)?;
-
-        let error = tracker
-            .set_status(item.id, Status::Archived, "agent-b", None)
-            .expect_err("Archived Work Items must reject even a repeated Status");
-
-        assert!(
-            error
-                .to_string()
-                .contains("is archived and cannot be modified")
-        );
-        assert_eq!(tracker.history(item.id)?.len(), 2);
-        Ok(())
-    }
-
-    #[test]
-    fn archived_item_and_history_survive_reopening_the_database() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let path = directory.path().join("tracker.db");
-        let mut tracker = SqliteLedger::open(&path)?;
+    fn purging_removes_item_and_history_after_retention() -> Result<()> {
+        let mut tracker = Tracker::open_in_memory()?;
         let item = tracker.create("Old work", None, Status::Pending, "human", None)?;
-        tracker.set_status(item.id, Status::Archived, "human", None)?;
-        tracker.connection.execute(
-            "UPDATE work_items SET archived_at = '2020-01-01T00:00:00.000Z' WHERE id = ?1",
-            params![item.id],
-        )?;
-        drop(tracker);
+        let deleted = tracker.set_status(item.id, Status::Deleted, "human", None)?;
+        let purge_time = deleted.purge_after.context("missing purge time")? + Duration::seconds(1);
 
-        let mut tracker = SqliteLedger::open(&path)?;
-        assert_eq!(tracker.get(item.id)?.status, Status::Archived);
-        assert_eq!(tracker.history(item.id)?.len(), 2);
+        assert_eq!(tracker.purge_expired(purge_time - Duration::days(1))?, 0);
+        assert_eq!(tracker.purge_expired(purge_time)?, 1);
+        assert!(tracker.get(item.id).is_err());
         Ok(())
     }
 
     #[test]
     fn update_records_only_real_changes() -> Result<()> {
-        let mut tracker = SqliteLedger::open_in_memory()?;
+        let mut tracker = Tracker::open_in_memory()?;
         let item = tracker.create("Original", None, Status::Pending, "human", None)?;
         tracker.update(
             item.id,
@@ -2432,9 +589,9 @@ mod tests {
 
     #[test]
     fn note_preserves_context_without_changing_status() -> Result<()> {
-        let mut tracker = SqliteLedger::open_in_memory()?;
+        let mut tracker = Tracker::open_in_memory()?;
         let item = tracker.create("Wait for CI", None, Status::Waiting, "agent-a", None)?;
-        tracker.add_note(item.id, "Queue position 12", "agent-b", None)?;
+        tracker.add_note(item.id, "Queue position 12", "agent-b")?;
 
         let current = tracker.get(item.id)?;
         let history = tracker.history(item.id)?;
@@ -2447,7 +604,7 @@ mod tests {
 
     #[test]
     fn daily_view_includes_stale_actionable_and_excludes_stale_done() -> Result<()> {
-        let mut tracker = SqliteLedger::open_in_memory()?;
+        let mut tracker = Tracker::open_in_memory()?;
         let actionable = tracker.create("Still blocked", None, Status::Blocked, "agent", None)?;
         let done = tracker.create("Old result", None, Status::Done, "agent", None)?;
         let old = "2020-01-01T00:00:00.000Z";
@@ -2464,7 +621,7 @@ mod tests {
 
     #[test]
     fn list_shows_actionable_items_by_default_and_everything_with_all() -> Result<()> {
-        let mut tracker = SqliteLedger::open_in_memory()?;
+        let mut tracker = Tracker::open_in_memory()?;
         for status in [
             Status::Pending,
             Status::Active,
@@ -2475,9 +632,8 @@ mod tests {
         ] {
             tracker.create(&format!("{status} work"), None, status, "agent", None)?;
         }
-        let archived_item =
-            tracker.create("Archived work", None, Status::Pending, "agent", None)?;
-        tracker.set_status(archived_item.id, Status::Archived, "agent", None)?;
+        let removed = tracker.create("Removed work", None, Status::Pending, "agent", None)?;
+        tracker.set_status(removed.id, Status::Deleted, "agent", None)?;
 
         let actionable = tracker.list(ListFilter::Actionable, false, 100)?;
         assert_eq!(actionable.len(), 4);
@@ -2490,15 +646,15 @@ mod tests {
         assert_eq!(done.len(), 1);
         assert_eq!(done[0].status, Status::Done);
 
-        let archived = tracker.list(ListFilter::Status(Status::Archived), false, 100)?;
-        assert_eq!(archived.len(), 1);
-        assert_eq!(archived[0].id, archived_item.id);
+        let deleted = tracker.list(ListFilter::Status(Status::Deleted), false, 100)?;
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].id, removed.id);
         Ok(())
     }
 
     #[test]
     fn list_orders_by_status_priority_then_recency() -> Result<()> {
-        let mut tracker = SqliteLedger::open_in_memory()?;
+        let mut tracker = Tracker::open_in_memory()?;
         let done = tracker.create("Finished", None, Status::Done, "agent", None)?;
         let older_pending =
             tracker.create("Older pending", None, Status::Pending, "agent", None)?;
@@ -2553,13 +709,13 @@ mod tests {
     fn concurrent_connections_do_not_lose_creations() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("tracker.db");
-        SqliteLedger::open(&path)?;
+        Tracker::open(&path)?;
 
         let handles = (0..16)
             .map(|index| {
                 let path = path.clone();
                 std::thread::spawn(move || -> Result<()> {
-                    let mut tracker = SqliteLedger::open(&path)?;
+                    let mut tracker = Tracker::open(&path)?;
                     tracker.create(
                         &format!("Parallel work {index}"),
                         None,
@@ -2575,8 +731,18 @@ mod tests {
             handle.join().expect("writer thread panicked")?;
         }
 
-        let mut tracker = SqliteLedger::open(&path)?;
+        let tracker = Tracker::open(&path)?;
         assert_eq!(tracker.list(ListFilter::All, false, 100)?.len(), 16);
+        Ok(())
+    }
+
+    #[test]
+    fn deleting_twice_is_idempotent() -> Result<()> {
+        let mut tracker = Tracker::open_in_memory()?;
+        let item = tracker.create("Disposable", None, Status::Pending, "agent", None)?;
+        tracker.set_status(item.id, Status::Deleted, "agent", None)?;
+        tracker.set_status(item.id, Status::Deleted, "agent", None)?;
+        assert_eq!(tracker.history(item.id)?.len(), 2);
         Ok(())
     }
 }

@@ -15,10 +15,10 @@ Work Tracker preserves the current status and context of long-running work acros
 
 ## Invariants
 
-- GitHub Issues is the authoritative ledger after explicit GitHub initialization; SQLite remains the single source of truth only for the explicit local backend and is otherwise a disposable cache. See ADR 0002.
+- SQLite is the single source of truth. Do not add a second writable store.
 - Every effective mutation and standalone note appends a History Entry in the same transaction.
 - Repeating an already-applied status is idempotent and does not append history.
-- Archived Work Items reject ordinary mutations and remain archived, locked, and retained indefinitely; explicit integrity recovery may repair ledger evidence under ADR 0003.
+- Deleted Work Items are immutable, readable for 60 days, and then purged with their history.
 - The Daily View uses the server's local day and includes every Actionable Work Item.
 - `list` shows only Actionable Work Items unless `--all` or `--status` widens it; see `docs/adr/0001-list-shows-actionable-work-by-default.md`.
 - Keep the HTML interface read-only. Mutations belong in the CLI.
@@ -39,17 +39,3 @@ Work Tracker preserves the current status and context of long-running work acros
 - `just release` — build an optimized binary.
 - `just install` / `just uninstall` — manage the current-user installation.
 - `just serve` — run the localhost dashboard with the default database.
-
-## Agent skills
-
-### Issue tracker
-
-Issues and specs are tracked in GitHub Issues for `vimkim/work-tracker`. See `docs/agents/issue-tracker.md`.
-
-### Triage labels
-
-Use the five canonical triage labels. See `docs/agents/triage-labels.md`.
-
-### Domain docs
-
-This is a single-context repository with `CONTEXT.md` and `docs/adr/` at the root. See `docs/agents/domain.md`.
