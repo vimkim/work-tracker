@@ -30,6 +30,7 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<()> {
+    let colors = cli.color.resolve(cli.json);
     let database = cli::database_path(cli.database)?;
     cli::prepare_database_path(&database)?;
 
@@ -56,25 +57,25 @@ async fn run(cli: Cli) -> Result<()> {
                 args.note.as_deref(),
                 args.schedule.for_creation(),
             )?;
-            show_item(&item, cli.json)
+            show_item(&item, cli.json, colors)
         }
-        Command::Show(args) => show_item(&tracker.get(args.id)?, cli.json),
+        Command::Show(args) => show_item(&tracker.get(args.id)?, cli.json, colors),
         Command::List(args) => {
             let filter = list_filter(&args);
             let items = tracker.list(filter, args.include_deleted, args.limit)?;
             if cli.json {
                 output::print_json(&items)
             } else if filter == ListFilter::Actionable {
-                output::print_actionable_items(&items);
+                output::print_actionable_items(&items, colors);
                 Ok(())
             } else {
-                output::print_items(&items);
+                output::print_items(&items, colors);
                 Ok(())
             }
         }
         Command::Today(args) => {
             let items = tracker.daily_view(args.include_deleted)?;
-            show_items(&items, cli.json)
+            show_items(&items, cli.json, colors)
         }
         Command::Todo(args) => {
             let window = TodoWindow::new(chrono::Utc::now(), args.days.unwrap_or(1))?;
@@ -82,7 +83,7 @@ async fn run(cli: Cli) -> Result<()> {
             if cli.json {
                 output::print_json(&view)
             } else {
-                print!("{}", output::format_todo(&view));
+                print!("{}", output::format_todo_colored(&view, colors));
                 Ok(())
             }
         }
@@ -100,7 +101,7 @@ async fn run(cli: Cli) -> Result<()> {
                 args.note.as_deref(),
                 args.schedule_update(),
             )?;
-            show_item(&item, cli.json)
+            show_item(&item, cli.json, colors)
         }
         Command::Status(args) => {
             let item = tracker.set_status(
@@ -109,7 +110,7 @@ async fn run(cli: Cli) -> Result<()> {
                 &args.actor.resolved(),
                 args.note.as_deref(),
             )?;
-            show_item(&item, cli.json)
+            show_item(&item, cli.json, colors)
         }
         Command::Note(args) => {
             let entry = tracker.add_note(args.id, &args.message, &args.actor.resolved())?;
@@ -127,7 +128,7 @@ async fn run(cli: Cli) -> Result<()> {
                 &args.actor.resolved(),
                 args.note.as_deref(),
             )?;
-            show_item(&item, cli.json)
+            show_item(&item, cli.json, colors)
         }
         Command::History(args) => {
             let entries = tracker.history(args.id)?;
@@ -150,20 +151,28 @@ fn list_filter(args: &ListArgs) -> ListFilter {
     }
 }
 
-fn show_item(item: &work_tracker::domain::WorkItem, json: bool) -> Result<()> {
+fn show_item(
+    item: &work_tracker::domain::WorkItem,
+    json: bool,
+    colors: output::Colors,
+) -> Result<()> {
     if json {
         output::print_json(item)
     } else {
-        output::print_item(item);
+        output::print_item(item, colors);
         Ok(())
     }
 }
 
-fn show_items(items: &[work_tracker::domain::WorkItem], json: bool) -> Result<()> {
+fn show_items(
+    items: &[work_tracker::domain::WorkItem],
+    json: bool,
+    colors: output::Colors,
+) -> Result<()> {
     if json {
         output::print_json(&items)
     } else {
-        output::print_items(items);
+        output::print_items(items, colors);
         Ok(())
     }
 }

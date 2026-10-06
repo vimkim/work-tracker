@@ -104,3 +104,59 @@ fn invalid_arguments_do_not_create_items() {
         serde_json::json!([])
     );
 }
+
+#[test]
+fn colors_preserve_plain_layout_and_json_contract() {
+    let temp = TempDir::new().unwrap();
+    let output = run(
+        &temp,
+        &[
+            "add",
+            "Colored item",
+            "--planned",
+            "2000-01-01",
+            "--due",
+            "2000-01-02",
+            "--priority",
+            "high",
+            "--status",
+            "blocked",
+            "--json",
+        ],
+    );
+    assert!(output.status.success());
+    let item: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let id = item["id"].to_string();
+    for args in [vec!["todo"], vec!["list"], vec!["today"], vec!["show", &id]] {
+        let plain = run(&temp, &[args.as_slice(), &["--color", "never"]].concat());
+        let auto = run(&temp, &args);
+        let colored = run(&temp, &[args.as_slice(), &["--color", "always"]].concat());
+        assert!(plain.status.success() && auto.status.success() && colored.status.success());
+        assert_eq!(auto.stdout, plain.stdout, "captured stdout must stay plain");
+        let colored = String::from_utf8(colored.stdout).unwrap();
+        assert!(colored.contains("\x1b[31m"), "blocked status should be red");
+        let mut stripped = String::new();
+        let mut chars = colored.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' {
+                assert_eq!(chars.next(), Some('['));
+                for ch in chars.by_ref() {
+                    if ch == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                stripped.push(ch);
+            }
+        }
+        assert_eq!(stripped.as_bytes(), plain.stdout);
+        let json = run(
+            &temp,
+            &[args.as_slice(), &["--color=always", "--json"]].concat(),
+        );
+        assert!(json.status.success());
+        assert!(!json.stdout.contains(&0x1b));
+        serde_json::from_slice::<Value>(&json.stdout).unwrap();
+    }
+    assert!(!run(&temp, &["todo", "--color", "invalid"]).status.success());
+}

@@ -95,6 +95,27 @@ work-tracker today                # actionable items plus anything updated today
 
 Both views order work by attention first: blocked, active, waiting, pending, then finished work, most recently updated first within each group. `--all` and `--status` cannot be combined. The human-readable `list` output ends with a footer that names `--all` whenever finished items are hidden; `--json` output is always a plain array. Deleted items stay hidden from every list unless you pass `--include-deleted` or `--status deleted`.
 
+## Terminal colors
+
+Human-readable Todo, list, today, and item output uses color automatically when
+stdout is a terminal. Headers are bold; active/done statuses are green, waiting
+is yellow, blocked and overdue dates/labels are red, high Priority is bold
+magenta, and carryover labels are yellow. Timestamps and secondary text are dim.
+Labels remain readable without color.
+
+Pipes and redirected output stay plain. A nonempty `NO_COLOR` or `TERM=dumb`
+disables automatic color. Use the global `--color auto|always|never` option to
+override detection; an explicit `always` overrides those environment settings.
+JSON output is always uncolored, including when `--color always` is given.
+
+```bash
+work-tracker todo --color never
+work-tracker list --color always | less -R
+```
+
+The companion Todo shortcuts also accept `--color` once their separately
+managed wrapper is updated.
+
 ## Planning with Todo
 
 ```bash

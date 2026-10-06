@@ -25,6 +25,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
+    /// Color human-readable output; JSON is always uncolored.
+    #[arg(long, global = true, value_enum, default_value = "auto")]
+    pub color: crate::output::ColorMode,
+
     #[command(subcommand)]
     pub command: Command,
 }
