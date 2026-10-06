@@ -35,3 +35,31 @@ _Avoid_: Grace period
 **Daily View**:
 The server-local-day view containing Work Items updated that day and every Actionable Work Item, regardless of its last update time.
 _Avoid_: Today's jobs, daily log
+
+**Todo View**:
+A planning view of unfinished Work Items selected by planned work dates or deadlines within a requested horizon, including overdue work.
+_Avoid_: Daily View, backlog
+
+**Due Date**:
+The Asia/Seoul calendar date by which a Work Item must be completed; it becomes overdue on the following calendar day.
+_Avoid_: Planned Date, start date
+
+**Planned Date**:
+The calendar date from which work on a Work Item is intended to remain visible until completion or explicit rescheduling, distinct from its completion deadline.
+_Avoid_: Due Date, deadline
+
+**Planning Horizon**:
+A span of consecutive Asia/Seoul calendar dates starting today and ending N−1 days later, with weekends and holidays counted. Unfinished carried-over or overdue work from before this span also remains eligible for the Todo View.
+_Avoid_: Working-day window, deadline, duration estimate
+
+**Priority**:
+The user's explicit ordering of work as high, normal, or low, with normal as the default. Priority takes precedence over Due Date within a Todo View section.
+_Avoid_: Status, urgency score
+
+**Carried-over Work**:
+Unfinished work whose Planned Date has passed and which remains visible without an explicit reschedule.
+_Avoid_: Overdue work
+
+**Overdue Work**:
+Unfinished work whose Due Date has passed.
+_Avoid_: Carried-over work, blocked work

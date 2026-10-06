@@ -7,7 +7,10 @@ use rusqlite::{
 };
 use serde_json::{Map, Value, json};
 
-use crate::domain::{HistoryEntry, Status, WorkItem};
+use crate::domain::{
+    HistoryEntry, Priority, Schedule, ScheduleUpdate, Status, WorkItem, parse_date,
+};
+use crate::todo::{TodoView, TodoWindow};
 
 const RETENTION_DAYS: i64 = 60;
 
@@ -15,7 +18,7 @@ const RETENTION_DAYS: i64 = 60;
 /// `Status::is_actionable`.
 const ACTIONABLE_STATUSES: &str = "('pending', 'active', 'waiting', 'blocked')";
 
-/// Shared ordering for every multi-item view: work that needs attention first,
+/// Shared ordering for the legacy list and Daily View: work that needs attention first,
 /// then finished work, most recently updated first within each group.
 const STATUS_PRIORITY_ORDER: &str = "CASE status
                  WHEN 'blocked' THEN 0
@@ -44,11 +47,15 @@ pub struct Tracker {
 
 impl Tracker {
     pub fn open(path: &Path) -> Result<Self> {
-        let connection = Connection::open(path)
+        let mut connection = Connection::open(path)
             .with_context(|| format!("failed to open database {}", path.display()))?;
         connection.busy_timeout(StdDuration::from_secs(5))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version > 2 {
+            bail!("database schema version {version} is newer than supported version 2");
+        }
         connection.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS work_items (
@@ -85,10 +92,34 @@ impl Tracker {
                 ON work_items(purge_after) WHERE status = 'deleted';
             CREATE INDEX IF NOT EXISTS idx_history_work_item
                 ON history_entries(work_item_id, id);
-
-            PRAGMA user_version = 1;
             ",
         )?;
+
+        // Legacy binaries reset user_version to 1. Inspect actual columns under
+        // a write lock so repeated and concurrent opens never add them twice.
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let columns = {
+            let mut statement = transaction.prepare("PRAGMA table_info(work_items)")?;
+            statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (name, declaration) in [
+            ("planned_date", "TEXT"),
+            ("due_date", "TEXT"),
+            (
+                "priority",
+                "TEXT NOT NULL DEFAULT 'normal' CHECK (priority IN ('high', 'normal', 'low'))",
+            ),
+        ] {
+            if !columns.iter().any(|column| column == name) {
+                transaction.execute_batch(&format!(
+                    "ALTER TABLE work_items ADD COLUMN {name} {declaration}"
+                ))?;
+            }
+        }
+        transaction.pragma_update(None, "user_version", 2)?;
+        transaction.commit()?;
 
         let tracker = Self { connection };
         tracker.purge_expired(Utc::now())?;
@@ -108,6 +139,19 @@ impl Tracker {
         actor: &str,
         note: Option<&str>,
     ) -> Result<WorkItem> {
+        self.create_scheduled(title, description, status, actor, note, Schedule::default())
+    }
+
+    pub fn create_scheduled(
+        &mut self,
+        title: &str,
+        description: Option<&str>,
+        status: Status,
+        actor: &str,
+        note: Option<&str>,
+        schedule: Schedule,
+    ) -> Result<WorkItem> {
+        schedule.validate()?;
         let title = normalized_required(title, "title")?;
         let actor = normalized_required(actor, "actor")?;
         if status == Status::Deleted {
@@ -121,9 +165,10 @@ impl Tracker {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "INSERT INTO work_items
-             (title, description, status, created_at, updated_at, deleted_at, purge_after)
-             VALUES (?1, ?2, ?3, ?4, ?4, NULL, NULL)",
-            params![title, description, status.as_str(), timestamp],
+             (title, description, status, created_at, updated_at, deleted_at, purge_after, planned_date, due_date, priority)
+             VALUES (?1, ?2, ?3, ?4, ?4, NULL, NULL, ?5, ?6, ?7)",
+            params![title, description, status.as_str(), timestamp,
+                schedule.planned_date.map(|d| d.to_string()), schedule.due_date.map(|d| d.to_string()), schedule.priority.as_str()],
         )?;
         let id = transaction.last_insert_rowid();
         insert_history(
@@ -133,7 +178,8 @@ impl Tracker {
             actor,
             normalized_optional(note),
             now,
-            &json!({"title": title, "description": description, "status": status}),
+            &json!({"title": title, "description": description, "status": status,
+                "planned_date": schedule.planned_date, "due_date": schedule.due_date, "priority": schedule.priority}),
         )?;
         transaction.commit()?;
         self.get(id)
@@ -156,7 +202,7 @@ impl Tracker {
         };
         let include_deleted = include_deleted || filter == ListFilter::Status(Status::Deleted);
         let mut statement = self.connection.prepare(&format!(
-            "SELECT id, title, description, status, created_at, updated_at, deleted_at, purge_after
+            "SELECT id, title, description, status, created_at, updated_at, deleted_at, purge_after, planned_date, due_date, priority
              FROM work_items
              WHERE (?1 IS NULL OR status = ?1)
                AND (NOT ?2 OR status IN {ACTIONABLE_STATUSES})
@@ -175,7 +221,7 @@ impl Tracker {
     pub fn daily_view(&self, include_deleted: bool) -> Result<Vec<WorkItem>> {
         let (start, end) = local_day_bounds(Utc::now())?;
         let mut statement = self.connection.prepare(&format!(
-            "SELECT id, title, description, status, created_at, updated_at, deleted_at, purge_after
+            "SELECT id, title, description, status, created_at, updated_at, deleted_at, purge_after, planned_date, due_date, priority
              FROM work_items
              WHERE (updated_at >= ?1 AND updated_at < ?2
                     OR status IN {ACTIONABLE_STATUSES})
@@ -190,6 +236,19 @@ impl Tracker {
             .map_err(Into::into)
     }
 
+    pub fn todo_view(&self, window: TodoWindow) -> Result<TodoView> {
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT id, title, description, status, created_at, updated_at, deleted_at, purge_after,
+                    planned_date, due_date, priority
+             FROM work_items WHERE status IN {ACTIONABLE_STATUSES}
+             AND (planned_date <= ?1 OR due_date <= ?1)"
+        ))?;
+        let items = statement
+            .query_map([window.end.to_string()], row_to_item)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(TodoView::new(window, items))
+    }
+
     pub fn update(
         &mut self,
         id: i64,
@@ -197,6 +256,25 @@ impl Tracker {
         description: Option<Option<&str>>,
         actor: &str,
         note: Option<&str>,
+    ) -> Result<WorkItem> {
+        self.update_scheduled(
+            id,
+            title,
+            description,
+            actor,
+            note,
+            ScheduleUpdate::default(),
+        )
+    }
+
+    pub fn update_scheduled(
+        &mut self,
+        id: i64,
+        title: Option<&str>,
+        description: Option<Option<&str>>,
+        actor: &str,
+        note: Option<&str>,
+        schedule: ScheduleUpdate,
     ) -> Result<WorkItem> {
         let actor = normalized_required(actor, "actor")?;
         let transaction = self
@@ -215,7 +293,30 @@ impl Tracker {
             None => current.description.clone(),
         };
 
+        let new_schedule = schedule.apply(current.schedule);
+        new_schedule.validate()?;
         let mut changes = Map::new();
+        for (field, before, after) in [
+            (
+                "planned_date",
+                json!(current.schedule.planned_date),
+                json!(new_schedule.planned_date),
+            ),
+            (
+                "due_date",
+                json!(current.schedule.due_date),
+                json!(new_schedule.due_date),
+            ),
+            (
+                "priority",
+                json!(current.schedule.priority),
+                json!(new_schedule.priority),
+            ),
+        ] {
+            if before != after {
+                changes.insert(field.into(), json!({"from": before, "to": after}));
+            }
+        }
         if new_title != current.title {
             changes.insert(
                 "title".into(),
@@ -236,9 +337,18 @@ impl Tracker {
         let now = Utc::now();
         transaction.execute(
             "UPDATE work_items
-             SET title = ?1, description = ?2, updated_at = ?3
+             SET title = ?1, description = ?2, updated_at = ?3,
+                 planned_date = ?5, due_date = ?6, priority = ?7
              WHERE id = ?4",
-            params![new_title, new_description, timestamp(now), id],
+            params![
+                new_title,
+                new_description,
+                timestamp(now),
+                id,
+                new_schedule.planned_date.map(|d| d.to_string()),
+                new_schedule.due_date.map(|d| d.to_string()),
+                new_schedule.priority.as_str()
+            ],
         )?;
         insert_history(
             &transaction,
@@ -433,7 +543,7 @@ fn insert_history(
 fn get_item(connection: &Connection, id: i64) -> Result<Option<WorkItem>> {
     connection
         .query_row(
-            "SELECT id, title, description, status, created_at, updated_at, deleted_at, purge_after
+            "SELECT id, title, description, status, created_at, updated_at, deleted_at, purge_after, planned_date, due_date, priority
              FROM work_items WHERE id = ?1",
             params![id],
             row_to_item,
@@ -445,7 +555,7 @@ fn get_item(connection: &Connection, id: i64) -> Result<Option<WorkItem>> {
 fn get_item_from_transaction(transaction: &Transaction<'_>, id: i64) -> Result<Option<WorkItem>> {
     transaction
         .query_row(
-            "SELECT id, title, description, status, created_at, updated_at, deleted_at, purge_after
+            "SELECT id, title, description, status, created_at, updated_at, deleted_at, purge_after, planned_date, due_date, priority
              FROM work_items WHERE id = ?1",
             params![id],
             row_to_item,
@@ -470,7 +580,31 @@ fn row_to_item(row: &Row<'_>) -> rusqlite::Result<WorkItem> {
         updated_at: datetime_column(row, 5)?,
         deleted_at: optional_datetime_column(row, 6)?,
         purge_after: optional_datetime_column(row, 7)?,
+        schedule: Schedule {
+            planned_date: date_column(row, 8)?,
+            due_date: date_column(row, 9)?,
+            priority: Priority::from_str(&row.get::<_, String>(10)?).map_err(|error| {
+                conversion_error(
+                    10,
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()),
+                )
+            })?,
+        },
     })
+}
+
+fn date_column(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<chrono::NaiveDate>> {
+    let value: Option<String> = row.get(index)?;
+    value
+        .map(|value| {
+            parse_date(&value).map_err(|error| {
+                conversion_error(
+                    index,
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+                )
+            })
+        })
+        .transpose()
 }
 
 fn row_to_history(row: &Row<'_>) -> rusqlite::Result<HistoryEntry> {

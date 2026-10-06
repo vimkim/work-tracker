@@ -7,7 +7,9 @@ use work_tracker::{
     cli::{self, Cli, Command, ListArgs},
     db::{ListFilter, Tracker},
     domain::Status,
-    output, web,
+    output,
+    todo::TodoWindow,
+    web,
 };
 
 #[tokio::main]
@@ -46,12 +48,13 @@ async fn run(cli: Cli) -> Result<()> {
     let mut tracker = Tracker::open(&database)?;
     match cli.command {
         Command::Add(args) => {
-            let item = tracker.create(
+            let item = tracker.create_scheduled(
                 &args.title,
                 args.description.as_deref(),
                 args.status,
                 &args.actor.resolved(),
                 args.note.as_deref(),
+                args.schedule.for_creation(),
             )?;
             show_item(&item, cli.json)
         }
@@ -73,18 +76,29 @@ async fn run(cli: Cli) -> Result<()> {
             let items = tracker.daily_view(args.include_deleted)?;
             show_items(&items, cli.json)
         }
+        Command::Todo(args) => {
+            let window = TodoWindow::new(chrono::Utc::now(), args.days.unwrap_or(1))?;
+            let view = tracker.todo_view(window)?;
+            if cli.json {
+                output::print_json(&view)
+            } else {
+                print!("{}", output::format_todo(&view));
+                Ok(())
+            }
+        }
         Command::Update(args) => {
             let description = if args.clear_description {
                 Some(None)
             } else {
                 args.description.as_deref().map(Some)
             };
-            let item = tracker.update(
+            let item = tracker.update_scheduled(
                 args.id,
                 args.title.as_deref(),
                 description,
                 &args.actor.resolved(),
                 args.note.as_deref(),
+                args.schedule_update(),
             )?;
             show_item(&item, cli.json)
         }

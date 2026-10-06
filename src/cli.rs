@@ -6,7 +6,9 @@ use std::{
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
-use crate::domain::Status;
+use chrono::NaiveDate;
+
+use crate::domain::{Priority, Schedule, ScheduleUpdate, Status, parse_date};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -37,7 +39,9 @@ pub enum Command {
     List(ListArgs),
     /// Show items updated today plus every actionable item.
     Today(TodayArgs),
-    /// Update a work item's title or description.
+    /// Show scheduled commitments over consecutive calendar days in Asia/Seoul.
+    Todo(TodoArgs),
+    /// Update a work item's title, description, or schedule.
     Update(UpdateArgs),
     /// Transition a work item's status.
     Status(StatusArgs),
@@ -72,6 +76,9 @@ impl ActorArgs {
 
 #[derive(Debug, Args)]
 pub struct AddArgs {
+    #[command(flatten)]
+    pub schedule: ScheduleArgs,
+
     /// Short work item title.
     pub title: String,
 
@@ -89,6 +96,38 @@ pub struct AddArgs {
 
     #[command(flatten)]
     pub actor: ActorArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct ScheduleArgs {
+    /// Date from which to keep this work visible (YYYY-MM-DD).
+    #[arg(long, value_parser = parse_date)]
+    pub planned: Option<NaiveDate>,
+    /// Completion deadline in Asia/Seoul (YYYY-MM-DD).
+    #[arg(long, value_parser = parse_date)]
+    pub due: Option<NaiveDate>,
+    #[arg(long, value_enum)]
+    pub priority: Option<Priority>,
+}
+
+impl ScheduleArgs {
+    pub fn for_creation(&self) -> Schedule {
+        Schedule {
+            planned_date: self.planned,
+            due_date: self.due,
+            priority: self.priority.unwrap_or_default(),
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct TodoArgs {
+    /// Explicit single-day horizon; defaults to today when omitted.
+    #[arg(value_parser = ["today"], conflicts_with = "days")]
+    pub horizon: Option<String>,
+    /// Number of consecutive calendar days, including today.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    pub days: Option<u32>,
 }
 
 #[derive(Debug, Args)]
@@ -124,6 +163,15 @@ pub struct TodayArgs {
 
 #[derive(Debug, Args)]
 pub struct UpdateArgs {
+    #[command(flatten)]
+    pub schedule: ScheduleArgs,
+
+    #[arg(long, conflicts_with = "planned")]
+    pub clear_planned: bool,
+
+    #[arg(long, conflicts_with = "due")]
+    pub clear_due: bool,
+
     pub id: i64,
 
     #[arg(long)]
@@ -141,6 +189,24 @@ pub struct UpdateArgs {
 
     #[command(flatten)]
     pub actor: ActorArgs,
+}
+
+impl UpdateArgs {
+    pub fn schedule_update(&self) -> ScheduleUpdate {
+        ScheduleUpdate {
+            planned_date: if self.clear_planned {
+                Some(None)
+            } else {
+                self.schedule.planned.map(Some)
+            },
+            due_date: if self.clear_due {
+                Some(None)
+            } else {
+                self.schedule.due.map(Some)
+            },
+            priority: self.schedule.priority,
+        }
+    }
 }
 
 #[derive(Debug, Args)]

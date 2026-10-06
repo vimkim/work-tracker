@@ -9,6 +9,7 @@ Work Tracker is a small, agent-friendly status ledger for parallel and long-runn
 - Immutable creation, note, update, status-transition, and deletion history.
 - A default `list` that shows only actionable work, with `--all` for the full ledger.
 - A Daily View containing everything updated today and every actionable item.
+- A Todo View for date-based commitments, with carryover, deadlines, and explicit priorities.
 - Soft deletion with a 60-day readable retention window and automatic purge.
 - A localhost-only, read-only dashboard suitable for SSH tunneling.
 
@@ -68,7 +69,8 @@ If neither is set, the CLI uses the current `USER`, then `unknown` as a last res
 | `show ID` | Show one item, including a soft-deleted item |
 | `list` | List actionable items; `--all` adds done and cancelled, `--status` selects one status |
 | `today` | Show items updated today plus all actionable items |
-| `update ID` | Change title or description |
+| `todo [today]` / `todo --days N` | Show commitments through N calendar days, including today |
+| `update ID` | Change title, description, planned/due dates, or priority |
 | `status ID STATUS` | Apply an idempotent status transition |
 | `note ID MESSAGE` | Preserve context without changing status |
 | `delete ID` | Soft-delete an item for 60 days |
@@ -92,6 +94,34 @@ work-tracker today                # actionable items plus anything updated today
 ```
 
 Both views order work by attention first: blocked, active, waiting, pending, then finished work, most recently updated first within each group. `--all` and `--status` cannot be combined. The human-readable `list` output ends with a footer that names `--all` whenever finished items are hidden; `--json` output is always a plain array. Deleted items stay hidden from every list unless you pass `--include-deleted` or `--status deleted`.
+
+## Planning with Todo
+
+```bash
+work-tracker add "Prepare benchmark presentation" \
+  --planned 2026-10-06 --due 2026-10-07 --priority high
+work-tracker todo today
+work-tracker todo --days 3
+work-tracker todo --days 5 --json
+work-tracker update 1 --planned 2026-10-08 --note "Work rescheduled; deadline unchanged"
+work-tracker update 1 --clear-planned --clear-due --priority normal
+```
+
+`todo` alone means today. An N-day horizon includes today and the following N−1 **calendar days**, including weekends and holidays, using Asia/Seoul (KST, UTC+09:00), independent of the server timezone. Dates use `YYYY-MM-DD` with years 0001–9999. Days must be positive and the end date representable. `today` and `--days` cannot be combined.
+
+A pending, active, waiting, or blocked item appears when **either** its Planned Date or Due Date is on or before the window's end. Unfinished past plans carry forward; missed deadlines remain overdue. Each item appears once. Items without either date stay in the ordinary backlog even when high priority. Done, cancelled, and deleted items are excluded.
+
+Actions (pending/active) and Blocked / waiting are separate sections. Within each section, sort by high/normal/low Priority, earliest Due Date, earliest Planned Date, then ID; missing dates sort last. Due today is not overdue. A Planned Date after a Due Date is allowed and does not hide the missed deadline. Reading never reschedules work.
+
+Dates are optional and independent; normal is the default Priority. Omitted update flags preserve existing values; `--clear-planned` and `--clear-due` remove dates explicitly. Effective changes include field-level history atomically, and repeated identical updates do not add history. `show` prints scheduling fields. Existing `list` and `today` semantics stay unchanged.
+
+Todo reads the local ledger without contacting GitHub or another service. UPDATED means ledger activity, not a live external check. Empty views succeed with an explanatory message. `--json` returns an object with `window` (`start`, `end`, `days`, `timezone`), `actions`, and `blocked_waiting`. Each row contains the Work Item fields plus `overdue` and `carried_over`; scheduling fields are `planned_date`, `due_date`, and `priority`. Existing Work Item JSON fields and list/today array shapes are preserved with additive scheduling fields.
+
+The companion chezmoi shortcuts `todo-today`, `todo-3days`, and `todo-5days` are symlinks to a `work-todo` wrapper, dispatching by invocation name. They forward `--json` and `--database`, preserve command exit status, and reject horizon overrides. They are installed separately from this Rust binary.
+
+### Database upgrade
+
+Opening an existing ledger adds nullable dates and normal Priority without changing its items, statuses, or history. Migration checks actual columns under a transaction because legacy binaries reset SQLite's version marker. Old field-specific writes preserve the additional columns. Newer unknown schema versions are rejected. Keep a SQLite-consistent backup before upgrading a shared live ledger; ordinary retention housekeeping still applies on open.
 
 ## Agent and script usage
 
