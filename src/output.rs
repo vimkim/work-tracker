@@ -197,13 +197,14 @@ pub fn format_todo_colored(view: &TodoView, colors: Colors) -> String {
         view.window.start, view.window.end, view.window.timezone, view.window.days
     );
     text = colors.paint(text.trim_end(), "1") + "\n";
-    if view.actions.is_empty() && view.blocked_waiting.is_empty() {
+    if view.actions.is_empty() && view.blocked_waiting.is_empty() && view.finished.is_empty() {
         text.push_str("No scheduled work matches this window.\n");
         return text;
     }
     for (name, rows) in [
         ("Actions", &view.actions),
         ("Blocked / waiting", &view.blocked_waiting),
+        ("Done / cancelled", &view.finished),
     ] {
         if rows.is_empty() {
             continue;

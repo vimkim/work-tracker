@@ -1,5 +1,7 @@
 # Todo CLI design contract
 
+October6 update: `todo --all` and the companion shortcuts include finished scheduled Work Items. See `docs/adr/0003-todo-all-includes-finished-scheduled-work.md` for the selection and output additions that supersede the finished-item exclusion below.
+
 Status: user confirmed the consolidated contract on October6,2026. Implementation and verification passed; task commits are being prepared for local merge review. Installation remains a separate requested step.
 Work-tracker item:272. Source session: October6,2026. Vocabulary: CONTEXT.md.
 

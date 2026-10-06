@@ -22,6 +22,99 @@ fn schedule(planned: Option<&str>, due: Option<&str>, priority: Priority) -> Sch
 }
 
 #[test]
+fn all_includes_finished_dates_in_window_without_carrying_finished_work() -> Result<()> {
+    let mut db = Tracker::open(std::path::Path::new(":memory:"))?;
+    let mut expected = Vec::new();
+    for (title, status, planned, due, first_days) in [
+        ("Done today", Status::Done, Some("2026-10-06"), None, 1),
+        (
+            "Cancelled today",
+            Status::Cancelled,
+            None,
+            Some("2026-10-06"),
+            1,
+        ),
+        (
+            "Both dates",
+            Status::Done,
+            Some("2026-10-06"),
+            Some("2026-10-06"),
+            1,
+        ),
+        (
+            "Old due, current plan",
+            Status::Done,
+            Some("2026-10-06"),
+            Some("2026-10-01"),
+            1,
+        ),
+        ("Three-day edge", Status::Done, None, Some("2026-10-08"), 3),
+        ("Five-day edge", Status::Done, Some("2026-10-10"), None, 5),
+        (
+            "Old done",
+            Status::Done,
+            Some("2026-10-05"),
+            Some("2026-10-05"),
+            0,
+        ),
+        ("Future done", Status::Done, Some("2026-10-11"), None, 0),
+        ("Undated done", Status::Done, None, None, 0),
+    ] {
+        let item = db.create_scheduled(
+            title,
+            None,
+            status,
+            "test",
+            None,
+            schedule(planned, due, Priority::Normal),
+        )?;
+        if first_days != 0 {
+            expected.push((item.id, first_days));
+        }
+    }
+    let deleted = db.create_scheduled(
+        "Deleted",
+        None,
+        Status::Pending,
+        "test",
+        None,
+        schedule(Some("2026-10-06"), None, Priority::Normal),
+    )?;
+    db.set_status(deleted.id, Status::Deleted, "test", None)?;
+    let carried = db.create_scheduled(
+        "Unfinished old plan",
+        None,
+        Status::Pending,
+        "test",
+        None,
+        schedule(Some("2026-10-01"), None, Priority::Normal),
+    )?;
+    for days in [1, 3, 5] {
+        let view = db.todo_view(at("2026-10-06T00:00:00Z", days), true)?;
+        let mut actual: Vec<_> = view.finished.iter().map(|r| r.item.id).collect();
+        actual.sort();
+        assert_eq!(
+            actual,
+            expected
+                .iter()
+                .filter(|(_, first)| *first <= days)
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>()
+        );
+        assert!(view.finished.iter().all(|r| !r.overdue && !r.carried_over));
+        assert_eq!(view.actions.len(), 1);
+        assert_eq!(view.actions[0].item.id, carried.id);
+        assert!(view.actions[0].carried_over);
+        assert!(
+            db.todo_view(at("2026-10-06T00:00:00Z", days), false)?
+                .finished
+                .is_empty()
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn calendar_windows_count_weekends_and_cross_seoul_midnight() {
     let before = at("2026-10-06T14:59:59Z", 1);
     let after = at("2026-10-06T15:00:00Z", 1);
@@ -140,7 +233,7 @@ fn selection_priority_sections_and_carryover_are_independent() -> Result<()> {
     )?;
     db.set_status(deleted.id, Status::Deleted, "test", None)?;
     let before_history = db.history(carried.id)?.len();
-    let view = db.todo_view(at("2026-10-06T00:00:00Z", 1))?;
+    let view = db.todo_view(at("2026-10-06T00:00:00Z", 1), false)?;
     let ids: Vec<_> = view.actions.iter().map(|r| r.item.id).collect();
     assert_eq!(
         ids,
@@ -161,7 +254,7 @@ fn selection_priority_sections_and_carryover_are_independent() -> Result<()> {
     assert!(format_todo(&view).contains("Blocked / waiting"));
     assert!(format_todo(&view).contains("[overdue]"));
     assert_eq!(db.history(carried.id)?.len(), before_history);
-    let longer = db.todo_view(at("2026-10-06T00:00:00Z", 3))?;
+    let longer = db.todo_view(at("2026-10-06T00:00:00Z", 3), false)?;
     assert!(longer.actions.iter().any(|r| r.item.id == edge.id));
     // Existing actionable list still includes undated work and its own ordering.
     assert!(
@@ -273,7 +366,7 @@ fn v1_migration_preserves_history_and_survives_legacy_opens() -> Result<()> {
 #[test]
 fn stable_ties_empty_view_and_no_default_limit() -> Result<()> {
     let mut db = Tracker::open(std::path::Path::new(":memory:"))?;
-    let empty = db.todo_view(at("2026-10-06T00:00:00Z", 5))?;
+    let empty = db.todo_view(at("2026-10-06T00:00:00Z", 5), false)?;
     assert!(format_todo(&empty).contains("No scheduled work"));
     for n in 0..105 {
         db.create_scheduled(
@@ -285,7 +378,7 @@ fn stable_ties_empty_view_and_no_default_limit() -> Result<()> {
             schedule(None, Some("2026-10-06"), Priority::Normal),
         )?;
     }
-    let view = db.todo_view(at("2026-10-06T00:00:00Z", 1))?;
+    let view = db.todo_view(at("2026-10-06T00:00:00Z", 1), false)?;
     assert_eq!(view.actions.len(), 105);
     assert!(view.actions.windows(2).all(|w| w[0].item.id < w[1].item.id));
     Ok(())

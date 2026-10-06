@@ -79,7 +79,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Todo(args) => {
             let window = TodoWindow::new(chrono::Utc::now(), args.days.unwrap_or(1))?;
-            let view = tracker.todo_view(window)?;
+            let view = tracker.todo_view(window, args.all)?;
             if cli.json {
                 output::print_json(&view)
             } else {

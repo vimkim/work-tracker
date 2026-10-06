@@ -38,6 +38,7 @@ _Avoid_: Today's jobs, daily log
 
 **Todo View**:
 A planning view of unfinished Work Items selected by planned work dates or deadlines within a requested horizon, including overdue work.
+With `--all`, it also includes done and cancelled Work Items scheduled within that horizon.
 _Avoid_: Daily View, backlog
 
 **Due Date**:

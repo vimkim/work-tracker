@@ -51,18 +51,20 @@ pub struct TodoView {
     pub window: TodoWindow,
     pub actions: Vec<TodoItem>,
     pub blocked_waiting: Vec<TodoItem>,
+    pub finished: Vec<TodoItem>,
 }
 
 impl TodoView {
-    pub fn new(window: TodoWindow, items: impl IntoIterator<Item = WorkItem>) -> Self {
+    pub fn new(window: TodoWindow, items: impl IntoIterator<Item = WorkItem>, all: bool) -> Self {
         let mut selected: Vec<_> = items
             .into_iter()
             .filter(|item| {
-                item.status.is_actionable()
+                let actionable = item.status.is_actionable();
+                (actionable || (all && matches!(item.status, Status::Done | Status::Cancelled)))
                     && [item.schedule.planned_date, item.schedule.due_date]
                         .into_iter()
                         .flatten()
-                        .any(|date| date <= window.end)
+                        .any(|date| date <= window.end && (actionable || date >= window.start))
             })
             .collect();
         selected.sort_by_key(|item| {
@@ -80,21 +82,27 @@ impl TodoView {
             window,
             actions: Vec::new(),
             blocked_waiting: Vec::new(),
+            finished: Vec::new(),
         };
         for item in selected {
             let blocked = matches!(item.status, Status::Blocked | Status::Waiting);
+            let actionable = item.status.is_actionable();
             let row = TodoItem {
-                overdue: item
-                    .schedule
-                    .due_date
-                    .is_some_and(|date| date < view.window.start),
-                carried_over: item
-                    .schedule
-                    .planned_date
-                    .is_some_and(|date| date < view.window.start),
+                overdue: actionable
+                    && item
+                        .schedule
+                        .due_date
+                        .is_some_and(|date| date < view.window.start),
+                carried_over: actionable
+                    && item
+                        .schedule
+                        .planned_date
+                        .is_some_and(|date| date < view.window.start),
                 item,
             };
-            if blocked {
+            if !actionable {
+                view.finished.push(row);
+            } else if blocked {
                 view.blocked_waiting.push(row);
             } else {
                 view.actions.push(row);

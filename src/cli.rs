@@ -126,6 +126,9 @@ impl ScheduleArgs {
 
 #[derive(Debug, Args)]
 pub struct TodoArgs {
+    /// Include done and cancelled work items scheduled within the horizon.
+    #[arg(long, overrides_with = "all")]
+    pub all: bool,
     /// Explicit single-day horizon; defaults to today when omitted.
     #[arg(value_parser = ["today"], conflicts_with = "days")]
     pub horizon: Option<String>,

@@ -13,6 +13,49 @@ fn run(temp: &TempDir, args: &[&str]) -> Output {
 }
 
 #[test]
+fn all_shows_finished_scheduled_items_in_text_and_json() {
+    let temp = TempDir::new().unwrap();
+    let today = chrono::Utc::now()
+        .with_timezone(&work_tracker::todo::seoul_offset())
+        .date_naive()
+        .to_string();
+    for (title, status) in [("Finished plan", "done"), ("Cancelled plan", "cancelled")] {
+        assert!(
+            run(
+                &temp,
+                &["add", title, "--planned", &today, "--status", status]
+            )
+            .status
+            .success()
+        );
+    }
+    let output = run(&temp, &["todo", "--all", "--json"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let view: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(view["finished"].as_array().unwrap().len(), 2);
+    assert_eq!(view["finished"][0]["status"], "done");
+    assert_eq!(view["finished"][0]["overdue"], false);
+    assert_eq!(view["finished"][0]["carried_over"], false);
+    let output = run(&temp, &["todo", "today", "--all"]);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("Done / cancelled"));
+    assert!(text.contains("Finished plan"));
+    assert!(text.contains("Cancelled plan"));
+    assert!(!text.contains("No scheduled work"));
+    let output = run(&temp, &["todo"]);
+    assert!(
+        !String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("Finished plan")
+    );
+}
+
+#[test]
 fn cli_schedule_text_json_clear_and_defaults() {
     let temp = TempDir::new().unwrap();
     let output = run(

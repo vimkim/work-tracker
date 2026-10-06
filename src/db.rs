@@ -236,17 +236,18 @@ impl Tracker {
             .map_err(Into::into)
     }
 
-    pub fn todo_view(&self, window: TodoWindow) -> Result<TodoView> {
+    pub fn todo_view(&self, window: TodoWindow, all: bool) -> Result<TodoView> {
         let mut statement = self.connection.prepare(&format!(
             "SELECT id, title, description, status, created_at, updated_at, deleted_at, purge_after,
                     planned_date, due_date, priority
-             FROM work_items WHERE status IN {ACTIONABLE_STATUSES}
+             FROM work_items WHERE (status IN {ACTIONABLE_STATUSES}
+                                   OR (?2 AND status IN ('done', 'cancelled')))
              AND (planned_date <= ?1 OR due_date <= ?1)"
         ))?;
         let items = statement
-            .query_map([window.end.to_string()], row_to_item)?
+            .query_map(params![window.end.to_string(), all], row_to_item)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(TodoView::new(window, items))
+        Ok(TodoView::new(window, items, all))
     }
 
     pub fn update(
