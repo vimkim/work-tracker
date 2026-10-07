@@ -24,6 +24,10 @@ _Avoid_: Audit row, log line
 The human, agent, or automation identity responsible for a History Entry.
 _Avoid_: Owner, assignee
 
+**Work Directory**:
+The directory associated with a Work Item, used to recover work in a particular working context. Its association can be corrected or changed when work moves; it does not identify the Actor.
+_Avoid_: Project root, owner directory, creation directory
+
 **Deleted Work Item**:
 A soft-deleted Work Item that remains readable with its History Entries during the Retention Window.
 _Avoid_: Archived item, removed task
