@@ -109,3 +109,43 @@ Pushing, installation, and deployment remain separate requested actions.
 
 The confirmed test surfaces are CLI subprocesses, public Tracker persistence APIs,
 and the dashboard HTTP routes.
+
+## Verification evidence — 2026-10-07
+
+- `just check` passes formatting, Clippy, and 40 tests, including 12 new tests.
+  CLI subprocesses exercise human and JSON output, overrides, symlinks, removed
+  paths, exact filters, clearing, and errors. HTTP checks cover `/` and item
+  details, escaped directory text, and rejection of mutations.
+- Migration fixtures cover versions 1 and 2, preserved fields and history,
+  legacy field-specific writes, repeated opens, and future-version rejection.
+- The actual installed version-2 binary was exercised against an isolated
+  ledger: upgrade preserves its existing history and leaves the old item
+  unknown; that binary rejects version 3; the new binary captures the directory.
+  The live ledger was not upgraded during verification.
+- The concurrent upgrade regression uses 32 fresh version-2 ledgers with eight
+  simultaneous Tracker opens each. It reproduced the WAL setup race on round 1
+  before the repair and passes after the repair.
+
+## Standards
+
+No Standards findings. Module responsibilities, domain vocabulary, transactional
+history, idempotent updates, and the read-only dashboard match repository
+guidance. The follow-up WAL retry remains in the persistence layer and restores
+the normal busy timeout before migration. No material baseline smell warrants
+a finding.
+
+## Spec
+
+One required finding was repaired: concurrent opens could return `DatabaseBusy`
+while enabling WAL, before acquiring the schema migration lock. WAL setup now
+retries within one monotonic five-second budget, limiting both SQLite's busy
+timeout and retry sleeps to the remaining time. SQLite can bypass its busy
+handler to avoid deadlock, as explained in the
+[SQLite busy-handler documentation](https://www.sqlite.org/c3ref/busy_handler.html).
+
+The independent reviewer reran the original CLI reproduction on 30 fresh
+version-2 ledgers with eight concurrent processes each and observed no failures.
+The version guard and column inspection share the same immediate transaction.
+No further missing, incorrect, or out-of-scope behavior was found.
+
+Review totals: Standards 0 findings; Spec 1 finding repaired, 0 outstanding.

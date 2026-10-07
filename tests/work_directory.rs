@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde_json::json;
 use work_tracker::{
@@ -219,24 +219,33 @@ fn migration_preserves_both_earlier_schemas_and_legacy_field_writes() -> Result<
 #[test]
 fn concurrent_migration_preserves_unknown_associations_and_creation_history() -> Result<()> {
     let temp = tempfile::tempdir()?;
-    let path = temp.path().join("concurrent.db");
-    legacy_ledger(&path, 2)?;
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
-    let threads: Vec<_> = (0..8)
-        .map(|_| {
-            let path = path.clone();
-            let barrier = barrier.clone();
-            std::thread::spawn(move || -> Result<()> {
-                barrier.wait();
-                let tracker = Tracker::open(&path)?;
-                assert!(tracker.get(42)?.workdir.is_none());
-                assert_eq!(tracker.history(42)?.len(), 1);
-                Ok(())
+    // Repeat first opens on rollback-journal ledgers: WAL conversion has a
+    // separate lock race before the schema transaction can start.
+    for round in 0..32 {
+        let path = temp.path().join(format!("concurrent-{round}.db"));
+        legacy_ledger(&path, 2)?;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || -> Result<()> {
+                    barrier.wait();
+                    let tracker = Tracker::open(&path)?;
+                    assert!(tracker.get(42)?.workdir.is_none());
+                    assert_eq!(tracker.history(42)?.len(), 1);
+                    Ok(())
+                })
             })
-        })
-        .collect();
-    for thread in threads {
-        thread.join().unwrap()?;
+            .collect();
+        // Join every worker before examining errors or removing the fixture.
+        let results: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        for result in results {
+            result.with_context(|| format!("concurrent migration round {round}"))?;
+        }
     }
     Ok(())
 }

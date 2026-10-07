@@ -1,4 +1,8 @@
-use std::{path::Path, str::FromStr, time::Duration as StdDuration};
+use std::{
+    path::Path,
+    str::FromStr,
+    time::{Duration as StdDuration, Instant},
+};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Local, LocalResult, NaiveTime, TimeZone, Utc};
@@ -13,6 +17,7 @@ use crate::domain::{
 use crate::todo::{TodoView, TodoWindow};
 
 const RETENTION_DAYS: i64 = 60;
+const BUSY_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 
 /// SQL list of the statuses that make a Work Item actionable. Keep in sync with
 /// `Status::is_actionable`.
@@ -75,9 +80,9 @@ impl Tracker {
     pub fn open(path: &Path) -> Result<Self> {
         let mut connection = Connection::open(path)
             .with_context(|| format!("failed to open database {}", path.display()))?;
-        connection.busy_timeout(StdDuration::from_secs(5))?;
+        connection.busy_timeout(BUSY_TIMEOUT)?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
-        connection.pragma_update(None, "journal_mode", "WAL")?;
+        enable_wal(&connection)?;
         // Guard the supported version and inspect columns under the same write
         // lock so concurrent migration cannot change the schema between them.
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -579,6 +584,33 @@ impl Tracker {
                 params![timestamp(now)],
             )
             .map_err(Into::into)
+    }
+}
+
+fn enable_wal(connection: &Connection) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        let remaining = BUSY_TIMEOUT.saturating_sub(started.elapsed());
+        connection.busy_timeout(remaining)?;
+        match connection.pragma_update(None, "journal_mode", "WAL") {
+            Ok(()) => {
+                connection.busy_timeout(BUSY_TIMEOUT)?;
+                return Ok(());
+            }
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::DatabaseBusy
+                    && started.elapsed() < BUSY_TIMEOUT =>
+            {
+                // SQLite can bypass its busy handler to avoid a deadlock while
+                // enabling WAL. Retry the statement after it releases its lock.
+                // https://www.sqlite.org/c3ref/busy_handler.html
+                std::thread::sleep(
+                    StdDuration::from_millis(10)
+                        .min(BUSY_TIMEOUT.saturating_sub(started.elapsed())),
+                );
+            }
+            Err(error) => return Err(error).context("failed to enable SQLite WAL"),
+        }
     }
 }
 
