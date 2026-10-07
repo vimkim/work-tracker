@@ -1,9 +1,9 @@
 use std::{
     env,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 
 use chrono::NaiveDate;
@@ -45,7 +45,7 @@ pub enum Command {
     Today(TodayArgs),
     /// Show scheduled commitments over consecutive calendar days in Asia/Seoul.
     Todo(TodoArgs),
-    /// Update a work item's title, description, or schedule.
+    /// Update a work item's title, description, schedule, or Work Directory.
     Update(UpdateArgs),
     /// Transition a work item's status.
     Status(StatusArgs),
@@ -89,6 +89,10 @@ pub struct AddArgs {
     /// Longer context or acceptance detail.
     #[arg(short, long)]
     pub description: Option<String>,
+
+    /// Work Directory; defaults to the command's current directory.
+    #[arg(long)]
+    pub workdir: Option<PathBuf>,
 
     /// Initial status.
     #[arg(long, value_enum, default_value_t = Status::Pending)]
@@ -144,6 +148,18 @@ pub struct IdArgs {
 
 #[derive(Debug, Args)]
 pub struct ListArgs {
+    /// Show only items associated with this exact Work Directory.
+    #[arg(long, conflicts_with_all = ["here", "without_workdir"])]
+    pub workdir: Option<PathBuf>,
+
+    /// Show only items associated with the command's current directory.
+    #[arg(long, conflicts_with = "without_workdir")]
+    pub here: bool,
+
+    /// Show only items with no recorded Work Directory.
+    #[arg(long)]
+    pub without_workdir: bool,
+
     /// Show every status, including done and cancelled work items.
     #[arg(long, conflicts_with = "status")]
     pub all: bool,
@@ -189,6 +205,14 @@ pub struct UpdateArgs {
 
     #[arg(long)]
     pub clear_description: bool,
+
+    /// Assign an existing Work Directory, resolving relative paths and symlinks.
+    #[arg(long, conflicts_with = "clear_workdir")]
+    pub workdir: Option<PathBuf>,
+
+    /// Remove the Work Directory association.
+    #[arg(long)]
+    pub clear_workdir: bool,
 
     /// Optional reason stored in history when a field changes.
     #[arg(long)]
@@ -257,6 +281,87 @@ pub struct ServeArgs {
     /// Socket address. Keep the localhost default and use an SSH tunnel.
     #[arg(long, default_value = "127.0.0.1:8787")]
     pub bind: String,
+}
+
+/// Resolve an assignment to an existing physical directory without trimming
+/// significant spaces or replacing unrepresentable path bytes.
+pub fn work_directory(path: &Path) -> Result<String> {
+    if path.as_os_str().is_empty() {
+        bail!("work directory cannot be empty");
+    }
+    let resolved = path
+        .canonicalize()
+        .with_context(|| format!("failed to resolve work directory {}", path.display()))?;
+    if !resolved.is_dir() {
+        bail!("work directory {} is not a directory", path.display());
+    }
+    resolved
+        .to_str()
+        .map(str::to_owned)
+        .context("work directory must be valid UTF-8")
+}
+
+/// Resolve a lookup without requiring its saved directory to still exist.
+pub fn work_directory_query(path: &Path) -> Result<String> {
+    if path.as_os_str().is_empty() {
+        bail!("work directory cannot be empty");
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .context("failed to determine current directory")?
+            .join(path)
+    };
+    let mut ancestor = absolute.as_path();
+    let mut suffix = Vec::new();
+    let mut resolved = loop {
+        match ancestor.canonicalize() {
+            Ok(resolved) => break resolved,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                suffix.push(
+                    ancestor
+                        .components()
+                        .next_back()
+                        .context("failed to find an existing work directory ancestor")?,
+                );
+                ancestor = ancestor
+                    .parent()
+                    .context("failed to find an existing work directory ancestor")?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to resolve work directory {}", path.display())
+                });
+            }
+        }
+    };
+    for component in suffix.into_iter().rev() {
+        match component {
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::Normal(part) => {
+                resolved.push(part);
+                // A parent component can bring us back from a missing prefix
+                // to an existing symlink. Resolve it before continuing.
+                match resolved.canonicalize() {
+                    Ok(physical) => resolved = physical,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("failed to resolve work directory {}", path.display())
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    resolved
+        .to_str()
+        .map(str::to_owned)
+        .context("work directory must be valid UTF-8")
 }
 
 pub fn database_path(explicit: Option<PathBuf>) -> Result<PathBuf> {

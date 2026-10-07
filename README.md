@@ -8,6 +8,7 @@ Work Tracker is a small, agent-friendly status ledger for parallel and long-runn
 - Stable human-readable commands and machine-readable `--json` output.
 - Immutable creation, note, update, status-transition, and deletion history.
 - A default `list` that shows only actionable work, with `--all` for the full ledger.
+- Automatic Work Directory capture, explicit overrides, and exact directory filters.
 - A Daily View containing everything updated today and every actionable item.
 - A Todo View for date-based commitments, with carryover, deadlines, and explicit priorities.
 - Soft deletion with a 60-day readable retention window and automatic purge.
@@ -65,12 +66,12 @@ If neither is set, the CLI uses the current `USER`, then `unknown` as a last res
 
 | Command | Purpose |
 |---|---|
-| `add` | Create a Work Item, initially `pending` unless selected otherwise |
+| `add` | Create a Work Item and capture its Work Directory; initially `pending` unless selected otherwise |
 | `show ID` | Show one item, including a soft-deleted item |
 | `list` | List actionable items; `--all` adds done and cancelled, `--status` selects one status |
 | `today` | Show items updated today plus all actionable items |
 | `todo [today]` / `todo --days N` | Show commitments through N calendar days, including today |
-| `update ID` | Change title, description, planned/due dates, or priority |
+| `update ID` | Change title, description, planned/due dates, priority, or Work Directory |
 | `status ID STATUS` | Apply an idempotent status transition |
 | `note ID MESSAGE` | Preserve context without changing status |
 | `delete ID` | Soft-delete an item for 60 days |
@@ -94,6 +95,54 @@ work-tracker today                # actionable items plus anything updated today
 ```
 
 Both views order work by attention first: blocked, active, waiting, pending, then finished work, most recently updated first within each group. `--all` and `--status` cannot be combined. The human-readable `list` output ends with a footer that names `--all` whenever finished items are hidden; `--json` output is always a plain array. Deleted items stay hidden from every list unless you pass `--include-deleted` or `--status deleted`.
+
+## Work Directory
+
+`add` automatically records the directory where the command runs. An agent
+running the command elsewhere can supply its project or worktree explicitly:
+
+```bash
+work-tracker add "Investigate failure"
+work-tracker add "Watch CI" --workdir /path/to/project-worktree
+work-tracker list --here --json
+work-tracker list --workdir /path/to/project-worktree --json
+work-tracker update 1 --workdir /path/to/another-worktree --note "Work moved"
+work-tracker list --without-workdir
+work-tracker update 1 --clear-workdir
+```
+
+Assignments require an existing directory. Paths are stored as absolute physical
+paths: relative arguments resolve from the command's current directory and
+symlink aliases share an association. Significant spaces are preserved; paths
+must be valid UTF-8. The CLI records its actual working directory, including a
+subdirectory, without discovering a Git root.
+
+Plain `list` stays global. `--here`, `--workdir PATH`, and `--without-workdir` are
+mutually exclusive directory selectors; combine any one with existing status,
+deletion, and limit options. Matching is exact, so a parent directory does not
+include its descendants. Directory selection happens before the limit. Daily
+and Todo Views retain their global selection rules.
+
+Existing items start with an unknown directory and remain visible globally.
+Assign them with `update --workdir`, or clear an association with
+`--clear-workdir`. Effective changes record the old and new value in history;
+repeating the same assignment or clear adds no history. Creation records its
+directory in the creation entry. Deleted items remain immutable.
+
+Removing a worktree preserves its saved association. `list --workdir` accepts
+the saved absolute path even after removal; for missing paths, it resolves an
+existing ancestor and normalizes the remaining components. Use the saved
+physical path when a symlink alias has also been removed. Directory reads never
+move or rewrite an association.
+
+`show` and the dashboard display Work Directory. Work Item JSON adds the stable
+`workdir` field, a string or `null`, across commands and views; compact human
+list/Today/Todo columns retain their existing layout.
+
+The directory migration upgrades SQLite's schema version to 3 while preserving
+existing fields and history. Version-2 binaries reject an upgraded ledger;
+all clients of that ledger need the new binary. Older field-specific writes
+that permit access preserve the additional column.
 
 ## Terminal colors
 

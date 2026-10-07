@@ -41,6 +41,32 @@ pub enum ListFilter {
     Status(Status),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkDirectoryFilter<'a> {
+    All,
+    Exact(&'a str),
+    Unknown,
+}
+
+/// Fields supplied when creating a Work Item. Directory data is explicit;
+/// the persistence layer does not inspect the process working directory.
+pub struct NewWorkItem<'a> {
+    pub title: &'a str,
+    pub description: Option<&'a str>,
+    pub status: Status,
+    pub schedule: Schedule,
+    pub workdir: Option<&'a str>,
+}
+
+/// None preserves a field; Some(None) explicitly clears an optional field.
+#[derive(Debug, Default)]
+pub struct WorkItemUpdate<'a> {
+    pub title: Option<&'a str>,
+    pub description: Option<Option<&'a str>>,
+    pub schedule: ScheduleUpdate,
+    pub workdir: Option<Option<&'a str>>,
+}
+
 pub struct Tracker {
     connection: Connection,
 }
@@ -52,11 +78,15 @@ impl Tracker {
         connection.busy_timeout(StdDuration::from_secs(5))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
-        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version > 2 {
-            bail!("database schema version {version} is newer than supported version 2");
+        // Guard the supported version and inspect columns under the same write
+        // lock so concurrent migration cannot change the schema between them.
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let version: i64 =
+            transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version > 3 {
+            bail!("database schema version {version} is newer than supported version 3");
         }
-        connection.execute_batch(
+        transaction.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS work_items (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -97,7 +127,6 @@ impl Tracker {
 
         // Legacy binaries reset user_version to 1. Inspect actual columns under
         // a write lock so repeated and concurrent opens never add them twice.
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let columns = {
             let mut statement = transaction.prepare("PRAGMA table_info(work_items)")?;
             statement
@@ -107,6 +136,7 @@ impl Tracker {
         for (name, declaration) in [
             ("planned_date", "TEXT"),
             ("due_date", "TEXT"),
+            ("workdir", "TEXT"),
             (
                 "priority",
                 "TEXT NOT NULL DEFAULT 'normal' CHECK (priority IN ('high', 'normal', 'low'))",
@@ -118,7 +148,7 @@ impl Tracker {
                 ))?;
             }
         }
-        transaction.pragma_update(None, "user_version", 2)?;
+        transaction.pragma_update(None, "user_version", 3)?;
         transaction.commit()?;
 
         let tracker = Self { connection };
@@ -151,7 +181,34 @@ impl Tracker {
         note: Option<&str>,
         schedule: Schedule,
     ) -> Result<WorkItem> {
+        self.create_item(
+            NewWorkItem {
+                title,
+                description,
+                status,
+                schedule,
+                workdir: None,
+            },
+            actor,
+            note,
+        )
+    }
+
+    pub fn create_item(
+        &mut self,
+        fields: NewWorkItem<'_>,
+        actor: &str,
+        note: Option<&str>,
+    ) -> Result<WorkItem> {
+        let NewWorkItem {
+            title,
+            description,
+            status,
+            schedule,
+            workdir,
+        } = fields;
         schedule.validate()?;
+        validate_work_directory(workdir)?;
         let title = normalized_required(title, "title")?;
         let actor = normalized_required(actor, "actor")?;
         if status == Status::Deleted {
@@ -165,10 +222,10 @@ impl Tracker {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "INSERT INTO work_items
-             (title, description, status, created_at, updated_at, deleted_at, purge_after, planned_date, due_date, priority)
-             VALUES (?1, ?2, ?3, ?4, ?4, NULL, NULL, ?5, ?6, ?7)",
+             (title, description, status, created_at, updated_at, deleted_at, purge_after, planned_date, due_date, priority, workdir)
+             VALUES (?1, ?2, ?3, ?4, ?4, NULL, NULL, ?5, ?6, ?7, ?8)",
             params![title, description, status.as_str(), timestamp,
-                schedule.planned_date.map(|d| d.to_string()), schedule.due_date.map(|d| d.to_string()), schedule.priority.as_str()],
+                schedule.planned_date.map(|d| d.to_string()), schedule.due_date.map(|d| d.to_string()), schedule.priority.as_str(), workdir],
         )?;
         let id = transaction.last_insert_rowid();
         insert_history(
@@ -179,7 +236,8 @@ impl Tracker {
             normalized_optional(note),
             now,
             &json!({"title": title, "description": description, "status": status,
-                "planned_date": schedule.planned_date, "due_date": schedule.due_date, "priority": schedule.priority}),
+                "planned_date": schedule.planned_date, "due_date": schedule.due_date, "priority": schedule.priority,
+                "workdir": workdir}),
         )?;
         transaction.commit()?;
         self.get(id)
@@ -195,6 +253,21 @@ impl Tracker {
         include_deleted: bool,
         limit: usize,
     ) -> Result<Vec<WorkItem>> {
+        self.list_in_directory(filter, WorkDirectoryFilter::All, include_deleted, limit)
+    }
+
+    pub fn list_in_directory(
+        &self,
+        filter: ListFilter,
+        directory: WorkDirectoryFilter<'_>,
+        include_deleted: bool,
+        limit: usize,
+    ) -> Result<Vec<WorkItem>> {
+        let (workdir, unknown_only) = match directory {
+            WorkDirectoryFilter::All => (None, false),
+            WorkDirectoryFilter::Exact(path) => (Some(path), false),
+            WorkDirectoryFilter::Unknown => (None, true),
+        };
         let (status, actionable_only) = match filter {
             ListFilter::Actionable => (None, true),
             ListFilter::All => (None, false),
@@ -202,16 +275,25 @@ impl Tracker {
         };
         let include_deleted = include_deleted || filter == ListFilter::Status(Status::Deleted);
         let mut statement = self.connection.prepare(&format!(
-            "SELECT id, title, description, status, created_at, updated_at, deleted_at, purge_after, planned_date, due_date, priority
+            "SELECT id, title, description, status, created_at, updated_at, deleted_at, purge_after, planned_date, due_date, priority, workdir
              FROM work_items
              WHERE (?1 IS NULL OR status = ?1)
                AND (NOT ?2 OR status IN {ACTIONABLE_STATUSES})
                AND (?3 OR status != 'deleted')
+               AND (?5 IS NULL OR workdir = ?5)
+               AND (NOT ?6 OR workdir IS NULL)
              ORDER BY {STATUS_PRIORITY_ORDER}
              LIMIT ?4"
         ))?;
         let rows = statement.query_map(
-            params![status, actionable_only, include_deleted, limit as i64],
+            params![
+                status,
+                actionable_only,
+                include_deleted,
+                limit as i64,
+                workdir,
+                unknown_only
+            ],
             row_to_item,
         )?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -221,7 +303,7 @@ impl Tracker {
     pub fn daily_view(&self, include_deleted: bool) -> Result<Vec<WorkItem>> {
         let (start, end) = local_day_bounds(Utc::now())?;
         let mut statement = self.connection.prepare(&format!(
-            "SELECT id, title, description, status, created_at, updated_at, deleted_at, purge_after, planned_date, due_date, priority
+            "SELECT id, title, description, status, created_at, updated_at, deleted_at, purge_after, planned_date, due_date, priority, workdir
              FROM work_items
              WHERE (updated_at >= ?1 AND updated_at < ?2
                     OR status IN {ACTIONABLE_STATUSES})
@@ -239,7 +321,7 @@ impl Tracker {
     pub fn todo_view(&self, window: TodoWindow, all: bool) -> Result<TodoView> {
         let mut statement = self.connection.prepare(&format!(
             "SELECT id, title, description, status, created_at, updated_at, deleted_at, purge_after,
-                    planned_date, due_date, priority
+                    planned_date, due_date, priority, workdir
              FROM work_items WHERE (status IN {ACTIONABLE_STATUSES}
                                    OR (?2 AND status IN ('done', 'cancelled')))
              AND (planned_date <= ?1 OR due_date <= ?1)"
@@ -277,6 +359,32 @@ impl Tracker {
         note: Option<&str>,
         schedule: ScheduleUpdate,
     ) -> Result<WorkItem> {
+        self.update_item(
+            id,
+            WorkItemUpdate {
+                title,
+                description,
+                schedule,
+                workdir: None,
+            },
+            actor,
+            note,
+        )
+    }
+
+    pub fn update_item(
+        &mut self,
+        id: i64,
+        fields: WorkItemUpdate<'_>,
+        actor: &str,
+        note: Option<&str>,
+    ) -> Result<WorkItem> {
+        let WorkItemUpdate {
+            title,
+            description,
+            schedule,
+            workdir,
+        } = fields;
         let actor = normalized_required(actor, "actor")?;
         let transaction = self
             .connection
@@ -296,8 +404,13 @@ impl Tracker {
 
         let new_schedule = schedule.apply(current.schedule);
         new_schedule.validate()?;
+        let new_workdir = workdir
+            .map(|value| value.map(str::to_owned))
+            .unwrap_or_else(|| current.workdir.clone());
+        validate_work_directory(new_workdir.as_deref())?;
         let mut changes = Map::new();
         for (field, before, after) in [
+            ("workdir", json!(current.workdir), json!(new_workdir)),
             (
                 "planned_date",
                 json!(current.schedule.planned_date),
@@ -339,7 +452,7 @@ impl Tracker {
         transaction.execute(
             "UPDATE work_items
              SET title = ?1, description = ?2, updated_at = ?3,
-                 planned_date = ?5, due_date = ?6, priority = ?7
+                 planned_date = ?5, due_date = ?6, priority = ?7, workdir = ?8
              WHERE id = ?4",
             params![
                 new_title,
@@ -348,7 +461,8 @@ impl Tracker {
                 id,
                 new_schedule.planned_date.map(|d| d.to_string()),
                 new_schedule.due_date.map(|d| d.to_string()),
-                new_schedule.priority.as_str()
+                new_schedule.priority.as_str(),
+                new_workdir
             ],
         )?;
         insert_history(
@@ -478,6 +592,15 @@ fn ensure_mutable(item: &WorkItem) -> Result<()> {
     Ok(())
 }
 
+fn validate_work_directory(workdir: Option<&str>) -> Result<()> {
+    if let Some(path) = workdir
+        && (path.is_empty() || !Path::new(path).is_absolute())
+    {
+        bail!("work directory must be a nonempty absolute path");
+    }
+    Ok(())
+}
+
 fn normalized_required(value: &str, field: &str) -> Result<String> {
     let value = value.trim();
     if value.is_empty() {
@@ -544,7 +667,7 @@ fn insert_history(
 fn get_item(connection: &Connection, id: i64) -> Result<Option<WorkItem>> {
     connection
         .query_row(
-            "SELECT id, title, description, status, created_at, updated_at, deleted_at, purge_after, planned_date, due_date, priority
+            "SELECT id, title, description, status, created_at, updated_at, deleted_at, purge_after, planned_date, due_date, priority, workdir
              FROM work_items WHERE id = ?1",
             params![id],
             row_to_item,
@@ -556,7 +679,7 @@ fn get_item(connection: &Connection, id: i64) -> Result<Option<WorkItem>> {
 fn get_item_from_transaction(transaction: &Transaction<'_>, id: i64) -> Result<Option<WorkItem>> {
     transaction
         .query_row(
-            "SELECT id, title, description, status, created_at, updated_at, deleted_at, purge_after, planned_date, due_date, priority
+            "SELECT id, title, description, status, created_at, updated_at, deleted_at, purge_after, planned_date, due_date, priority, workdir
              FROM work_items WHERE id = ?1",
             params![id],
             row_to_item,
@@ -571,6 +694,7 @@ fn row_to_item(row: &Row<'_>) -> rusqlite::Result<WorkItem> {
         id: row.get(0)?,
         title: row.get(1)?,
         description: row.get(2)?,
+        workdir: row.get(11)?,
         status: Status::from_str(&status).map_err(|error| {
             conversion_error(
                 3,

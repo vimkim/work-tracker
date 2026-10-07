@@ -358,7 +358,7 @@ fn v1_migration_preserves_history_and_survives_legacy_opens() -> Result<()> {
         assert_eq!(serde_json::to_value(db.history(42)?)?[0], history[0]);
         assert_eq!(db.get(43)?.schedule, Schedule::default());
     }
-    legacy.pragma_update(None, "user_version", 3)?;
+    legacy.pragma_update(None, "user_version", 4)?;
     assert!(Tracker::open(&path).is_err());
     Ok(())
 }

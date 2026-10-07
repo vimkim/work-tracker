@@ -153,6 +153,8 @@ pub struct WorkItem {
     pub id: i64,
     pub title: String,
     pub description: Option<String>,
+    #[serde(default)]
+    pub workdir: Option<String>,
     pub status: Status,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

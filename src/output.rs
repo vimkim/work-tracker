@@ -79,6 +79,10 @@ pub fn print_item(item: &WorkItem, colors: Colors) {
     println!("Status:      {}", colors.status(item.status, 0));
     println!("Title:       {}", item.title);
     println!(
+        "Work dir:    {}",
+        item.workdir.as_deref().unwrap_or("unknown")
+    );
+    println!(
         "Priority:    {}",
         colors.priority(item.schedule.priority, 0)
     );

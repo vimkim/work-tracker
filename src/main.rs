@@ -5,7 +5,7 @@ use clap::Parser;
 use serde_json::json;
 use work_tracker::{
     cli::{self, Cli, Command, ListArgs},
-    db::{ListFilter, Tracker},
+    db::{ListFilter, NewWorkItem, Tracker, WorkDirectoryFilter, WorkItemUpdate},
     domain::Status,
     output,
     todo::TodoWindow,
@@ -49,20 +49,37 @@ async fn run(cli: Cli) -> Result<()> {
     let mut tracker = Tracker::open(&database)?;
     match cli.command {
         Command::Add(args) => {
-            let item = tracker.create_scheduled(
-                &args.title,
-                args.description.as_deref(),
-                args.status,
+            let workdir =
+                cli::work_directory(args.workdir.as_deref().unwrap_or(std::path::Path::new(".")))?;
+            let item = tracker.create_item(
+                NewWorkItem {
+                    title: &args.title,
+                    description: args.description.as_deref(),
+                    status: args.status,
+                    schedule: args.schedule.for_creation(),
+                    workdir: Some(&workdir),
+                },
                 &args.actor.resolved(),
                 args.note.as_deref(),
-                args.schedule.for_creation(),
             )?;
             show_item(&item, cli.json, colors)
         }
         Command::Show(args) => show_item(&tracker.get(args.id)?, cli.json, colors),
         Command::List(args) => {
             let filter = list_filter(&args);
-            let items = tracker.list(filter, args.include_deleted, args.limit)?;
+            let workdir = args
+                .workdir
+                .as_deref()
+                .or_else(|| args.here.then_some(std::path::Path::new(".")))
+                .map(cli::work_directory_query)
+                .transpose()?;
+            let directory = match workdir.as_deref() {
+                Some(path) => WorkDirectoryFilter::Exact(path),
+                None if args.without_workdir => WorkDirectoryFilter::Unknown,
+                None => WorkDirectoryFilter::All,
+            };
+            let items =
+                tracker.list_in_directory(filter, directory, args.include_deleted, args.limit)?;
             if cli.json {
                 output::print_json(&items)
             } else if filter == ListFilter::Actionable {
@@ -93,13 +110,25 @@ async fn run(cli: Cli) -> Result<()> {
             } else {
                 args.description.as_deref().map(Some)
             };
-            let item = tracker.update_scheduled(
+            let workdir = args
+                .workdir
+                .as_deref()
+                .map(cli::work_directory)
+                .transpose()?;
+            let item = tracker.update_item(
                 args.id,
-                args.title.as_deref(),
-                description,
+                WorkItemUpdate {
+                    title: args.title.as_deref(),
+                    description,
+                    schedule: args.schedule_update(),
+                    workdir: if args.clear_workdir {
+                        Some(None)
+                    } else {
+                        workdir.as_deref().map(Some)
+                    },
+                },
                 &args.actor.resolved(),
                 args.note.as_deref(),
-                args.schedule_update(),
             )?;
             show_item(&item, cli.json, colors)
         }

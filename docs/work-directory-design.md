@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 date: 2026-10-07
 ---
 
@@ -10,7 +10,7 @@ with that directory. Work Directory describes the current working context;
 Actor continues to identify who recorded each History Entry.
 
 Work Item: 297. All six interview decisions were accepted on 2026-10-07.
-The consolidated contract below awaits final shared-understanding confirmation.
+The user confirmed shared understanding and authorized implementation on the same day.
 
 ## Capture and correction
 
@@ -107,4 +107,5 @@ this contract. Commit task changes and hand back a clean topic worktree for the
 separate local rebase/fast-forward-merge confirmation required by `AGENTS.md`.
 Pushing, installation, and deployment remain separate requested actions.
 
-Implementation follows explicit confirmation of the completed design.
+The confirmed test surfaces are CLI subprocesses, public Tracker persistence APIs,
+and the dashboard HTTP routes.
