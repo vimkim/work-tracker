@@ -1,8 +1,9 @@
 use std::{fmt::Write, io::IsTerminal};
 
-use anyhow::Result;
-use chrono::Local;
+use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Local};
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::domain::{HistoryEntry, Priority, Status, WorkItem};
 use crate::todo::{TodoView, seoul_offset};
@@ -74,47 +75,107 @@ pub fn print_json(value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
-pub fn print_item(item: &WorkItem, colors: Colors) {
-    println!("ID:          {}", item.id);
-    println!("Status:      {}", colors.status(item.status, 0));
-    println!("Title:       {}", item.title);
-    println!(
-        "Work dir:    {}",
-        item.workdir.as_deref().unwrap_or("unknown")
-    );
-    println!(
-        "Priority:    {}",
-        colors.priority(item.schedule.priority, 0)
-    );
-    if let Some(date) = item.schedule.planned_date {
-        println!("Planned:     {date}");
-    }
-    if let Some(date) = item.schedule.due_date {
-        println!("Due:         {date}");
-    }
-    if let Some(description) = &item.description {
-        println!("Description: {description}");
-    }
-    println!(
-        "Created:     {}",
-        item.created_at
-            .with_timezone(&Local)
-            .format("%Y-%m-%d %H:%M:%S %:z")
-    );
-    println!(
-        "Updated:     {}",
-        item.updated_at
-            .with_timezone(&Local)
-            .format("%Y-%m-%d %H:%M:%S %:z")
-    );
-    if let Some(purge_after) = item.purge_after {
-        println!(
-            "Purge after: {}",
-            purge_after
-                .with_timezone(&Local)
-                .format("%Y-%m-%d %H:%M:%S %:z")
+// This is the rendering order, not a substitute for inspecting the live schema.
+// Both the schema and each serialized item must match these rendered fields.
+const ITEM_FIELDS: &[(&str, &str)] = &[
+    ("id", "ID:"),
+    ("status", "Status:"),
+    ("title", "Title:"),
+    ("workdir", "Work dir:"),
+    ("priority", "Priority:"),
+    ("planned_date", "Planned:"),
+    ("due_date", "Due:"),
+    ("description", "Description:"),
+    ("created_at", "Created:"),
+    ("updated_at", "Updated:"),
+    ("deleted_at", "Deleted:"),
+    ("purge_after", "Purge after:"),
+];
+
+pub fn item_field_names() -> impl Iterator<Item = &'static str> {
+    ITEM_FIELDS.iter().map(|(name, _)| *name)
+}
+
+/// Validate the actual serializer, so adding a label alone cannot satisfy coverage.
+pub fn item_json(item: &WorkItem) -> Result<Value> {
+    let value = serde_json::to_value(item)?;
+    check_item_fields(&value)?;
+    Ok(value)
+}
+
+fn check_item_fields(value: &Value) -> Result<()> {
+    let fields = value
+        .as_object()
+        .context("Work Item must serialize to an object")?;
+    let missing: Vec<_> = item_field_names()
+        .filter(|name| !fields.contains_key(*name))
+        .collect();
+    let unknown: Vec<_> = fields
+        .keys()
+        .filter(|name| !item_field_names().any(|field| field == name.as_str()))
+        .collect();
+    if !missing.is_empty() || !unknown.is_empty() {
+        bail!(
+            "Work Item serialization does not match detail fields: missing fields {missing:?}; unknown fields {unknown:?}"
         );
     }
+    Ok(())
+}
+
+pub fn format_item(item: &WorkItem, colors: Colors) -> Result<String> {
+    let fields = item_json(item)?;
+    let mut text = String::new();
+    for &(name, label) in ITEM_FIELDS {
+        let value = &fields[name];
+        let rendered = match name {
+            "status" => colors.status(item.status, 0),
+            "priority" => colors.priority(item.schedule.priority, 0),
+            "workdir" => value.as_str().unwrap_or("unknown").to_owned(),
+            "created_at" | "updated_at" | "deleted_at" | "purge_after" if !value.is_null() => {
+                DateTime::parse_from_rfc3339(
+                    value
+                        .as_str()
+                        .context("Work Item timestamp must be a string")?,
+                )?
+                .with_timezone(&Local)
+                .format("%Y-%m-%d %H:%M:%S%.f %:z")
+                .to_string()
+            }
+            _ if value.is_null() => "-".to_owned(),
+            _ => value
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| value.to_string()),
+        };
+        writeln!(text, "{label:<12} {rendered}").unwrap();
+    }
+    Ok(text)
+}
+
+pub fn print_item(item: &WorkItem, colors: Colors) -> Result<()> {
+    print!("{}", format_item(item, colors)?);
+    Ok(())
+}
+
+pub fn print_item_details(items: &[WorkItem], actionable: bool, colors: Colors) -> Result<()> {
+    if items.is_empty() {
+        if actionable {
+            print_actionable_items(items, colors);
+        } else {
+            print_items(items, colors);
+        }
+        return Ok(());
+    }
+    // Format every item before writing, so validation errors cannot leave partial output.
+    let details = items
+        .iter()
+        .map(|item| format_item(item, colors))
+        .collect::<Result<Vec<_>>>()?;
+    print!("{}", details.join("\n"));
+    if actionable {
+        println!("{}", colors.paint(actionable_footer(items.len()), "2"));
+    }
+    Ok(())
 }
 
 pub fn print_items(items: &[WorkItem], colors: Colors) {
@@ -284,6 +345,22 @@ pub fn format_todo_colored(view: &TodoView, colors: Colors) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serialized_fields_must_match_the_fields_rendered_in_details() {
+        let mut fields: serde_json::Map<String, Value> = item_field_names()
+            .map(|name| (name.to_owned(), Value::Null))
+            .collect();
+        check_item_fields(&Value::Object(fields.clone())).unwrap();
+        fields.remove("description");
+        fields.insert("unrendered_context".to_owned(), Value::Null);
+        let error = check_item_fields(&Value::Object(fields))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("missing fields [\"description\"]"));
+        assert!(error.contains("unknown fields [\"unrendered_context\"]"));
+        assert!(check_item_fields(&Value::Null).is_err());
+    }
 
     #[test]
     fn color_policy_keeps_machine_output_plain_and_allows_explicit_overrides() {

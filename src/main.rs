@@ -64,8 +64,14 @@ async fn run(cli: Cli) -> Result<()> {
             )?;
             show_item(&item, cli.json, colors)
         }
-        Command::Show(args) => show_item(&tracker.get(args.id)?, cli.json, colors),
+        Command::Show(args) => {
+            tracker.check_work_item_output_fields(output::item_field_names())?;
+            show_item(&tracker.get(args.id)?, cli.json, colors)
+        }
         Command::List(args) => {
+            if cli.json || args.details {
+                tracker.check_work_item_output_fields(output::item_field_names())?;
+            }
             let filter = list_filter(&args);
             let workdir = args
                 .workdir
@@ -81,7 +87,12 @@ async fn run(cli: Cli) -> Result<()> {
             let items =
                 tracker.list_in_directory(filter, directory, args.include_deleted, args.limit)?;
             if cli.json {
+                for item in &items {
+                    output::item_json(item)?;
+                }
                 output::print_json(&items)
+            } else if args.details {
+                output::print_item_details(&items, filter == ListFilter::Actionable, colors)
             } else if filter == ListFilter::Actionable {
                 output::print_actionable_items(&items, colors);
                 Ok(())
@@ -186,10 +197,10 @@ fn show_item(
     colors: output::Colors,
 ) -> Result<()> {
     if json {
+        output::item_json(item)?;
         output::print_json(item)
     } else {
-        output::print_item(item, colors);
-        Ok(())
+        output::print_item(item, colors)
     }
 }
 

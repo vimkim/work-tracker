@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     path::Path,
     str::FromStr,
     time::{Duration as StdDuration, Instant},
@@ -250,6 +251,27 @@ impl Tracker {
 
     pub fn get(&self, id: i64) -> Result<WorkItem> {
         get_item(&self.connection, id)?.with_context(|| format!("work item {id} not found"))
+    }
+
+    /// Reject incomplete output, including when a query returns no Work Items.
+    /// Inspect the live schema rather than relying on its version or a column list.
+    pub fn check_work_item_output_fields<'a>(
+        &self,
+        fields: impl IntoIterator<Item = &'a str>,
+    ) -> Result<()> {
+        let mut statement = self.connection.prepare("PRAGMA table_xinfo(work_items)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+        let fields: BTreeSet<_> = fields.into_iter().map(str::to_owned).collect();
+        if columns != fields {
+            let missing: Vec<_> = columns.difference(&fields).cloned().collect();
+            let unknown: Vec<_> = fields.difference(&columns).cloned().collect();
+            bail!(
+                "Work Item output does not match SQLite work_items schema: missing columns {missing:?}; unknown fields {unknown:?}"
+            );
+        }
+        Ok(())
     }
 
     pub fn list(

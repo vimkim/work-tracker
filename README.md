@@ -91,10 +91,28 @@ Run `work-tracker COMMAND --help` for all options.
 work-tracker list                 # actionable items only
 work-tracker list --all           # every item, including done and cancelled
 work-tracker list --status done   # exactly one status
+work-tracker list --details       # show-style details for each selected item
 work-tracker today                # actionable items plus anything updated today
 ```
 
 Both views order work by attention first: blocked, active, waiting, pending, then finished work, most recently updated first within each group. `--all` and `--status` cannot be combined. The human-readable `list` output ends with a footer that names `--all` whenever finished items are hidden; `--json` output is always a plain array. Deleted items stay hidden from every list unless you pass `--include-deleted` or `--status deleted`.
+
+`list --details` prints each selected Work Item using the same formatter as
+`show ID`, with a blank line between items. Existing filters, ordering, limits,
+and the actionable footer still apply. `--details --json` produces the same JSON
+as `--json` alone; plain `list` keeps its compact table.
+
+`show` and `list --details` display every column in SQLite's `work_items` table,
+including `deleted_at` and unset fields (`-`; an unset Work Directory is
+`unknown`). Detailed timestamps preserve fractional seconds and show the local
+UTC offset. History Entries remain available through `history ID`.
+
+Before `show`, `list --details`, or `list --json` prints anything, a runtime check
+compares the live SQLite columns with the detail fields. Each returned item's
+serialized fields must also match. Missing or unknown fields cause exit status
+1 with a diagnostic on standard error, rather than silently returning incomplete
+details. The schema check runs even when the list is empty. JSON field names,
+null values, and the list array shape are preserved.
 
 ## Work Directory
 

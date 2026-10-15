@@ -148,6 +148,10 @@ pub struct IdArgs {
 
 #[derive(Debug, Args)]
 pub struct ListArgs {
+    /// Print each item with the same full details as show; JSON is unchanged.
+    #[arg(long)]
+    pub details: bool,
+
     /// Show only items associated with this exact Work Directory.
     #[arg(long, conflicts_with_all = ["here", "without_workdir"])]
     pub workdir: Option<PathBuf>,
