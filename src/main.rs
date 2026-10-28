@@ -5,7 +5,7 @@ use clap::Parser;
 use serde_json::json;
 use work_tracker::{
     cli::{self, Cli, Command, ListArgs},
-    db::{ListFilter, NewWorkItem, Tracker, WorkDirectoryFilter, WorkItemUpdate},
+    db::{ListFilter, NewWorkItem, Tracker, WorkDirectoryFilter, WorkItemUpdate, backup},
     domain::Status,
     output,
     todo::TodoWindow,
@@ -32,6 +32,22 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> Result<()> {
     let colors = cli.color.resolve(cli.json);
     let database = cli::database_path(cli.database)?;
+    match &cli.command {
+        Command::Backup(args) => {
+            let directory = backup::directory(&database, args.directory.clone());
+            let snapshot = backup::create(&database, &directory)?;
+            return output::print_snapshot(&snapshot, cli.json);
+        }
+        Command::Backups(args) => {
+            let directory = backup::directory(&database, args.directory.clone());
+            return output::print_snapshots(&backup::list(&directory)?, cli.json);
+        }
+        Command::Restore(args) => {
+            let recovery = backup::restore(&args.snapshot, &args.to)?;
+            return output::print_recovery(&recovery, cli.json);
+        }
+        _ => {}
+    }
     cli::prepare_database_path(&database)?;
 
     if let Command::Serve(args) = &cli.command {
@@ -179,7 +195,11 @@ async fn run(cli: Cli) -> Result<()> {
                 Ok(())
             }
         }
-        Command::Path | Command::Serve(_) => unreachable!(),
+        Command::Path
+        | Command::Serve(_)
+        | Command::Backup(_)
+        | Command::Backups(_)
+        | Command::Restore(_) => unreachable!(),
     }
 }
 

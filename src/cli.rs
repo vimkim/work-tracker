@@ -57,8 +57,31 @@ pub enum Command {
     History(IdArgs),
     /// Print the database path in use.
     Path,
+    /// Save a complete SQLite snapshot without changing the ledger.
+    Backup(BackupArgs),
+    /// List saved snapshots, newest first, and verify their integrity.
+    Backups(BackupArgs),
+    /// Recover a snapshot into a new database; existing files are never replaced.
+    Restore(RestoreArgs),
     /// Host the read-only HTML dashboard.
     Serve(ServeArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct BackupArgs {
+    /// Snapshot directory. Defaults to backups/ beside the selected database.
+    #[arg(long, env = "WORK_TRACKER_BACKUP_DIR")]
+    pub directory: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct RestoreArgs {
+    /// Snapshot file to recover.
+    pub snapshot: PathBuf,
+
+    /// New database path. Inspect it before switching clients to it.
+    #[arg(long, required = true)]
+    pub to: PathBuf,
 }
 
 #[derive(Debug, Args)]

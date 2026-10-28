@@ -13,6 +13,7 @@ Work Tracker is a small, agent-friendly status ledger for parallel and long-runn
 - A Todo View for date-based commitments, with carryover, deadlines, and explicit priorities.
 - Soft deletion with a 60-day readable retention window and automatic purge.
 - A localhost-only, read-only dashboard suitable for SSH tunneling.
+- Verified manual SQLite snapshots, optional daily backups, and recovery to a saved snapshot.
 
 ## Build and install
 
@@ -77,6 +78,9 @@ If neither is set, the CLI uses the current `USER`, then `unknown` as a last res
 | `delete ID` | Soft-delete an item for 60 days |
 | `history ID` | Show the complete immutable history |
 | `path` | Show the SQLite database path |
+| `backup` | Save a complete, verified SQLite snapshot |
+| `backups` | List and verify snapshots, newest first |
+| `restore SNAPSHOT --to PATH` | Recover a snapshot into a new database |
 | `serve` | Host the read-only dashboard |
 
 The statuses are `pending`, `active`, `waiting`, `blocked`, `done`, `cancelled`, and `deleted`. The first four are actionable: they are what `list` shows by default, and they remain in the Daily View even when they were not updated today.
@@ -211,6 +215,135 @@ The companion chezmoi shortcuts `todo-today`, `todo-3days`, and `todo-5days` are
 ### Database upgrade
 
 Opening an existing ledger adds nullable dates and normal Priority without changing its items, statuses, or history. Migration checks actual columns under a transaction because legacy binaries reset SQLite's version marker. Old field-specific writes preserve the additional columns. Newer unknown schema versions are rejected. Keep a SQLite-consistent backup before upgrading a shared live ledger; ordinary retention housekeeping still applies on open.
+
+## Back up and recover your archive
+
+Save a snapshot manually and list the available recovery points:
+
+```bash
+work-tracker backup
+work-tracker backups
+work-tracker backups --json
+```
+
+By default, snapshots go in `backups/` beside the selected database. For the
+default ledger, this is `~/.local/share/work-tracker/backups/`. Each file has a
+UTC timestamp and a unique suffix. Use `--directory PATH` or
+`WORK_TRACKER_BACKUP_DIR` to choose another directory for `backup` and `backups`.
+Use separate directories for separate ledgers.
+
+Each snapshot contains every Work Item, Status, field, and History Entry present
+at one consistent point during the backup. This includes done, cancelled, and
+deleted work still stored in SQLite. Backup captures committed WAL data while
+other agents continue working. It does not migrate the source database, purge
+expired deletions, or add History Entries. Missing source databases fail instead
+of creating an empty ledger.
+
+The command verifies SQLite integrity, foreign keys, and the Work Tracker schema
+before publishing a completed snapshot. Incomplete files use `.partial` and are
+excluded from `backups`. Concurrent backups produce separate files. On Unix,
+new backup directories have mode `0700`, and snapshots have mode `0600`.
+Existing directories keep their permissions. Snapshots are never automatically
+deleted, so monitor free disk space. If a backup fails, earlier snapshots remain
+available. `backups` reports a corrupt recognized snapshot as an error with its
+path rather than silently listing it as usable.
+
+### Enable daily backups on Linux
+
+Install the new binary with `just install`. The supplied systemd user units use
+`~/.cargo/bin/work-tracker`, the default database, and the default backup directory.
+If you use `WORK_TRACKER_DB`, `XDG_DATA_HOME`, a custom Cargo installation, or a
+different backup directory, edit `ExecStart` in the copied service before starting
+it. The service does not inherit your shell environment. Quote paths containing
+spaces using systemd unit syntax.
+
+From the repository directory:
+
+```bash
+install -Dm644 systemd/work-tracker-backup.service ~/.config/systemd/user/work-tracker-backup.service
+install -Dm644 systemd/work-tracker-backup.timer ~/.config/systemd/user/work-tracker-backup.timer
+# Edit ~/.config/systemd/user/work-tracker-backup.service here if needed.
+systemctl --user daemon-reload
+systemctl --user start work-tracker-backup.service
+systemctl --user enable --now work-tracker-backup.timer
+systemctl --user list-timers work-tracker-backup.timer
+```
+
+The timer saves one snapshot at 03:00 in the server's local timezone each day.
+`Persistent=true` triggers a missed run when the user manager starts again.
+For backups while logged out, enable lingering for your user if the server's
+policy permits it:
+
+```bash
+loginctl enable-linger "$USER"
+```
+
+Check the latest result and any failures:
+
+```bash
+systemctl --user status work-tracker-backup.service
+journalctl --user -u work-tracker-backup.service -n 30 --no-pager
+work-tracker backups
+```
+
+To stop future daily backups while keeping snapshots:
+
+```bash
+systemctl --user disable --now work-tracker-backup.timer
+```
+
+### Resume from a snapshot
+
+Choose a file from `work-tracker backups`. Recover it into a new path:
+
+```bash
+work-tracker restore /path/to/snapshot.db --to ~/.local/share/work-tracker/recovered.db
+work-tracker --database ~/.local/share/work-tracker/recovered.db list --all --include-deleted --limit 100000
+work-tracker --database ~/.local/share/work-tracker/recovered.db history 1
+```
+
+`restore` checks the snapshot and refuses an existing destination, even with
+`--database` set. It also refuses SQLite sidecars at the destination. The recovered
+database initially matches the snapshot, including IDs and timestamps. Ordinary
+commands apply current migrations and the usual 60-day deletion retention, so
+expired Deleted Work Items can disappear on the first normal open. Done and
+cancelled Work Items have no expiry.
+
+To resume work, stop the dashboard and pause agents that use the old ledger.
+Set the recovered path for every client, then restart them:
+
+```bash
+export WORK_TRACKER_DB="$HOME/.local/share/work-tracker/recovered.db"
+work-tracker path
+work-tracker today
+```
+
+Persist that setting in your shell or service configuration. Update the daily
+backup service's explicit `--database` path and reload systemd as well. Changing
+one shell does not redirect existing agents or a running dashboard. Keep the
+previous live database until you have checked the recovered ledger.
+
+Recovery returns the whole ledger to the selected snapshot's statuses and notes.
+Later changes stay in the previous database and are absent from the recovered
+copy. This does not rewind Git repositories, GitHub, CI, or files mentioned by a
+Work Item. Daily backups give roughly daily recovery points while successful
+backups run each day. Take a manual snapshot before an important change for a
+closer recovery point.
+
+### Protect against losing the server
+
+Local snapshots protect against accidental ledger changes or loss of the live
+database. Copy completed `.db` snapshots to a separate machine or disk to
+protect against losing this server. Preserve older copies there as well. For
+example, from another machine:
+
+```bash
+rsync -av your-linux-server:.local/share/work-tracker/backups/ ./work-tracker-backups/ --include='*.db' --exclude='*'
+```
+
+Only copy completed snapshots. A raw copy of the live database can miss
+committed changes in its WAL. Test recovery from an external copy with `restore`
+and `show` before relying on that destination.
 
 ## Agent and script usage
 

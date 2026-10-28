@@ -17,7 +17,10 @@ use crate::domain::{
 };
 use crate::todo::{TodoView, TodoWindow};
 
+pub mod backup;
+
 const RETENTION_DAYS: i64 = 60;
+const SCHEMA_VERSION: i64 = 3;
 const BUSY_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 
 /// SQL list of the statuses that make a Work Item actionable. Keep in sync with
@@ -89,8 +92,10 @@ impl Tracker {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let version: i64 =
             transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version > 3 {
-            bail!("database schema version {version} is newer than supported version 3");
+        if version > SCHEMA_VERSION {
+            bail!(
+                "database schema version {version} is newer than supported version {SCHEMA_VERSION}"
+            );
         }
         transaction.execute_batch(
             "
@@ -154,7 +159,7 @@ impl Tracker {
                 ))?;
             }
         }
-        transaction.pragma_update(None, "user_version", 3)?;
+        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
 
         let tracker = Self { connection };

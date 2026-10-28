@@ -1,0 +1,10 @@
+[Unit]
+Description=Save a verified Work Tracker database snapshot
+
+[Service]
+Type=oneshot
+UMask=0077
+# Change the executable, database, and directory if your installation differs.
+# Shell environment variables such as WORK_TRACKER_DB are not inherited here.
+ExecStart=%h/.cargo/bin/work-tracker --database %h/.local/share/work-tracker/work-tracker.db backup --directory %h/.local/share/work-tracker/backups
+TimeoutStartSec=5min

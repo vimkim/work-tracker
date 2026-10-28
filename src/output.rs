@@ -342,6 +342,56 @@ pub fn format_todo_colored(view: &TodoView, colors: Colors) -> String {
     text
 }
 
+pub fn print_snapshot(snapshot: &crate::db::backup::Snapshot, json: bool) -> anyhow::Result<()> {
+    if json {
+        return print_json(snapshot);
+    }
+    println!("Snapshot: {}", snapshot.path.display());
+    println!("Saved at: {}", snapshot.created_at);
+    println!(
+        "{} Work Items, {} History Entries, {} bytes; integrity verified",
+        snapshot.contents.work_items, snapshot.contents.history_entries, snapshot.size_bytes
+    );
+    Ok(())
+}
+
+pub fn print_snapshots(
+    snapshots: &[crate::db::backup::Snapshot],
+    json: bool,
+) -> anyhow::Result<()> {
+    if json {
+        return print_json(&snapshots);
+    }
+    if snapshots.is_empty() {
+        println!("No snapshots yet. Run work-tracker backup to save one.");
+    }
+    for snapshot in snapshots {
+        println!(
+            "{}  {} items  {} history  {} bytes  {}",
+            snapshot.created_at.format("%Y-%m-%d %H:%M:%S UTC"),
+            snapshot.contents.work_items,
+            snapshot.contents.history_entries,
+            snapshot.size_bytes,
+            snapshot.path.display()
+        );
+    }
+    Ok(())
+}
+
+pub fn print_recovery(recovery: &crate::db::backup::Recovery, json: bool) -> anyhow::Result<()> {
+    if json {
+        return print_json(recovery);
+    }
+    println!("Recovered database: {}", recovery.database.display());
+    println!("From snapshot: {}", recovery.snapshot.display());
+    println!(
+        "{} Work Items, {} History Entries; integrity verified",
+        recovery.contents.work_items, recovery.contents.history_entries
+    );
+    println!("Inspect this database with --database PATH, then point clients at it to resume.");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
