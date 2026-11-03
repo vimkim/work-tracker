@@ -1,0 +1,15 @@
+[Unit]
+Description=Record a failed Work Tracker backup as a Work Item
+
+[Service]
+Type=oneshot
+UMask=0077
+# Keep the executable and database equal to work-tracker-backup.service.
+# systemd passes MONITOR_* only while one unit triggers this handler; the note is blank otherwise.
+ExecStart=%h/.cargo/bin/work-tracker --database %h/.local/share/work-tracker/work-tracker.db add "Work Tracker backup failed" \
+  --status blocked --priority high \
+  --workdir %h/.local/share/work-tracker \
+  --actor systemd:work-tracker-backup \
+  --description "Diagnose with journalctl --user -u work-tracker-backup.service -n 50 --no-pager, then check recovery points with work-tracker backups." \
+  --note "Service result ${MONITOR_SERVICE_RESULT}, exit status ${MONITOR_EXIT_STATUS}."
+TimeoutStartSec=1min

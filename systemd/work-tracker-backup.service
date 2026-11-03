@@ -1,5 +1,6 @@
 [Unit]
 Description=Save a verified Work Tracker database snapshot
+OnFailure=work-tracker-backup-failure.service
 
 [Service]
 Type=oneshot

@@ -253,16 +253,17 @@ path rather than silently listing it as usable.
 Install the new binary with `just install`. The supplied systemd user units use
 `~/.cargo/bin/work-tracker`, the default database, and the default backup directory.
 If you use `WORK_TRACKER_DB`, `XDG_DATA_HOME`, a custom Cargo installation, or a
-different backup directory, edit `ExecStart` in the copied service before starting
-it. The service does not inherit your shell environment. Quote paths containing
+different backup directory, edit `ExecStart` in the copied services before starting
+them. The services do not inherit your shell environment. Quote paths containing
 spaces using systemd unit syntax.
 
 From the repository directory:
 
 ```bash
 install -Dm644 systemd/work-tracker-backup.service ~/.config/systemd/user/work-tracker-backup.service
+install -Dm644 systemd/work-tracker-backup-failure.service ~/.config/systemd/user/work-tracker-backup-failure.service
 install -Dm644 systemd/work-tracker-backup.timer ~/.config/systemd/user/work-tracker-backup.timer
-# Edit ~/.config/systemd/user/work-tracker-backup.service here if needed.
+# Edit both copied .service files here if needed.
 systemctl --user daemon-reload
 systemctl --user start work-tracker-backup.service
 systemctl --user enable --now work-tracker-backup.timer
@@ -271,6 +272,10 @@ systemctl --user list-timers work-tracker-backup.timer
 
 The timer saves one snapshot at 03:00 in the server's local timezone each day.
 `Persistent=true` triggers a missed run when the user manager starts again.
+If the backup service fails, `OnFailure=` starts
+`work-tracker-backup-failure.service`, which adds a blocked, high-priority Work
+Item titled "Work Tracker backup failed". It appears in `today`, `list`, `todo`,
+and the dashboard. Each failed run adds its own Work Item.
 For backups while logged out, enable lingering for your user if the server's
 policy permits it:
 
@@ -318,10 +323,11 @@ work-tracker path
 work-tracker today
 ```
 
-Persist that setting in your shell or service configuration. Update the daily
-backup service's explicit `--database` path and reload systemd as well. Changing
-one shell does not redirect existing agents or a running dashboard. Keep the
-previous live database until you have checked the recovered ledger.
+Persist that setting in your shell or service configuration. Update the explicit
+`--database` path in the daily backup service and its failure service, and reload
+systemd as well. Changing one shell does not redirect existing agents or a running
+dashboard. Keep the previous live database until you have checked the recovered
+ledger.
 
 Recovery returns the whole ledger to the selected snapshot's statuses and notes.
 Later changes stay in the previous database and are absent from the recovered
@@ -344,6 +350,14 @@ rsync -av your-linux-server:.local/share/work-tracker/backups/ ./work-tracker-ba
 Only copy completed snapshots. A raw copy of the live database can miss
 committed changes in its WAL. Test recovery from an external copy with `restore`
 and `show` before relying on that destination.
+
+To also save each daily snapshot on a physically separate disk, add a second
+`ExecStart=` line after the first in `work-tracker-backup.service`. systemd runs
+the lines in order and fails the service if either fails:
+
+```ini
+ExecStart=%h/.cargo/bin/work-tracker --database %h/.local/share/work-tracker/work-tracker.db backup --directory /mnt/nvme/data-5/work-tracker-backups
+```
 
 ## Agent and script usage
 
