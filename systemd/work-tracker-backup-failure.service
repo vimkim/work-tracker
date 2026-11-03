@@ -5,7 +5,7 @@ Description=Record a failed Work Tracker backup as a Work Item
 Type=oneshot
 UMask=0077
 # Keep the executable and database equal to work-tracker-backup.service.
-# systemd passes MONITOR_* only while one unit triggers this handler; the note is blank otherwise.
+# systemd sets MONITOR_* only when exactly one unit names this handler in OnFailure=.
 ExecStart=%h/.cargo/bin/work-tracker --database %h/.local/share/work-tracker/work-tracker.db add "Work Tracker backup failed" \
   --status blocked --priority high \
   --workdir %h/.local/share/work-tracker \

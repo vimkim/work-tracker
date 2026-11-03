@@ -356,7 +356,7 @@ To also save each daily snapshot on a physically separate disk, add a second
 the lines in order and fails the service if either fails:
 
 ```ini
-ExecStart=%h/.cargo/bin/work-tracker --database %h/.local/share/work-tracker/work-tracker.db backup --directory /mnt/nvme/data-5/work-tracker-backups
+ExecStart=%h/.cargo/bin/work-tracker --database %h/.local/share/work-tracker/work-tracker.db backup --directory /mnt/other-disk/work-tracker-backups
 ```
 
 ## Agent and script usage
