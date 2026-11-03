@@ -1,4 +1,9 @@
-use std::process::ExitCode;
+#![deny(clippy::print_stdout)]
+
+use std::{
+    io::{self, Write as _},
+    process::ExitCode,
+};
 
 use anyhow::Result;
 use clap::Parser;
@@ -18,6 +23,9 @@ async fn main() -> ExitCode {
     let json_output = cli.json;
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
+        // A reader that closes stdout early (`| head`) is the consumer's choice. Failing here
+        // would make an agent retry a mutation that already committed.
+        Err(error) if is_broken_pipe(&error) => ExitCode::SUCCESS,
         Err(error) => {
             if json_output {
                 eprintln!("{}", json!({"error": format!("{error:#}")}));
@@ -27,6 +35,14 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn is_broken_pipe(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|io_error| io_error.kind() == io::ErrorKind::BrokenPipe)
+    })
 }
 
 async fn run(cli: Cli) -> Result<()> {
@@ -58,7 +74,7 @@ async fn run(cli: Cli) -> Result<()> {
         if cli.json {
             return output::print_json(&json!({"database": database}));
         }
-        println!("{}", database.display());
+        writeln!(io::stdout(), "{}", database.display())?;
         return Ok(());
     }
 
@@ -110,11 +126,9 @@ async fn run(cli: Cli) -> Result<()> {
             } else if args.details {
                 output::print_item_details(&items, filter == ListFilter::Actionable, colors)
             } else if filter == ListFilter::Actionable {
-                output::print_actionable_items(&items, colors);
-                Ok(())
+                output::print_actionable_items(&items, colors)
             } else {
-                output::print_items(&items, colors);
-                Ok(())
+                output::print_items(&items, colors)
             }
         }
         Command::Today(args) => {
@@ -127,7 +141,11 @@ async fn run(cli: Cli) -> Result<()> {
             if cli.json {
                 output::print_json(&view)
             } else {
-                print!("{}", output::format_todo_colored(&view, colors));
+                write!(
+                    io::stdout(),
+                    "{}",
+                    output::format_todo_colored(&view, colors)
+                )?;
                 Ok(())
             }
         }
@@ -173,8 +191,7 @@ async fn run(cli: Cli) -> Result<()> {
             if cli.json {
                 output::print_json(&entry)
             } else {
-                output::print_history(&[entry]);
-                Ok(())
+                output::print_history(&[entry])
             }
         }
         Command::Delete(args) => {
@@ -191,8 +208,7 @@ async fn run(cli: Cli) -> Result<()> {
             if cli.json {
                 output::print_json(&entries)
             } else {
-                output::print_history(&entries);
-                Ok(())
+                output::print_history(&entries)
             }
         }
         Command::Path
@@ -232,7 +248,6 @@ fn show_items(
     if json {
         output::print_json(&items)
     } else {
-        output::print_items(items, colors);
-        Ok(())
+        output::print_items(items, colors)
     }
 }

@@ -1,4 +1,9 @@
-use std::{fmt::Write, io::IsTerminal};
+#![deny(clippy::print_stdout)]
+
+use std::{
+    fmt::Write as _,
+    io::{self, IsTerminal, Write as _},
+};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local};
@@ -71,7 +76,7 @@ impl Colors {
 }
 
 pub fn print_json(value: &impl Serialize) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(value)?);
+    writeln!(io::stdout(), "{}", serde_json::to_string_pretty(value)?)?;
     Ok(())
 }
 
@@ -153,47 +158,58 @@ pub fn format_item(item: &WorkItem, colors: Colors) -> Result<String> {
 }
 
 pub fn print_item(item: &WorkItem, colors: Colors) -> Result<()> {
-    print!("{}", format_item(item, colors)?);
+    write!(io::stdout(), "{}", format_item(item, colors)?)?;
     Ok(())
 }
 
 pub fn print_item_details(items: &[WorkItem], actionable: bool, colors: Colors) -> Result<()> {
     if items.is_empty() {
-        if actionable {
-            print_actionable_items(items, colors);
+        return if actionable {
+            print_actionable_items(items, colors)
         } else {
-            print_items(items, colors);
-        }
-        return Ok(());
+            print_items(items, colors)
+        };
     }
     // Format every item before writing, so validation errors cannot leave partial output.
     let details = items
         .iter()
         .map(|item| format_item(item, colors))
         .collect::<Result<Vec<_>>>()?;
-    print!("{}", details.join("\n"));
+    write!(io::stdout(), "{}", details.join("\n"))?;
     if actionable {
-        println!("{}", colors.paint(actionable_footer(items.len()), "2"));
+        writeln!(
+            io::stdout(),
+            "{}",
+            colors.paint(actionable_footer(items.len()), "2")
+        )?;
     }
     Ok(())
 }
 
-pub fn print_items(items: &[WorkItem], colors: Colors) {
+pub fn print_items(items: &[WorkItem], colors: Colors) -> Result<()> {
     if items.is_empty() {
-        println!("No work items.");
-        return;
+        writeln!(io::stdout(), "No work items.")?;
+        return Ok(());
     }
-    print_table(items, colors);
+    print_table(items, colors)
 }
 
 /// Prints the default `list` view and tells the reader how to widen it.
-pub fn print_actionable_items(items: &[WorkItem], colors: Colors) {
+pub fn print_actionable_items(items: &[WorkItem], colors: Colors) -> Result<()> {
     if items.is_empty() {
-        println!("No actionable work items. Use --all to include done and cancelled.");
-        return;
+        writeln!(
+            io::stdout(),
+            "No actionable work items. Use --all to include done and cancelled."
+        )?;
+        return Ok(());
     }
-    print_table(items, colors);
-    println!("{}", colors.paint(actionable_footer(items.len()), "2"));
+    print_table(items, colors)?;
+    writeln!(
+        io::stdout(),
+        "{}",
+        colors.paint(actionable_footer(items.len()), "2")
+    )?;
+    Ok(())
 }
 
 fn actionable_footer(count: usize) -> String {
@@ -201,16 +217,18 @@ fn actionable_footer(count: usize) -> String {
     format!("Showing {count} actionable work {noun}. Use --all to include done and cancelled.")
 }
 
-fn print_table(items: &[WorkItem], colors: Colors) {
-    println!(
+fn print_table(items: &[WorkItem], colors: Colors) -> Result<()> {
+    writeln!(
+        io::stdout(),
         "{}",
         colors.paint(
             format!("{:<7} {:<10} {:<17} TITLE", "ID", "STATUS", "UPDATED"),
             "1"
         )
-    );
+    )?;
     for item in items {
-        println!(
+        writeln!(
+            io::stdout(),
             "{:<7} {} {} {}",
             item.id,
             colors.status(item.status, 10),
@@ -224,17 +242,19 @@ fn print_table(items: &[WorkItem], colors: Colors) {
                 "2"
             ),
             item.title
-        );
+        )?;
     }
+    Ok(())
 }
 
-pub fn print_history(entries: &[HistoryEntry]) {
+pub fn print_history(entries: &[HistoryEntry]) -> Result<()> {
     if entries.is_empty() {
-        println!("No history entries.");
-        return;
+        writeln!(io::stdout(), "No history entries.")?;
+        return Ok(());
     }
     for entry in entries {
-        println!(
+        writeln!(
+            io::stdout(),
             "{}  {:<14} by {}",
             entry
                 .occurred_at
@@ -242,14 +262,15 @@ pub fn print_history(entries: &[HistoryEntry]) {
                 .format("%Y-%m-%d %H:%M:%S %:z"),
             entry.kind,
             entry.actor
-        );
+        )?;
         if let Some(note) = &entry.note {
-            println!("  Note: {note}");
+            writeln!(io::stdout(), "  Note: {note}")?;
         }
         if entry.changes != serde_json::json!({}) {
-            println!("  Changes: {}", entry.changes);
+            writeln!(io::stdout(), "  Changes: {}", entry.changes)?;
         }
     }
+    Ok(())
 }
 
 pub fn format_todo(view: &TodoView) -> String {
@@ -346,12 +367,15 @@ pub fn print_snapshot(snapshot: &crate::db::backup::Snapshot, json: bool) -> any
     if json {
         return print_json(snapshot);
     }
-    println!("Snapshot: {}", snapshot.path.display());
-    println!("Saved at: {}", snapshot.created_at);
-    println!(
+    writeln!(io::stdout(), "Snapshot: {}", snapshot.path.display())?;
+    writeln!(io::stdout(), "Saved at: {}", snapshot.created_at)?;
+    writeln!(
+        io::stdout(),
         "{} Work Items, {} History Entries, {} bytes; integrity verified",
-        snapshot.contents.work_items, snapshot.contents.history_entries, snapshot.size_bytes
-    );
+        snapshot.contents.work_items,
+        snapshot.contents.history_entries,
+        snapshot.size_bytes
+    )?;
     Ok(())
 }
 
@@ -363,17 +387,21 @@ pub fn print_snapshots(
         return print_json(&snapshots);
     }
     if snapshots.is_empty() {
-        println!("No snapshots yet. Run work-tracker backup to save one.");
+        writeln!(
+            io::stdout(),
+            "No snapshots yet. Run work-tracker backup to save one."
+        )?;
     }
     for snapshot in snapshots {
-        println!(
+        writeln!(
+            io::stdout(),
             "{}  {} items  {} history  {} bytes  {}",
             snapshot.created_at.format("%Y-%m-%d %H:%M:%S UTC"),
             snapshot.contents.work_items,
             snapshot.contents.history_entries,
             snapshot.size_bytes,
             snapshot.path.display()
-        );
+        )?;
     }
     Ok(())
 }
@@ -382,13 +410,26 @@ pub fn print_recovery(recovery: &crate::db::backup::Recovery, json: bool) -> any
     if json {
         return print_json(recovery);
     }
-    println!("Recovered database: {}", recovery.database.display());
-    println!("From snapshot: {}", recovery.snapshot.display());
-    println!(
+    writeln!(
+        io::stdout(),
+        "Recovered database: {}",
+        recovery.database.display()
+    )?;
+    writeln!(
+        io::stdout(),
+        "From snapshot: {}",
+        recovery.snapshot.display()
+    )?;
+    writeln!(
+        io::stdout(),
         "{} Work Items, {} History Entries; integrity verified",
-        recovery.contents.work_items, recovery.contents.history_entries
-    );
-    println!("Inspect this database with --database PATH, then point clients at it to resume.");
+        recovery.contents.work_items,
+        recovery.contents.history_entries
+    )?;
+    writeln!(
+        io::stdout(),
+        "Inspect this database with --database PATH, then point clients at it to resume."
+    )?;
     Ok(())
 }
 
