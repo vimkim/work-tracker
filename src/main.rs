@@ -93,7 +93,7 @@ async fn run(cli: Cli) -> Result<()> {
 
     if let Command::Serve(args) = &cli.command {
         Tracker::open(&database)?;
-        return web::serve(database, &args.bind).await;
+        return web::serve(database, &args.bind, args.allow_hosts.clone()).await;
     }
     if matches!(cli.command, Command::Path) {
         if cli.json {

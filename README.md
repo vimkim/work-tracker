@@ -484,6 +484,14 @@ ssh -L 8787:127.0.0.1:8787 your-linux-server
 
 A different socket can be selected explicitly with `work-tracker serve --bind 127.0.0.1:9000`. Binding to a non-loopback address exposes an unauthenticated dashboard and should only be done behind appropriate network controls.
 
+The dashboard answers only requests whose `Host` names `localhost` or a
+loopback IP, on any port, so a tunnel to another local port still works. Other
+hostnames get `403`. This blocks DNS rebinding, where a web page you visit
+re-points its own hostname at `127.0.0.1` and reads the dashboard through your
+tunnel. To open it under another name, pass `--allow-host NAME` (repeatable).
+Every response also forbids framing (`X-Frame-Options: DENY`,
+`frame-ancestors 'none'`).
+
 ## Agent skill
 
 The `track-work` skill is maintained in the `my-cubrid-skills` collection. Install it for Claude Code and Codex with:

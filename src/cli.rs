@@ -377,6 +377,10 @@ pub struct ServeArgs {
     /// Socket address. Keep the localhost default and use an SSH tunnel.
     #[arg(long, default_value = "127.0.0.1:8787")]
     pub bind: String,
+
+    /// Extra hostname the browser may use, besides localhost and loopback IPs. Repeatable.
+    #[arg(long = "allow-host", value_name = "HOSTNAME")]
+    pub allow_hosts: Vec<String>,
 }
 
 /// Resolve an assignment to an existing physical directory without trimming

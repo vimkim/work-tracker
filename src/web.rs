@@ -1,11 +1,16 @@
-use std::{net::SocketAddr, path::PathBuf};
+use std::{
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use anyhow::{Context, Result};
 use axum::{
     Router,
-    extract::{Path, State},
-    http::StatusCode,
-    response::Html,
+    extract::{Path, Request, State},
+    http::{HeaderValue, StatusCode, header},
+    middleware::{self, Next},
+    response::{Html, IntoResponse, Response},
     routing::get,
 };
 use chrono::Local;
@@ -19,11 +24,11 @@ struct AppState {
 
 type WebResult = Result<Html<String>, (StatusCode, Html<String>)>;
 
-pub async fn serve(database: PathBuf, bind: &str) -> Result<()> {
+pub async fn serve(database: PathBuf, bind: &str, allowed_hosts: Vec<String>) -> Result<()> {
     let address: SocketAddr = bind
         .parse()
         .with_context(|| format!("invalid bind address: {bind}"))?;
-    let app = router(database);
+    let app = router(database, allowed_hosts);
     let listener = tokio::net::TcpListener::bind(address)
         .await
         .with_context(|| format!("failed to bind {address}"))?;
@@ -32,11 +37,64 @@ pub async fn serve(database: PathBuf, bind: &str) -> Result<()> {
     Ok(())
 }
 
-fn router(database: PathBuf) -> Router {
+fn router(database: PathBuf, allowed_hosts: Vec<String>) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/items/{id}", get(show_item))
         .with_state(AppState { database })
+        .layer(middleware::from_fn_with_state(
+            Arc::new(allowed_hosts),
+            guard_host,
+        ))
+}
+
+/// A DNS-rebinding page reaches the loopback listener under the attacker's
+/// hostname, so only loopback names and explicitly allowed names may read.
+async fn guard_host(
+    State(allowed): State<Arc<Vec<String>>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let permitted = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|host| host.to_str().ok())
+        .is_some_and(|host| host_allowed(host, &allowed));
+    let mut response = if permitted {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::FORBIDDEN,
+            "Host not allowed. Open the dashboard through localhost or pass --allow-host.\n",
+        )
+            .into_response()
+    };
+    let headers = response.headers_mut();
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
+/// Any port is accepted, because an SSH tunnel may forward a different local port.
+pub fn host_allowed(host: &str, allowed: &[String]) -> bool {
+    let name = match host.strip_prefix('[') {
+        Some(bracketed) => bracketed.split(']').next().unwrap_or_default(),
+        None => match host.rsplit_once(':') {
+            Some((name, port)) if port.bytes().all(|b| b.is_ascii_digit()) => name,
+            _ => host,
+        },
+    };
+    let name = name.trim_end_matches('.');
+    name.eq_ignore_ascii_case("localhost")
+        || name.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+        || allowed.iter().any(|extra| extra.eq_ignore_ascii_case(name))
 }
 
 async fn index(State(state): State<AppState>) -> WebResult {
