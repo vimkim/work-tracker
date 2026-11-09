@@ -85,6 +85,7 @@ If neither is set, the CLI uses the current `USER`, then `unknown` as a last res
 | `backups` | List and verify snapshots, newest first |
 | `restore SNAPSHOT --to PATH` | Recover a snapshot into a new database |
 | `serve` | Host the read-only dashboard |
+| `doctor` | Check the database, schema, integrity, backups, and actor without writing |
 
 The statuses are `pending`, `active`, `waiting`, `blocked`, `done`, `cancelled`, and `deleted`. The first four are actionable: they are what `list` shows by default, and they remain in the Daily View even when they were not updated today.
 
@@ -445,6 +446,22 @@ The default budget stays below the 10,000 characters at which Claude Code
 replaces hook output with a file reference.
 
 For multiple agents, point every process at the same database file on the same Linux host. SQLite serializes writes, waits up to five seconds for a busy writer, and keeps reads responsive through WAL mode. Do not put the database on a filesystem that does not support SQLite locking semantics.
+
+## Health check
+
+```bash
+work-tracker doctor
+work-tracker doctor --json      # {"ok": bool, "checks": [{name, status, detail, required}]}
+```
+
+`doctor` opens the database read-only, so it never migrates or creates it.
+Required checks are `database` (exists and opens), `schema` (not newer than
+this binary), and `integrity` (`PRAGMA quick_check`); any failure exits with
+status 1. `journal` (WAL mode), `backup`, and `actor` only warn. The backup
+check warns when there is no snapshot or the newest is older than 48 hours,
+twice the daily timer interval, which catches a timer that never runs.
+`--directory` or `WORK_TRACKER_BACKUP_DIR` selects the snapshot directory as
+for `backups`.
 
 ## Deletion and retention
 

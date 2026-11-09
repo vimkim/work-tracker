@@ -64,6 +64,25 @@ async fn run(cli: Cli) -> Result<()> {
             let directory = backup::directory(&database, args.directory.clone());
             return output::print_snapshots(&backup::list(&directory)?, cli.json);
         }
+        Command::Doctor(args) => {
+            let directory = backup::directory(&database, args.directory.clone());
+            let actor = std::env::var("WORK_TRACKER_ACTOR").ok();
+            let checks = work_tracker::doctor::run(
+                &database,
+                &directory,
+                actor.as_deref(),
+                chrono::Utc::now(),
+            );
+            output::print_checks(&checks, cli.json, colors)?;
+            let failed = checks
+                .iter()
+                .filter(|check| check.failed_required())
+                .count();
+            if failed > 0 {
+                anyhow::bail!("{failed} required check(s) failed");
+            }
+            return Ok(());
+        }
         Command::Restore(args) => {
             let recovery = backup::restore(&args.snapshot, &args.to)?;
             return output::print_recovery(&recovery, cli.json);
@@ -258,6 +277,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Path
         | Command::Hook(_)
+        | Command::Doctor(_)
         | Command::Serve(_)
         | Command::Backup(_)
         | Command::Backups(_)

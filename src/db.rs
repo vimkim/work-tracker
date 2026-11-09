@@ -20,7 +20,7 @@ use crate::todo::{TodoView, TodoWindow};
 pub mod backup;
 
 const RETENTION_DAYS: i64 = 60;
-const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 3;
 const BUSY_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 
 /// SQL list of the statuses that make a Work Item actionable. Keep in sync with

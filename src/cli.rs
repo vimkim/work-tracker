@@ -71,6 +71,8 @@ pub enum Command {
     Restore(RestoreArgs),
     /// Host the read-only HTML dashboard.
     Serve(ServeArgs),
+    /// Check the database, schema, integrity, backups, and actor without writing.
+    Doctor(BackupArgs),
 }
 
 #[derive(Debug, Args)]

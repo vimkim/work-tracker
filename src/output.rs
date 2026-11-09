@@ -11,6 +11,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::db::SearchHit;
+use crate::doctor::{Check, CheckStatus};
 use crate::domain::{HistoryEntry, Priority, Status, WorkItem};
 use crate::todo::{TodoView, seoul_offset};
 
@@ -142,6 +143,28 @@ pub fn print_search(hits: &[SearchHit], colors: Colors) -> Result<()> {
             io::stdout(),
             "        {}",
             colors.paint(format!("{}: {}", hit.matched_in, hit.snippet), "2")
+        )?;
+    }
+    Ok(())
+}
+
+pub fn print_checks(checks: &[Check], json: bool, colors: Colors) -> Result<()> {
+    if json {
+        let ok = !checks.iter().any(Check::failed_required);
+        return print_json(&serde_json::json!({"ok": ok, "checks": checks}));
+    }
+    for check in checks {
+        let (label, style) = match check.status {
+            CheckStatus::Ok => ("ok", "32"),
+            CheckStatus::Warn => ("warn", "33"),
+            CheckStatus::Fail => ("FAIL", "31"),
+        };
+        writeln!(
+            io::stdout(),
+            "{} {:<10} {}",
+            colors.paint(format!("{label:<5}"), style),
+            check.name,
+            check.detail
         )?;
     }
     Ok(())
