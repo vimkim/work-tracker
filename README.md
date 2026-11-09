@@ -371,6 +371,22 @@ work-tracker --database /srv/work-tracker/team.db list --json
 
 `WORK_TRACKER_DB` selects the shared database without repeating `--database`. Successful commands exit with status 0. Command validation uses exit status 2; runtime and lookup errors use exit status 1 and emit `{"error":"..."}` to standard error when `--json` is enabled.
 
+To keep agent context small, read an index first and fetch details only for
+the items you need:
+
+```bash
+work-tracker today --compact --json     # index: no descriptions
+work-tracker list --here --compact --json
+work-tracker show 42 --json             # full item
+work-tracker history 42 --limit 10      # newest 10 entries, oldest first
+```
+
+`--compact` keeps `id`, `status`, `title`, `workdir`, `priority`,
+`planned_date`, `due_date`, and `updated_at`, and is still a plain array. It
+affects JSON only and cannot be combined with `list --details`. `history
+--limit N` keeps the newest N entries in chronological order; the
+human-readable form starts with a line counting the omitted entries.
+
 For multiple agents, point every process at the same database file on the same Linux host. SQLite serializes writes, waits up to five seconds for a busy writer, and keeps reads responsive through WAL mode. Do not put the database on a filesystem that does not support SQLite locking semantics.
 
 ## Deletion and retention

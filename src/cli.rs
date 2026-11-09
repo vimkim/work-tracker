@@ -54,7 +54,7 @@ pub enum Command {
     /// Soft-delete a work item for the 60-day retention window.
     Delete(DeleteArgs),
     /// Show the immutable history of a work item.
-    History(IdArgs),
+    History(HistoryArgs),
     /// Print the database path in use.
     Path,
     /// Save a complete SQLite snapshot without changing the ledger.
@@ -170,10 +170,30 @@ pub struct IdArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct HistoryArgs {
+    pub id: i64,
+
+    /// Show only the newest N entries, still in chronological order.
+    #[arg(long)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Args)]
+pub struct CompactArgs {
+    /// With --json, keep only id, status, title, workdir, priority, planned_date,
+    /// due_date, and updated_at. Human-readable output is already compact.
+    #[arg(long)]
+    pub compact: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct ListArgs {
     /// Print each item with the same full details as show; JSON is unchanged.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "compact")]
     pub details: bool,
+
+    #[command(flatten)]
+    pub compact: CompactArgs,
 
     /// Show only items associated with this exact Work Directory.
     #[arg(long, conflicts_with_all = ["here", "without_workdir"])]
@@ -209,6 +229,9 @@ pub struct TodayArgs {
     /// Include work items deleted today.
     #[arg(long)]
     pub include_deleted: bool,
+
+    #[command(flatten)]
+    pub compact: CompactArgs,
 }
 
 #[derive(Debug, Args)]

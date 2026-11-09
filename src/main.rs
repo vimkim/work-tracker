@@ -118,7 +118,9 @@ async fn run(cli: Cli) -> Result<()> {
             };
             let items =
                 tracker.list_in_directory(filter, directory, args.include_deleted, args.limit)?;
-            if cli.json {
+            if cli.json && args.compact.compact {
+                output::print_compact_json(&items)
+            } else if cli.json {
                 for item in &items {
                     output::item_json(item)?;
                 }
@@ -133,7 +135,11 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Today(args) => {
             let items = tracker.daily_view(args.include_deleted)?;
-            show_items(&items, cli.json, colors)
+            if cli.json && args.compact.compact {
+                output::print_compact_json(&items)
+            } else {
+                show_items(&items, cli.json, colors)
+            }
         }
         Command::Todo(args) => {
             let window = TodoWindow::new(chrono::Utc::now(), args.days.unwrap_or(1))?;
@@ -191,7 +197,7 @@ async fn run(cli: Cli) -> Result<()> {
             if cli.json {
                 output::print_json(&entry)
             } else {
-                output::print_history(&[entry])
+                output::print_history(&[entry], 0)
             }
         }
         Command::Delete(args) => {
@@ -204,11 +210,15 @@ async fn run(cli: Cli) -> Result<()> {
             show_item(&item, cli.json, colors)
         }
         Command::History(args) => {
-            let entries = tracker.history(args.id)?;
+            let mut entries = tracker.history(args.id)?;
+            let omitted = args
+                .limit
+                .map_or(0, |limit| entries.len().saturating_sub(limit));
+            entries.drain(..omitted);
             if cli.json {
                 output::print_json(&entries)
             } else {
-                output::print_history(&entries)
+                output::print_history(&entries, omitted)
             }
         }
         Command::Path

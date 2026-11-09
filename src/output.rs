@@ -75,6 +75,38 @@ impl Colors {
     }
 }
 
+/// The index form of a Work Item: enough to choose which items to `show`.
+#[derive(Serialize)]
+pub struct CompactItem<'a> {
+    id: i64,
+    status: Status,
+    title: &'a str,
+    workdir: Option<&'a str>,
+    priority: Priority,
+    planned_date: Option<chrono::NaiveDate>,
+    due_date: Option<chrono::NaiveDate>,
+    updated_at: DateTime<chrono::Utc>,
+}
+
+impl<'a> From<&'a WorkItem> for CompactItem<'a> {
+    fn from(item: &'a WorkItem) -> Self {
+        Self {
+            id: item.id,
+            status: item.status,
+            title: &item.title,
+            workdir: item.workdir.as_deref(),
+            priority: item.schedule.priority,
+            planned_date: item.schedule.planned_date,
+            due_date: item.schedule.due_date,
+            updated_at: item.updated_at,
+        }
+    }
+}
+
+pub fn print_compact_json(items: &[WorkItem]) -> Result<()> {
+    print_json(&items.iter().map(CompactItem::from).collect::<Vec<_>>())
+}
+
 pub fn print_json(value: &impl Serialize) -> Result<()> {
     writeln!(io::stdout(), "{}", serde_json::to_string_pretty(value)?)?;
     Ok(())
@@ -247,8 +279,14 @@ fn print_table(items: &[WorkItem], colors: Colors) -> Result<()> {
     Ok(())
 }
 
-pub fn print_history(entries: &[HistoryEntry]) -> Result<()> {
-    if entries.is_empty() {
+pub fn print_history(entries: &[HistoryEntry], omitted: usize) -> Result<()> {
+    if omitted > 0 {
+        let noun = if omitted == 1 { "entry" } else { "entries" };
+        writeln!(
+            io::stdout(),
+            "{omitted} earlier {noun} omitted. Remove --limit to show all."
+        )?;
+    } else if entries.is_empty() {
         writeln!(io::stdout(), "No history entries.")?;
         return Ok(());
     }
