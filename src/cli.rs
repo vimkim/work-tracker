@@ -55,6 +55,10 @@ pub enum Command {
     Delete(DeleteArgs),
     /// Show the immutable history of a work item.
     History(HistoryArgs),
+    /// Print a bounded resume brief of actionable work in one Work Directory.
+    Brief(BriefArgs),
+    /// Run as an agent hook. Always exits 0 so a tracker failure cannot block the agent.
+    Hook(HookArgs),
     /// Print the database path in use.
     Path,
     /// Save a complete SQLite snapshot without changing the ledger.
@@ -176,6 +180,29 @@ pub struct HistoryArgs {
     /// Show only the newest N entries, still in chronological order.
     #[arg(long)]
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Args)]
+pub struct BriefArgs {
+    /// Work Directory to brief; defaults to the command's current directory.
+    #[arg(long)]
+    pub workdir: Option<PathBuf>,
+
+    /// Maximum characters in the brief.
+    #[arg(long, default_value_t = crate::brief::DEFAULT_MAX_CHARS)]
+    pub max_chars: usize,
+}
+
+#[derive(Debug, Args)]
+pub struct HookArgs {
+    #[arg(value_enum)]
+    pub event: HookEvent,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum HookEvent {
+    /// Claude Code SessionStart: inject the brief for the session's cwd.
+    SessionStart,
 }
 
 #[derive(Debug, Args)]

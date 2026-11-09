@@ -76,7 +76,9 @@ If neither is set, the CLI uses the current `USER`, then `unknown` as a last res
 | `status ID STATUS` | Apply an idempotent status transition |
 | `note ID MESSAGE` | Preserve context without changing status |
 | `delete ID` | Soft-delete an item for 60 days |
-| `history ID` | Show the complete immutable history |
+| `history ID` | Show the complete immutable history; `--limit N` keeps the newest N |
+| `brief` | Print a bounded resume brief for one Work Directory |
+| `hook session-start` | Emit the brief as a Claude Code SessionStart hook; always exits 0 |
 | `path` | Show the SQLite database path |
 | `backup` | Save a complete, verified SQLite snapshot |
 | `backups` | List and verify snapshots, newest first |
@@ -386,6 +388,45 @@ work-tracker history 42 --limit 10      # newest 10 entries, oldest first
 affects JSON only and cannot be combined with `list --details`. `history
 --limit N` keeps the newest N entries in chronological order; the
 human-readable form starts with a line counting the omitted entries.
+
+### Resume brief at session start
+
+`brief` prints the Actionable Work Items of one exact Work Directory (the
+current directory by default) with each item's latest note, within a
+character budget:
+
+```bash
+work-tracker brief                       # current directory, 9000 characters
+work-tracker brief --workdir PATH --max-chars 4000
+work-tracker brief --json                # {"context": "...", "shown": N, "omitted": N}
+```
+
+Items keep the attention order of `list`. An item that does not fit with its
+note is shown without it; when items stop fitting, a final line counts the
+rest. Descriptions are never included.
+
+`hook session-start` runs `brief` for a Claude Code SessionStart hook. It
+reads the hook's JSON from standard input, briefs the hook's `cwd`, and prints
+`hookSpecificOutput.additionalContext`. It returns an empty context for
+resumed sessions, for a missing database, and on any error, and it always
+exits 0, so a tracker problem never blocks the agent. Errors go to standard
+error as one line. Register it in `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|clear|compact",
+        "hooks": [{ "type": "command", "command": "work-tracker hook session-start", "timeout": 10 }]
+      }
+    ]
+  }
+}
+```
+
+The default budget stays below the 10,000 characters at which Claude Code
+replaces hook output with a file reference.
 
 For multiple agents, point every process at the same database file on the same Linux host. SQLite serializes writes, waits up to five seconds for a busy writer, and keeps reads responsive through WAL mode. Do not put the database on a filesystem that does not support SQLite locking semantics.
 

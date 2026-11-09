@@ -1,7 +1,8 @@
 #![deny(clippy::print_stdout)]
 
 use std::{
-    io::{self, Write as _},
+    io::{self, Read as _, Write as _},
+    path::{Path, PathBuf},
     process::ExitCode,
 };
 
@@ -9,7 +10,8 @@ use anyhow::Result;
 use clap::Parser;
 use serde_json::json;
 use work_tracker::{
-    cli::{self, Cli, Command, ListArgs},
+    brief::{self, Brief, BriefItem},
+    cli::{self, Cli, Command, HookEvent, ListArgs},
     db::{ListFilter, NewWorkItem, Tracker, WorkDirectoryFilter, WorkItemUpdate, backup},
     domain::Status,
     output,
@@ -20,6 +22,10 @@ use work_tracker::{
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    if let Command::Hook(args) = &cli.command {
+        run_hook(cli.database.clone(), args.event);
+        return ExitCode::SUCCESS;
+    }
     let json_output = cli.json;
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
@@ -221,12 +227,89 @@ async fn run(cli: Cli) -> Result<()> {
                 output::print_history(&entries, omitted)
             }
         }
+        Command::Brief(args) => {
+            let path = args.workdir.as_deref().unwrap_or(Path::new("."));
+            let brief = build_brief(&tracker, path, args.max_chars)?;
+            if cli.json {
+                output::print_json(&brief)
+            } else if brief.context.is_empty() && brief.omitted == 0 {
+                writeln!(
+                    io::stdout(),
+                    "No actionable work items in this Work Directory."
+                )?;
+                Ok(())
+            } else {
+                write!(io::stdout(), "{}", brief.context)?;
+                Ok(())
+            }
+        }
         Command::Path
+        | Command::Hook(_)
         | Command::Serve(_)
         | Command::Backup(_)
         | Command::Backups(_)
         | Command::Restore(_) => unreachable!(),
     }
+}
+
+fn build_brief(tracker: &Tracker, path: &Path, max_chars: usize) -> Result<Brief> {
+    let workdir = cli::work_directory_query(path)?;
+    let items = tracker
+        .list_in_directory(
+            ListFilter::Actionable,
+            WorkDirectoryFilter::Exact(&workdir),
+            false,
+            1_000,
+        )?
+        .into_iter()
+        .map(|item| {
+            let latest_note = tracker.latest_note(item.id)?;
+            Ok(BriefItem { item, latest_note })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(brief::render(&workdir, &items, max_chars))
+}
+
+/// Hooks must never block the agent: every failure becomes an empty context
+/// plus one line on standard error, and the process exits 0.
+fn run_hook(database: Option<PathBuf>, event: HookEvent) {
+    let context = match event {
+        HookEvent::SessionStart => session_start_context(database).unwrap_or_else(|error| {
+            eprintln!("work-tracker hook: {error:#}");
+            String::new()
+        }),
+    };
+    let envelope = json!({
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": context,
+        }
+    });
+    let _ = writeln!(io::stdout(), "{envelope}");
+}
+
+fn session_start_context(database: Option<PathBuf>) -> Result<String> {
+    let mut input = String::new();
+    io::stdin().read_to_string(&mut input)?;
+    let input: serde_json::Value = if input.trim().is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str(&input)?
+    };
+    // A resumed session already holds its context; injecting again would
+    // invalidate the prompt cache.
+    if input["source"] == "resume" {
+        return Ok(String::new());
+    }
+    let database = cli::database_path(database)?;
+    if !database.exists() {
+        return Ok(String::new());
+    }
+    let cwd = input["cwd"]
+        .as_str()
+        .map_or_else(|| PathBuf::from("."), PathBuf::from);
+    let tracker = Tracker::open(&database)?;
+    Ok(build_brief(&tracker, &cwd, brief::DEFAULT_MAX_CHARS)?.context)
 }
 
 fn list_filter(args: &ListArgs) -> ListFilter {

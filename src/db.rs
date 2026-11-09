@@ -603,6 +603,21 @@ impl Tracker {
             .map_err(Into::into)
     }
 
+    /// The newest note on a Work Item, the usual answer to "where did this stop?".
+    pub fn latest_note(&self, id: i64) -> Result<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT note FROM history_entries
+                 WHERE work_item_id = ?1 AND note IS NOT NULL AND note != ''
+                 ORDER BY id DESC
+                 LIMIT 1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn purge_expired(&self, now: DateTime<Utc>) -> Result<usize> {
         self.connection
             .execute(
