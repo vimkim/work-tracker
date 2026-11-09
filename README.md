@@ -494,13 +494,13 @@ Every response also forbids framing (`X-Frame-Options: DENY`,
 
 ## Agent skill
 
-The `track-work` skill is maintained in the `my-cubrid-skills` collection. Install it for Claude Code and Codex with:
+The `track-work` skill is maintained in the [`my-skills`](https://github.com/vimkim/my-skills) collection (`skills/track-work/`). Install it for Claude Code and Codex with:
 
 ```bash
-npx skills add vimkim/my-cubrid-skills -y -g --agent claude-code --agent codex
+npx --yes skills@1.7.0 add vimkim/my-skills --global --skill track-work --agent claude-code codex --yes
 ```
 
-The skill teaches agents to create a Work Item before long-running work, record meaningful notes and transitions, inspect the Daily View and the actionable list, and preserve the final outcome.
+The skill teaches agents to check the tracker with `doctor`, search for and create a Work Item before long-running work, record meaningful notes and transitions, resume from `brief`, the compact Daily View, and `history --limit`, and preserve the final outcome.
 
 ## Development
 
