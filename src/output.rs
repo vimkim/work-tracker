@@ -10,6 +10,7 @@ use chrono::{DateTime, Local};
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::db::SearchHit;
 use crate::domain::{HistoryEntry, Priority, Status, WorkItem};
 use crate::todo::{TodoView, seoul_offset};
 
@@ -101,6 +102,49 @@ impl<'a> From<&'a WorkItem> for CompactItem<'a> {
             updated_at: item.updated_at,
         }
     }
+}
+
+#[derive(Serialize)]
+struct SearchResult<'a> {
+    #[serde(flatten)]
+    item: CompactItem<'a>,
+    matched_in: &'a str,
+    snippet: &'a str,
+}
+
+pub fn print_search_json(hits: &[SearchHit]) -> Result<()> {
+    print_json(
+        &hits
+            .iter()
+            .map(|hit| SearchResult {
+                item: CompactItem::from(&hit.item),
+                matched_in: hit.matched_in,
+                snippet: &hit.snippet,
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+pub fn print_search(hits: &[SearchHit], colors: Colors) -> Result<()> {
+    if hits.is_empty() {
+        writeln!(io::stdout(), "No matching work items.")?;
+        return Ok(());
+    }
+    for hit in hits {
+        writeln!(
+            io::stdout(),
+            "{:<7} {} {}",
+            hit.item.id,
+            colors.status(hit.item.status, 10),
+            hit.item.title
+        )?;
+        writeln!(
+            io::stdout(),
+            "        {}",
+            colors.paint(format!("{}: {}", hit.matched_in, hit.snippet), "2")
+        )?;
+    }
+    Ok(())
 }
 
 pub fn print_compact_json(items: &[WorkItem]) -> Result<()> {

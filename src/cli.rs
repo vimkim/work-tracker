@@ -55,6 +55,8 @@ pub enum Command {
     Delete(DeleteArgs),
     /// Show the immutable history of a work item.
     History(HistoryArgs),
+    /// Find work items whose title, description, or notes contain every term.
+    Search(SearchArgs),
     /// Print a bounded resume brief of actionable work in one Work Directory.
     Brief(BriefArgs),
     /// Run as an agent hook. Always exits 0 so a tracker failure cannot block the agent.
@@ -180,6 +182,21 @@ pub struct HistoryArgs {
     /// Show only the newest N entries, still in chronological order.
     #[arg(long)]
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Args)]
+pub struct SearchArgs {
+    /// Terms; each must appear in the title, description, or a note. Case-insensitive.
+    #[arg(required = true)]
+    pub terms: Vec<String>,
+
+    /// Include soft-deleted work items.
+    #[arg(long)]
+    pub include_deleted: bool,
+
+    /// Maximum number of results.
+    #[arg(long, default_value_t = 20)]
+    pub limit: usize,
 }
 
 #[derive(Debug, Args)]

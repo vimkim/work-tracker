@@ -603,6 +603,92 @@ impl Tracker {
             .map_err(Into::into)
     }
 
+    /// Work Items whose title, description, or any note contains every term,
+    /// case-insensitively. A plain scan is fast at this ledger's size and,
+    /// unlike FTS5 word tokens, matches Korean words with attached particles.
+    pub fn search(
+        &self,
+        terms: &[&str],
+        include_deleted: bool,
+        limit: usize,
+    ) -> Result<Vec<SearchHit>> {
+        if terms.is_empty() {
+            bail!("search query must contain at least one term");
+        }
+        let patterns: Vec<String> = terms.iter().map(|term| like_pattern(term)).collect();
+        let conditions: Vec<String> = (0..patterns.len())
+            .map(|index| {
+                let p = index + 3;
+                format!(
+                    "(title LIKE ?{p} ESCAPE '\\' OR description LIKE ?{p} ESCAPE '\\'
+                      OR EXISTS (SELECT 1 FROM history_entries h
+                                 WHERE h.work_item_id = work_items.id
+                                   AND h.note LIKE ?{p} ESCAPE '\\'))"
+                )
+            })
+            .collect();
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT id, title, description, status, created_at, updated_at, deleted_at, purge_after, planned_date, due_date, priority, workdir
+             FROM work_items
+             WHERE (?1 OR status != 'deleted') AND {}
+             ORDER BY {STATUS_PRIORITY_ORDER}
+             LIMIT ?2",
+            conditions.join(" AND ")
+        ))?;
+        let mut values: Vec<&dyn rusqlite::ToSql> = vec![&include_deleted];
+        let limit = limit as i64;
+        values.push(&limit);
+        values.extend(
+            patterns
+                .iter()
+                .map(|pattern| pattern as &dyn rusqlite::ToSql),
+        );
+        let items = statement
+            .query_map(values.as_slice(), row_to_item)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        items
+            .into_iter()
+            .map(|item| {
+                let (matched_in, text) = self.first_match(&item, terms[0], &patterns[0])?;
+                Ok(SearchHit {
+                    snippet: snippet(&text, terms[0]),
+                    matched_in,
+                    item,
+                })
+            })
+            .collect()
+    }
+
+    fn first_match(
+        &self,
+        item: &WorkItem,
+        term: &str,
+        pattern: &str,
+    ) -> Result<(&'static str, String)> {
+        if contains_folded(&item.title, term) {
+            return Ok(("title", item.title.clone()));
+        }
+        if let Some(description) = item
+            .description
+            .as_deref()
+            .filter(|d| contains_folded(d, term))
+        {
+            return Ok(("description", description.to_owned()));
+        }
+        let note: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT note FROM history_entries
+                 WHERE work_item_id = ?1 AND note LIKE ?2 ESCAPE '\\'
+                 ORDER BY id DESC LIMIT 1",
+                params![item.id, pattern],
+                |row| row.get(0),
+            )
+            .optional()?;
+        // The first term may match only through LIKE's ASCII folding; fall back to the title.
+        Ok(note.map_or_else(|| ("title", item.title.clone()), |note| ("note", note)))
+    }
+
     /// The newest note on a Work Item, the usual answer to "where did this stop?".
     pub fn latest_note(&self, id: i64) -> Result<Option<String>> {
         self.connection
@@ -760,6 +846,63 @@ fn get_item_from_transaction(transaction: &Transaction<'_>, id: i64) -> Result<O
         )
         .optional()
         .map_err(Into::into)
+}
+
+/// One search result: the item, where the first term matched, and text around it.
+#[derive(Debug)]
+pub struct SearchHit {
+    pub item: WorkItem,
+    pub matched_in: &'static str,
+    pub snippet: String,
+}
+
+fn like_pattern(term: &str) -> String {
+    let escaped = term
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    format!("%{escaped}%")
+}
+
+fn find_folded(text: &[char], term: &[char]) -> Option<usize> {
+    let fold = |c: &char| c.to_lowercase().collect::<String>();
+    (0..=text.len().checked_sub(term.len())?).find(|&start| {
+        text[start..start + term.len()]
+            .iter()
+            .map(fold)
+            .eq(term.iter().map(fold))
+    })
+}
+
+fn contains_folded(text: &str, term: &str) -> bool {
+    let text: Vec<char> = text.chars().collect();
+    let term: Vec<char> = term.chars().collect();
+    find_folded(&text, &term).is_some()
+}
+
+const SNIPPET_CONTEXT: usize = 60;
+
+/// One line of up to about 120 characters centred on the first match.
+fn snippet(text: &str, term: &str) -> String {
+    let text: Vec<char> = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .collect();
+    let term: Vec<char> = term.chars().collect();
+    let at = find_folded(&text, &term).unwrap_or(0);
+    let start = at.saturating_sub(SNIPPET_CONTEXT);
+    let end = (at + term.len() + SNIPPET_CONTEXT).min(text.len());
+    let mut result = String::new();
+    if start > 0 {
+        result.push_str("...");
+    }
+    result.extend(&text[start..end]);
+    if end < text.len() {
+        result.push_str("...");
+    }
+    result
 }
 
 fn row_to_item(row: &Row<'_>) -> rusqlite::Result<WorkItem> {

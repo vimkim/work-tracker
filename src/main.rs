@@ -227,6 +227,19 @@ async fn run(cli: Cli) -> Result<()> {
                 output::print_history(&entries, omitted)
             }
         }
+        Command::Search(args) => {
+            let terms: Vec<&str> = args
+                .terms
+                .iter()
+                .flat_map(|t| t.split_whitespace())
+                .collect();
+            let hits = tracker.search(&terms, args.include_deleted, args.limit)?;
+            if cli.json {
+                output::print_search_json(&hits)
+            } else {
+                output::print_search(&hits, colors)
+            }
+        }
         Command::Brief(args) => {
             let path = args.workdir.as_deref().unwrap_or(Path::new("."));
             let brief = build_brief(&tracker, path, args.max_chars)?;

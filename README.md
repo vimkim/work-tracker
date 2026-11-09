@@ -77,6 +77,7 @@ If neither is set, the CLI uses the current `USER`, then `unknown` as a last res
 | `note ID MESSAGE` | Preserve context without changing status |
 | `delete ID` | Soft-delete an item for 60 days |
 | `history ID` | Show the complete immutable history; `--limit N` keeps the newest N |
+| `search TERM...` | Find items whose title, description, or notes contain every term |
 | `brief` | Print a bounded resume brief for one Work Directory |
 | `hook session-start` | Emit the brief as a Claude Code SessionStart hook; always exits 0 |
 | `path` | Show the SQLite database path |
@@ -388,6 +389,21 @@ work-tracker history 42 --limit 10      # newest 10 entries, oldest first
 affects JSON only and cannot be combined with `list --details`. `history
 --limit N` keeps the newest N entries in chronological order; the
 human-readable form starts with a line counting the omitted entries.
+
+### Searching past work
+
+```bash
+work-tracker search timeout medium       # every term must match
+work-tracker search 트래커 --json
+work-tracker search CBRD-27781 --include-deleted --limit 50
+```
+
+Each term must appear, case-insensitively, in the item's title, description,
+or any note. Matching is by substring, so Korean words match with attached
+particles. Done and cancelled items are included; deleted items need
+`--include-deleted`. Results use the attention order of `list` and default to
+20. `--json` returns the `--compact` fields plus `matched_in` (`title`,
+`description`, or `note`) and a one-line `snippet` around the first term.
 
 ### Resume brief at session start
 
