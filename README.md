@@ -1,19 +1,49 @@
+<div align="center">
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/hero-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="assets/readme/hero-light.svg">
+  <img alt="work-tracker: deterministic pwd-scoped SQLite WAL session memory for humans and AI agents" src="assets/readme/hero-light.svg" width="100%">
+</picture>
+
 # Work Tracker
+
+**Deterministic `pwd`-scoped session memory and status ledger for parallel, long-running human and AI-agent workflows.**
+
+`Rust 2024` · `SQLite WAL` · `Zero Daemon` · `MIT License`
+
+[Why It Exists](#why-this-exists-pwd-scoped-session-memory) · [Build & Install](#build-and-install) · [Quick Start](#quick-start) · [Brief & Hooks](#session-start-resume-brief-and-hooks) · [Commands](#commands) · [Core Workflows](#core-workflows) · [Todo Planning](#planning-with-todo) · [Backups & Doctor](#backups-recovery-and-health-checks) · [Dashboard](#read-only-html-dashboard)
+
+</div>
 
 Work Tracker is a small, agent-friendly status ledger for parallel and long-running work. A Rust CLI and read-only HTML dashboard share one SQLite database, so a human or agent can recover the current state and the context that led there.
 
-## What it provides
+---
+
+## Why this exists: `pwd`-scoped session memory
+
+Agent conversations are ephemeral: opening a new shell, switching Git worktrees, running `/clear`, or compressing history with `/compact` wipes or blurs working memory. `work-tracker` acts like deterministic session memory (similar in spirit to `claude-mem`, but backed by explicit transactional task state rather than probabilistic recall): every Work Item is anchored to its physical `Work Directory` (`pwd`) inside a single SQLite WAL ledger.
+
+| Lifecycle event | What happens | Deterministic recovery |
+|---|---|---|
+| **Work in progress** | `add`, `status`, `note`, `update` record state + physical `workdir` | Each mutation appends an immutable `History Entry` in the same SQLite transaction |
+| **Fresh session, `/clear`, or `/compact`** | `SessionStart` hook triggers on `"startup\|clear\|compact"` | `work-tracker hook session-start` runs `brief` for the hook's `cwd` (`<= 9,000` chars) |
+| **Parallel agents & inspection** | Concurrent writers use SQLite WAL (5s busy timeout) | Agents query `--compact --json`; humans view the read-only HTML dashboard over SSH |
+
+### What it provides
 
 - Transaction-safe updates from concurrent agents using SQLite WAL mode.
 - Stable human-readable commands and machine-readable `--json` output.
 - Immutable creation, note, update, status-transition, and deletion history.
 - A default `list` that shows only actionable work, with `--all` for the full ledger.
-- Automatic Work Directory capture, explicit overrides, and exact directory filters.
-- A Daily View containing everything updated today and every actionable item.
-- A Todo View for date-based commitments, with carryover, deadlines, and explicit priorities.
-- Soft deletion with a 60-day readable retention window and automatic purge.
+- Automatic `Work Directory` capture, explicit overrides, and exact directory filters.
+- A `Daily View` containing everything updated today and every actionable item.
+- A `Todo View` for date-based commitments, with carryover, deadlines, and explicit priorities.
+- Soft deletion with a 60-day readable `Retention Window` and automatic purge.
 - A localhost-only, read-only dashboard suitable for SSH tunneling.
 - Verified manual SQLite snapshots, optional daily backups, and recovery to a saved snapshot.
+
+---
 
 ## Build and install
 
@@ -33,6 +63,8 @@ just check           # format check, Clippy, and tests
 just release         # optimized binary in target/release/
 just uninstall
 ```
+
+---
 
 ## Quick start
 
@@ -63,6 +95,39 @@ work-tracker status 1 waiting --note "queued behind 12 builds"
 
 If neither is set, the CLI uses the current `USER`, then `unknown` as a last resort.
 
+---
+
+## Session-start resume brief and hooks
+
+`brief` prints the Actionable Work Items of one exact `Work Directory` (the current directory by default) with each item's latest note, within a character budget:
+
+```bash
+work-tracker brief                       # current directory, 9000 characters
+work-tracker brief --workdir PATH --max-chars 4000
+work-tracker brief --json                # {"context": "...", "shown": N, "omitted": N}
+```
+
+Items keep the attention order of `list`. An item that does not fit with its note is shown without it; when items stop fitting, a final line counts the rest. Descriptions are never included.
+
+`hook session-start` runs `brief` for a Claude Code `SessionStart` hook. It reads the hook's JSON from standard input, briefs the hook's `cwd`, and prints `hookSpecificOutput.additionalContext`. It returns an empty context for resumed sessions, for a missing database, and on any error, and it always exits `0`, so a tracker problem never blocks the agent. Errors go to standard error as one line. Register it in `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|clear|compact",
+        "hooks": [{ "type": "command", "command": "work-tracker hook session-start", "timeout": 10 }]
+      }
+    ]
+  }
+}
+```
+
+The default budget stays below the 10,000 characters at which Claude Code replaces hook output with a file reference.
+
+---
+
 ## Commands
 
 | Command | Purpose |
@@ -87,11 +152,15 @@ If neither is set, the CLI uses the current `USER`, then `unknown` as a last res
 | `serve` | Host the read-only dashboard |
 | `doctor` | Check the database, schema, integrity, backups, and actor without writing |
 
-The statuses are `pending`, `active`, `waiting`, `blocked`, `done`, `cancelled`, and `deleted`. The first four are actionable: they are what `list` shows by default, and they remain in the Daily View even when they were not updated today.
+The statuses are `pending`, `active`, `waiting`, `blocked`, `done`, `cancelled`, and `deleted`. The first four are actionable: they are what `list` shows by default, and they remain in the `Daily View` even when they were not updated today.
 
 Run `work-tracker COMMAND --help` for all options.
 
-## Listing work
+---
+
+## Core workflows
+
+### Listing work and schema verification
 
 `list` answers "what is still open" and `today` answers "what happened today":
 
@@ -103,29 +172,17 @@ work-tracker list --details       # show-style details for each selected item
 work-tracker today                # actionable items plus anything updated today
 ```
 
-Both views order work by attention first: blocked, active, waiting, pending, then finished work, most recently updated first within each group. `--all` and `--status` cannot be combined. The human-readable `list` output ends with a footer that names `--all` whenever finished items are hidden; `--json` output is always a plain array. Deleted items stay hidden from every list unless you pass `--include-deleted` or `--status deleted`.
+Both views order work by attention first: `blocked`, `active`, `waiting`, `pending`, then finished work, most recently updated first within each group. `--all` and `--status` cannot be combined. The human-readable `list` output ends with a footer that names `--all` whenever finished items are hidden; `--json` output is always a plain array. Deleted items stay hidden from every list unless you pass `--include-deleted` or `--status deleted`.
 
-`list --details` prints each selected Work Item using the same formatter as
-`show ID`, with a blank line between items. Existing filters, ordering, limits,
-and the actionable footer still apply. `--details --json` produces the same JSON
-as `--json` alone; plain `list` keeps its compact table.
+`list --details` prints each selected Work Item using the same formatter as `show ID`, with a blank line between items. Existing filters, ordering, limits, and the actionable footer still apply. `--details --json` produces the same JSON as `--json` alone; plain `list` keeps its compact table.
 
-`show` and `list --details` display every column in SQLite's `work_items` table,
-including `deleted_at` and unset fields (`-`; an unset Work Directory is
-`unknown`). Detailed timestamps preserve fractional seconds and show the local
-UTC offset. History Entries remain available through `history ID`.
+`show` and `list --details` display every column in SQLite's `work_items` table, including `deleted_at` and unset fields (`-`; an unset Work Directory is `unknown`). Detailed timestamps preserve fractional seconds and show the local UTC offset. History Entries remain available through `history ID`.
 
-Before `show`, `list --details`, or `list --json` prints anything, a runtime check
-compares the live SQLite columns with the detail fields. Each returned item's
-serialized fields must also match. Missing or unknown fields cause exit status
-1 with a diagnostic on standard error, rather than silently returning incomplete
-details. The schema check runs even when the list is empty. JSON field names,
-null values, and the list array shape are preserved.
+Before `show`, `list --details`, or `list --json` prints anything, a runtime check compares the live SQLite columns with the detail fields. Each returned item's serialized fields must also match. Missing or unknown fields cause exit status `1` with a diagnostic on standard error, rather than silently returning incomplete details. The schema check runs even when the list is empty. JSON field names, null values, and the list array shape are preserved.
 
-## Work Directory
+### Work Directory (`pwd` scoping)
 
-`add` automatically records the directory where the command runs. An agent
-running the command elsewhere can supply its project or worktree explicitly:
+`add` automatically records the directory where the command runs. An agent running the command elsewhere can supply its project or worktree explicitly:
 
 ```bash
 work-tracker add "Investigate failure"
@@ -137,59 +194,72 @@ work-tracker list --without-workdir
 work-tracker update 1 --clear-workdir
 ```
 
-Assignments require an existing directory. Paths are stored as absolute physical
-paths: relative arguments resolve from the command's current directory and
-symlink aliases share an association. Significant spaces are preserved; paths
-must be valid UTF-8. The CLI records its actual working directory, including a
-subdirectory, without discovering a Git root.
+Assignments require an existing directory. Paths are stored as absolute physical paths: relative arguments resolve from the command's current directory and symlink aliases share an association. Significant spaces are preserved; paths must be valid UTF-8. The CLI records its actual working directory, including a subdirectory, without discovering a Git root.
 
-Plain `list` stays global. `--here`, `--workdir PATH`, and `--without-workdir` are
-mutually exclusive directory selectors; combine any one with existing status,
-deletion, and limit options. Matching is exact, so a parent directory does not
-include its descendants. Directory selection happens before the limit. Daily
-and Todo Views retain their global selection rules.
+Plain `list` stays global. `--here`, `--workdir PATH`, and `--without-workdir` are mutually exclusive directory selectors; combine any one with existing status, deletion, and limit options. Matching is exact, so a parent directory does not include its descendants. Directory selection happens before the limit. Daily and Todo Views retain their global selection rules.
 
-Existing items start with an unknown directory and remain visible globally.
-Assign them with `update --workdir`, or clear an association with
-`--clear-workdir`. Effective changes record the old and new value in history;
-repeating the same assignment or clear adds no history. Creation records its
-directory in the creation entry. Deleted items remain immutable.
+Existing items start with an unknown directory and remain visible globally. Assign them with `update --workdir`, or clear an association with `--clear-workdir`. Effective changes record the old and new value in history; repeating the same assignment or clear adds no history. Creation records its directory in the creation entry. Deleted items remain immutable.
 
-Removing a worktree preserves its saved association. `list --workdir` accepts
-the saved absolute path even after removal; for missing paths, it resolves an
-existing ancestor and normalizes the remaining components. Use the saved
-physical path when a symlink alias has also been removed. Directory reads never
-move or rewrite an association.
+Removing a worktree preserves its saved association. `list --workdir` accepts the saved absolute path even after removal; for missing paths, it resolves an existing ancestor and normalizes the remaining components. Use the saved physical path when a symlink alias has also been removed. Directory reads never move or rewrite an association.
 
-`show` and the dashboard display Work Directory. Work Item JSON adds the stable
-`workdir` field, a string or `null`, across commands and views; compact human
-list/Today/Todo columns retain their existing layout.
+`show` and the dashboard display Work Directory. Work Item JSON adds the stable `workdir` field, a string or `null`, across commands and views; compact human `list`/Today/Todo columns retain their existing layout.
 
-The directory migration upgrades SQLite's schema version to 3 while preserving
-existing fields and history. Version-2 binaries reject an upgraded ledger;
-all clients of that ledger need the new binary. Older field-specific writes
-that permit access preserve the additional column.
+<details>
+<summary>Schema v3 upgrade notes for Work Directory</summary>
 
-## Terminal colors
+The directory migration upgrades SQLite's schema version to 3 while preserving existing fields and history. Version-2 binaries reject an upgraded ledger; all clients of that ledger need the new binary. Older field-specific writes that permit access preserve the additional column.
 
-Human-readable Todo, list, today, and item output uses color automatically when
-stdout is a terminal. Headers are bold; active/done statuses are green, waiting
-is yellow, blocked and overdue dates/labels are red, high Priority is bold
-magenta, and carryover labels are yellow. Timestamps and secondary text are dim.
-Labels remain readable without color.
+</details>
 
-Pipes and redirected output stay plain. A nonempty `NO_COLOR` or `TERM=dumb`
-disables automatic color. Use the global `--color auto|always|never` option to
-override detection; an explicit `always` overrides those environment settings.
-JSON output is always uncolored, including when `--color always` is given.
+### Agent and script usage
+
+Every command accepts global options before or after the subcommand:
+
+```bash
+work-tracker --json today
+work-tracker show 1 --json
+work-tracker --database /srv/work-tracker/team.db list --json
+```
+
+`WORK_TRACKER_DB` selects the shared database without repeating `--database`. Successful commands exit with status `0`. Command validation uses exit status `2`; runtime and lookup errors use exit status `1` and emit `{"error":"..."}` to standard error when `--json` is enabled.
+
+To keep agent context small, read an index first and fetch details only for the items you need:
+
+```bash
+work-tracker today --compact --json     # index: no descriptions
+work-tracker list --here --compact --json
+work-tracker show 42 --json             # full item
+work-tracker history 42 --limit 10      # newest 10 entries, oldest first
+```
+
+`--compact` keeps `id`, `status`, `title`, `workdir`, `priority`, `planned_date`, `due_date`, and `updated_at`, and is still a plain array. It affects JSON only and cannot be combined with `list --details`. `history --limit N` keeps the newest `N` entries in chronological order; the human-readable form starts with a line counting the omitted entries.
+
+For multiple agents, point every process at the same database file on the same Linux host. SQLite serializes writes, waits up to five seconds for a busy writer, and keeps reads responsive through WAL mode. Do not put the database on a filesystem that does not support SQLite locking semantics.
+
+#### Searching past work
+
+```bash
+work-tracker search timeout medium       # every term must match
+work-tracker search 트래커 --json
+work-tracker search CBRD-27781 --include-deleted --limit 50
+```
+
+Each term must appear, case-insensitively, in the item's title, description, or any note. Matching is by substring, so Korean words match with attached particles. Done and cancelled items are included; deleted items need `--include-deleted`. Results use the attention order of `list` and default to 20. `--json` returns the `--compact` fields plus `matched_in` (`title`, `description`, or `note`) and a one-line `snippet` around the first term.
+
+### Terminal colors
+
+Human-readable Todo, list, today, and item output uses color automatically when stdout is a terminal. Headers are bold; active/done statuses are green, waiting is yellow, blocked and overdue dates/labels are red, high Priority is bold magenta, and carryover labels are yellow. Timestamps and secondary text are dim. Labels remain readable without color.
+
+Pipes and redirected output stay plain. A nonempty `NO_COLOR` or `TERM=dumb` disables automatic color. Use the global `--color auto|always|never` option to override detection; an explicit `always` overrides those environment settings. JSON output is always uncolored, including when `--color always` is given.
 
 ```bash
 work-tracker todo --color never
 work-tracker list --color always | less -R
 ```
 
-The companion Todo shortcuts also accept `--color` once their separately
-managed wrapper is updated.
+The companion Todo shortcuts also accept `--color` once their separately managed wrapper is updated.
+
+---
 
 ## Planning with Todo
 
@@ -204,23 +274,30 @@ work-tracker update 1 --planned 2026-10-08 --note "Work rescheduled; deadline un
 work-tracker update 1 --clear-planned --clear-due --priority normal
 ```
 
-`todo` alone means today. An N-day horizon includes today and the following N−1 **calendar days**, including weekends and holidays, using Asia/Seoul (KST, UTC+09:00), independent of the server timezone. Dates use `YYYY-MM-DD` with years 0001–9999. Days must be positive and the end date representable. `today` and `--days` cannot be combined.
+`todo` alone means today. An N-day `Planning Horizon` includes today and the following `N−1` **calendar days**, including weekends and holidays, using `Asia/Seoul` (KST, UTC+09:00), independent of the server timezone. Dates use `YYYY-MM-DD` with years 0001–9999. Days must be positive and the end date representable. `today` and `--days` cannot be combined.
 
-A pending, active, waiting, or blocked item appears when **either** its Planned Date or Due Date is on or before the window's end. Unfinished past plans carry forward; missed deadlines remain overdue. Each item appears once. Items without either date stay in the ordinary backlog even when high priority. `--all` also includes done and cancelled items when either date falls within the window, in a separate Done / cancelled section. Finished items do not carry forward or receive overdue markers. Deleted items remain excluded.
+A `pending`, `active`, `waiting`, or `blocked` item appears when **either** its `Planned Date` or `Due Date` is on or before the window's end. Unfinished past plans carry forward (`Carried-over Work`); missed deadlines remain overdue (`Overdue Work`). Each item appears once. Items without either date stay in the ordinary backlog even when high `Priority`. `--all` also includes `done` and `cancelled` items when either date falls within the window, in a separate `Done / cancelled` section. Finished items do not carry forward or receive overdue markers. Deleted items remain excluded.
 
-Actions (pending/active) and Blocked / waiting are separate sections. Within each section, sort by high/normal/low Priority, earliest Due Date, earliest Planned Date, then ID; missing dates sort last. Due today is not overdue. A Planned Date after a Due Date is allowed and does not hide the missed deadline. Reading never reschedules work.
+`Actions` (`pending`/`active`) and `Blocked / waiting` are separate sections. Within each section, sort by `high`/`normal`/`low` Priority, earliest Due Date, earliest Planned Date, then ID; missing dates sort last. Due today is not overdue. A Planned Date after a Due Date is allowed and does not hide the missed deadline. Reading never reschedules work.
 
-Dates are optional and independent; normal is the default Priority. Omitted update flags preserve existing values; `--clear-planned` and `--clear-due` remove dates explicitly. Effective changes include field-level history atomically, and repeated identical updates do not add history. `show` prints scheduling fields. Existing `list` and `today` semantics stay unchanged.
+Dates are optional and independent; `normal` is the default Priority. Omitted update flags preserve existing values; `--clear-planned` and `--clear-due` remove dates explicitly. Effective changes include field-level history atomically, and repeated identical updates do not add history. `show` prints scheduling fields. Existing `list` and `today` semantics stay unchanged.
 
-Todo reads the local ledger without contacting GitHub or another service. UPDATED means ledger activity, not a live external check. Empty views succeed with an explanatory message. `--json` returns an object with `window` (`start`, `end`, `days`, `timezone`), `actions`, `blocked_waiting`, and `finished` (empty without `--all`). Each row contains the Work Item fields plus `overdue` and `carried_over`; scheduling fields are `planned_date`, `due_date`, and `priority`. Existing Work Item JSON fields and list/today array shapes are preserved with additive scheduling fields.
+Todo reads the local ledger without contacting GitHub or another service. `UPDATED` means ledger activity, not a live external check. Empty views succeed with an explanatory message. `--json` returns an object with `window` (`start`, `end`, `days`, `timezone`), `actions`, `blocked_waiting`, and `finished` (empty without `--all`). Each row contains the Work Item fields plus `overdue` and `carried_over`; scheduling fields are `planned_date`, `due_date`, and `priority`. Existing Work Item JSON fields and list/today array shapes are preserved with additive scheduling fields.
 
 The companion chezmoi shortcuts `todo-today`, `todo-3days`, and `todo-5days` are symlinks to a `work-todo` wrapper, dispatching by invocation name. The wrapper includes `--all` by default, including for direct `work-todo` invocation. Shortcuts forward `--json`, `--database`, and `--color`, preserve command exit status, and reject horizon overrides. They are installed separately from this Rust binary; the updated wrapper requires a binary supporting `todo --all`.
 
-### Database upgrade
+<details>
+<summary>Database upgrade notes (scheduling columns migration)</summary>
 
 Opening an existing ledger adds nullable dates and normal Priority without changing its items, statuses, or history. Migration checks actual columns under a transaction because legacy binaries reset SQLite's version marker. Old field-specific writes preserve the additional columns. Newer unknown schema versions are rejected. Keep a SQLite-consistent backup before upgrading a shared live ledger; ordinary retention housekeeping still applies on open.
 
-## Back up and recover your archive
+</details>
+
+---
+
+## Backups, recovery, and health checks
+
+### Manual SQLite snapshots
 
 Save a snapshot manually and list the available recovery points:
 
@@ -230,36 +307,16 @@ work-tracker backups
 work-tracker backups --json
 ```
 
-By default, snapshots go in `backups/` beside the selected database. For the
-default ledger, this is `~/.local/share/work-tracker/backups/`. Each file has a
-UTC timestamp and a unique suffix. Use `--directory PATH` or
-`WORK_TRACKER_BACKUP_DIR` to choose another directory for `backup` and `backups`.
-Use separate directories for separate ledgers.
+By default, snapshots go in `backups/` beside the selected database. For the default ledger, this is `~/.local/share/work-tracker/backups/`. Each file has a UTC timestamp and a unique suffix. Use `--directory PATH` or `WORK_TRACKER_BACKUP_DIR` to choose another directory for `backup` and `backups`. Use separate directories for separate ledgers.
 
-Each snapshot contains every Work Item, Status, field, and History Entry present
-at one consistent point during the backup. This includes done, cancelled, and
-deleted work still stored in SQLite. Backup captures committed WAL data while
-other agents continue working. It does not migrate the source database, purge
-expired deletions, or add History Entries. Missing source databases fail instead
-of creating an empty ledger.
+Each snapshot contains every Work Item, Status, field, and History Entry present at one consistent point during the backup. This includes `done`, `cancelled`, and `deleted` work still stored in SQLite. Backup captures committed WAL data while other agents continue working. It does not migrate the source database, purge expired deletions, or add History Entries. Missing source databases fail instead of creating an empty ledger.
 
-The command verifies SQLite integrity, foreign keys, and the Work Tracker schema
-before publishing a completed snapshot. Incomplete files use `.partial` and are
-excluded from `backups`. Concurrent backups produce separate files. On Unix,
-new backup directories have mode `0700`, and snapshots have mode `0600`.
-Existing directories keep their permissions. Snapshots are never automatically
-deleted, so monitor free disk space. If a backup fails, earlier snapshots remain
-available. `backups` reports a corrupt recognized snapshot as an error with its
-path rather than silently listing it as usable.
+The command verifies SQLite integrity, foreign keys, and the Work Tracker schema before publishing a completed snapshot. Incomplete files use `.partial` and are excluded from `backups`. Concurrent backups produce separate files. On Unix, new backup directories have mode `0700`, and snapshots have mode `0600`. Existing directories keep their permissions. Snapshots are never automatically deleted, so monitor free disk space. If a backup fails, earlier snapshots remain available. `backups` reports a corrupt recognized snapshot as an error with its path rather than silently listing it as usable.
 
-### Enable daily backups on Linux
+<details>
+<summary>Enable daily backups on Linux (systemd user units)</summary>
 
-Install the new binary with `just install`. The supplied systemd user units use
-`~/.cargo/bin/work-tracker`, the default database, and the default backup directory.
-If you use `WORK_TRACKER_DB`, `XDG_DATA_HOME`, a custom Cargo installation, or a
-different backup directory, edit `ExecStart` in the copied services before starting
-them. The services do not inherit your shell environment. Quote paths containing
-spaces using systemd unit syntax.
+Install the new binary with `just install`. The supplied [systemd units](systemd/) use `~/.cargo/bin/work-tracker`, the default database, and the default backup directory. If you use `WORK_TRACKER_DB`, `XDG_DATA_HOME`, a custom Cargo installation, or a different backup directory, edit `ExecStart` in the copied services before starting them. The services do not inherit your shell environment. Quote paths containing spaces using systemd unit syntax.
 
 From the repository directory:
 
@@ -274,14 +331,7 @@ systemctl --user enable --now work-tracker-backup.timer
 systemctl --user list-timers work-tracker-backup.timer
 ```
 
-The timer saves one snapshot at 03:00 in the server's local timezone each day.
-`Persistent=true` triggers a missed run when the user manager starts again.
-If the backup service fails, `OnFailure=` starts
-`work-tracker-backup-failure.service`, which adds a blocked, high-priority Work
-Item titled "Work Tracker backup failed". It appears in `today`, `list`, `todo`,
-and the dashboard. Each failed run adds its own Work Item.
-For backups while logged out, enable lingering for your user if the server's
-policy permits it:
+The timer saves one snapshot at `03:00` in the server's local timezone each day. `Persistent=true` triggers a missed run when the user manager starts again. If the backup service fails, `OnFailure=` starts `work-tracker-backup-failure.service`, which adds a blocked, high-priority Work Item titled `"Work Tracker backup failed"`. It appears in `today`, `list`, `todo`, and the dashboard. Each failed run adds its own Work Item. For backups while logged out, enable lingering for your user if the server's policy permits it:
 
 ```bash
 loginctl enable-linger "$USER"
@@ -301,7 +351,12 @@ To stop future daily backups while keeping snapshots:
 systemctl --user disable --now work-tracker-backup.timer
 ```
 
-### Resume from a snapshot
+</details>
+
+<details>
+<summary>Resume from a snapshot and protect against server loss</summary>
+
+#### Resume from a snapshot
 
 Choose a file from `work-tracker backups`. Recover it into a new path:
 
@@ -311,15 +366,9 @@ work-tracker --database ~/.local/share/work-tracker/recovered.db list --all --in
 work-tracker --database ~/.local/share/work-tracker/recovered.db history 1
 ```
 
-`restore` checks the snapshot and refuses an existing destination, even with
-`--database` set. It also refuses SQLite sidecars at the destination. The recovered
-database initially matches the snapshot, including IDs and timestamps. Ordinary
-commands apply current migrations and the usual 60-day deletion retention, so
-expired Deleted Work Items can disappear on the first normal open. Done and
-cancelled Work Items have no expiry.
+`restore` checks the snapshot and refuses an existing destination, even with `--database` set. It also refuses SQLite sidecars at the destination. The recovered database initially matches the snapshot, including IDs and timestamps. Ordinary commands apply current migrations and the usual 60-day deletion retention, so expired Deleted Work Items can disappear on the first normal open. Done and cancelled Work Items have no expiry.
 
-To resume work, stop the dashboard and pause agents that use the old ledger.
-Set the recovered path for every client, then restart them:
+To resume work, stop the dashboard and pause agents that use the old ledger. Set the recovered path for every client, then restart them:
 
 ```bash
 export WORK_TRACKER_DB="$HOME/.local/share/work-tracker/recovered.db"
@@ -327,147 +376,44 @@ work-tracker path
 work-tracker today
 ```
 
-Persist that setting in your shell or service configuration. Update the explicit
-`--database` path in the daily backup service and its failure service, and reload
-systemd as well. Changing one shell does not redirect existing agents or a running
-dashboard. Keep the previous live database until you have checked the recovered
-ledger.
+Persist that setting in your shell or service configuration. Update the explicit `--database` path in the daily backup service and its failure service, and reload systemd as well. Changing one shell does not redirect existing agents or a running dashboard. Keep the previous live database until you have checked the recovered ledger.
 
-Recovery returns the whole ledger to the selected snapshot's statuses and notes.
-Later changes stay in the previous database and are absent from the recovered
-copy. This does not rewind Git repositories, GitHub, CI, or files mentioned by a
-Work Item. Daily backups give roughly daily recovery points while successful
-backups run each day. Take a manual snapshot before an important change for a
-closer recovery point.
+Recovery returns the whole ledger to the selected snapshot's statuses and notes. Later changes stay in the previous database and are absent from the recovered copy. This does not rewind Git repositories, GitHub, CI, or files mentioned by a Work Item. Daily backups give roughly daily recovery points while successful backups run each day. Take a manual snapshot before an important change for a closer recovery point.
 
-### Protect against losing the server
+#### Protect against losing the server
 
-Local snapshots protect against accidental ledger changes or loss of the live
-database. Copy completed `.db` snapshots to a separate machine or disk to
-protect against losing this server. Preserve older copies there as well. For
-example, from another machine:
+Local snapshots protect against accidental ledger changes or loss of the live database. Copy completed `.db` snapshots to a separate machine or disk to protect against losing this server. Preserve older copies there as well. For example, from another machine:
 
 ```bash
 rsync -av your-linux-server:.local/share/work-tracker/backups/ ./work-tracker-backups/ --include='*.db' --exclude='*'
 ```
 
-Only copy completed snapshots. A raw copy of the live database can miss
-committed changes in its WAL. Test recovery from an external copy with `restore`
-and `show` before relying on that destination.
+Only copy completed snapshots. A raw copy of the live database can miss committed changes in its WAL. Test recovery from an external copy with `restore` and `show` before relying on that destination.
 
-To also save each daily snapshot on a physically separate disk, add a second
-`ExecStart=` line after the first in `work-tracker-backup.service`. systemd runs
-the lines in order and fails the service if either fails:
+To also save each daily snapshot on a physically separate disk, add a second `ExecStart=` line after the first in `work-tracker-backup.service`. systemd runs the lines in order and fails the service if either fails:
 
 ```ini
 ExecStart=%h/.cargo/bin/work-tracker --database %h/.local/share/work-tracker/work-tracker.db backup --directory /mnt/other-disk/work-tracker-backups
 ```
 
-## Agent and script usage
+</details>
 
-Every command accepts global options before or after the subcommand:
-
-```bash
-work-tracker --json today
-work-tracker show 1 --json
-work-tracker --database /srv/work-tracker/team.db list --json
-```
-
-`WORK_TRACKER_DB` selects the shared database without repeating `--database`. Successful commands exit with status 0. Command validation uses exit status 2; runtime and lookup errors use exit status 1 and emit `{"error":"..."}` to standard error when `--json` is enabled.
-
-To keep agent context small, read an index first and fetch details only for
-the items you need:
-
-```bash
-work-tracker today --compact --json     # index: no descriptions
-work-tracker list --here --compact --json
-work-tracker show 42 --json             # full item
-work-tracker history 42 --limit 10      # newest 10 entries, oldest first
-```
-
-`--compact` keeps `id`, `status`, `title`, `workdir`, `priority`,
-`planned_date`, `due_date`, and `updated_at`, and is still a plain array. It
-affects JSON only and cannot be combined with `list --details`. `history
---limit N` keeps the newest N entries in chronological order; the
-human-readable form starts with a line counting the omitted entries.
-
-### Searching past work
-
-```bash
-work-tracker search timeout medium       # every term must match
-work-tracker search 트래커 --json
-work-tracker search CBRD-27781 --include-deleted --limit 50
-```
-
-Each term must appear, case-insensitively, in the item's title, description,
-or any note. Matching is by substring, so Korean words match with attached
-particles. Done and cancelled items are included; deleted items need
-`--include-deleted`. Results use the attention order of `list` and default to
-20. `--json` returns the `--compact` fields plus `matched_in` (`title`,
-`description`, or `note`) and a one-line `snippet` around the first term.
-
-### Resume brief at session start
-
-`brief` prints the Actionable Work Items of one exact Work Directory (the
-current directory by default) with each item's latest note, within a
-character budget:
-
-```bash
-work-tracker brief                       # current directory, 9000 characters
-work-tracker brief --workdir PATH --max-chars 4000
-work-tracker brief --json                # {"context": "...", "shown": N, "omitted": N}
-```
-
-Items keep the attention order of `list`. An item that does not fit with its
-note is shown without it; when items stop fitting, a final line counts the
-rest. Descriptions are never included.
-
-`hook session-start` runs `brief` for a Claude Code SessionStart hook. It
-reads the hook's JSON from standard input, briefs the hook's `cwd`, and prints
-`hookSpecificOutput.additionalContext`. It returns an empty context for
-resumed sessions, for a missing database, and on any error, and it always
-exits 0, so a tracker problem never blocks the agent. Errors go to standard
-error as one line. Register it in `~/.claude/settings.json`:
-
-```json
-{
-  "hooks": {
-    "SessionStart": [
-      {
-        "matcher": "startup|clear|compact",
-        "hooks": [{ "type": "command", "command": "work-tracker hook session-start", "timeout": 10 }]
-      }
-    ]
-  }
-}
-```
-
-The default budget stays below the 10,000 characters at which Claude Code
-replaces hook output with a file reference.
-
-For multiple agents, point every process at the same database file on the same Linux host. SQLite serializes writes, waits up to five seconds for a busy writer, and keeps reads responsive through WAL mode. Do not put the database on a filesystem that does not support SQLite locking semantics.
-
-## Health check
+### Health check (`doctor`)
 
 ```bash
 work-tracker doctor
 work-tracker doctor --json      # {"ok": bool, "checks": [{name, status, detail, required}]}
 ```
 
-`doctor` opens the database read-only, so it never migrates or creates it.
-Required checks are `database` (exists and opens), `schema` (not newer than
-this binary), and `integrity` (`PRAGMA quick_check`); any failure exits with
-status 1. `journal` (WAL mode), `backup`, and `actor` only warn. The backup
-check warns when there is no snapshot or the newest is older than 48 hours,
-twice the daily timer interval, which catches a timer that never runs.
-`--directory` or `WORK_TRACKER_BACKUP_DIR` selects the snapshot directory as
-for `backups`.
+`doctor` opens the database read-only, so it never migrates or creates it. Required checks are `database` (exists and opens), `schema` (not newer than this binary), and `integrity` (`PRAGMA quick_check`); any failure exits with status `1`. `journal` (WAL mode), `backup`, and `actor` only warn. The backup check warns when there is no snapshot or the newest is older than 48 hours, twice the daily timer interval, which catches a timer that never runs. `--directory` or `WORK_TRACKER_BACKUP_DIR` selects the snapshot directory as for `backups`.
 
-## Deletion and retention
+### Deletion and retention
 
 `delete` changes the status to `deleted`, records the actor and reason, and sets `purge_after` to exactly 60 days after deletion. Deleted items remain available through `show`, `history`, `list --include-deleted`, or `list --status deleted`. They cannot be changed. Opening the tracker lazily purges items whose retention window has expired, including their history.
 
-## HTML dashboard
+---
+
+## Read-only HTML dashboard
 
 Start the read-only server on the Linux host:
 
@@ -484,15 +430,11 @@ ssh -L 8787:127.0.0.1:8787 your-linux-server
 
 A different socket can be selected explicitly with `work-tracker serve --bind 127.0.0.1:9000`. Binding to a non-loopback address exposes an unauthenticated dashboard and should only be done behind appropriate network controls.
 
-The dashboard answers only requests whose `Host` names `localhost` or a
-loopback IP, on any port, so a tunnel to another local port still works. Other
-hostnames get `403`. This blocks DNS rebinding, where a web page you visit
-re-points its own hostname at `127.0.0.1` and reads the dashboard through your
-tunnel. To open it under another name, pass `--allow-host NAME` (repeatable).
-Every response also forbids framing (`X-Frame-Options: DENY`,
-`frame-ancestors 'none'`).
+The dashboard answers only requests whose `Host` names `localhost` or a loopback IP, on any port, so a tunnel to another local port still works. Other hostnames get `403`. This blocks DNS rebinding, where a web page you visit re-points its own hostname at `127.0.0.1` and reads the dashboard through your tunnel. To open it under another name, pass `--allow-host NAME` (repeatable). Every response also forbids framing (`X-Frame-Options: DENY`, `frame-ancestors 'none'`).
 
-## Agent skill
+---
+
+## Agent skill and development
 
 The `track-work` skill is maintained in the [`my-skills`](https://github.com/vimkim/my-skills) collection (`skills/track-work/`). Install it for Claude Code and Codex with:
 
@@ -502,6 +444,4 @@ npx --yes skills@1.7.0 add vimkim/my-skills --global --skill track-work --agent 
 
 The skill teaches agents to check the tracker with `doctor`, search for and create a Work Item before long-running work, record meaningful notes and transitions, resume from `brief`, the compact Daily View, and `history --limit`, and preserve the final outcome.
 
-## Development
-
-See `AGENTS.md` for architecture and invariants, and `docs/adr/` for recorded decisions. `CLAUDE.md` is a symlink to the same guidance so both agent environments receive one canonical instruction file.
+See [AGENTS.md](AGENTS.md) for architecture and invariants, [CONTEXT.md](CONTEXT.md) for domain terminology, and [docs/adr/](docs/adr/) for recorded decisions. [CLAUDE.md](CLAUDE.md) is a symlink to the same guidance so both agent environments receive one canonical instruction file.

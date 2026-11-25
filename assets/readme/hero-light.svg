@@ -1,0 +1,180 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="520" viewBox="0 0 1200 520" role="img" aria-labelledby="title-light desc-light">
+  <title id="title-light">work-tracker architecture: pwd-scoped SQLite WAL session memory</title>
+  <desc id="desc-light">Diagram showing how startup, /clear, and /compact sessions write to and read from a single pwd-scoped SQLite WAL ledger via CLI commands, resume brief, SessionStart hook, and read-only HTML dashboard.</desc>
+  <defs>
+    <marker id="arrow-blue-light" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 1 1 L 9 5 L 1 9 z" fill="#0969da"/>
+    </marker>
+    <marker id="arrow-green-light" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 1 1 L 9 5 L 1 9 z" fill="#1a7f37"/>
+    </marker>
+    <marker id="arrow-muted-light" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 1 1 L 9 5 L 1 9 z" fill="#59636e"/>
+    </marker>
+  </defs>
+
+  <!-- Canvas -->
+  <rect x="1" y="1" width="1198" height="518" rx="14" fill="#ffffff" stroke="#d0d7de" stroke-width="1.5"/>
+
+  <!-- Top Header Band -->
+  <rect x="28" y="25" width="40" height="40" rx="10" fill="#f6f8fa" stroke="#0969da" stroke-width="1.5"/>
+  <rect x="37" y="36" width="14" height="3" rx="1.5" fill="#0969da"/>
+  <rect x="37" y="44" width="22" height="3" rx="1.5" fill="#59636e"/>
+  <rect x="37" y="52" width="18" height="3" rx="1.5" fill="#59636e"/>
+  <circle cx="57" cy="37.5" r="3" fill="#1a7f37"/>
+
+  <text x="80" y="44" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="22" font-weight="700" fill="#1f2328">work-tracker</text>
+  <text x="80" y="64" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" fill="#59636e">Deterministic pwd-scoped session memory for humans &amp; AI agents</text>
+
+  <!-- Header Badges -->
+  <rect x="768" y="30" width="146" height="28" rx="14" fill="#ddf4ff" stroke="#0969da" stroke-opacity="0.45" stroke-width="1"/>
+  <text x="841" y="48" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="11.5" font-weight="600" fill="#0969da">Rust · SQLite WAL</text>
+
+  <rect x="924" y="30" width="112" height="28" rx="14" fill="#dafbe1" stroke="#1a7f37" stroke-opacity="0.45" stroke-width="1"/>
+  <text x="980" y="48" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="11.5" font-weight="600" fill="#1a7f37">Zero Daemon</text>
+
+  <rect x="1046" y="30" width="130" height="28" rx="14" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+  <text x="1111" y="48" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="11.5" font-weight="600" fill="#1f2328">CLI · JSON · HTML</text>
+
+  <line x1="24" y1="88" x2="1176" y2="88" stroke="#d8dee4" stroke-width="1.5"/>
+
+  <!-- Left Column: Agent & CLI Sessions (x=24..304, w=280) -->
+  <rect x="24" y="106" width="280" height="338" rx="12" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1.2"/>
+  <text x="38" y="129" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="700" letter-spacing="0.6" fill="#59636e">AGENT &amp; CLI SESSIONS</text>
+  <text x="38" y="146" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#6e7781">Ephemeral context per working dir</text>
+
+  <!-- Card: startup -->
+  <rect x="36" y="162" width="256" height="60" rx="8" fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
+  <rect x="48" y="173" width="74" height="22" rx="6" fill="#dafbe1" stroke="#1a7f37" stroke-opacity="0.4" stroke-width="1"/>
+  <text x="85" y="188" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="700" fill="#1a7f37">startup</text>
+  <text x="132" y="188" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#1f2328">Fresh Session</text>
+  <text x="48" y="210" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#59636e">New shell, worktree, or agent start</text>
+
+  <!-- Card: /clear -->
+  <rect x="36" y="232" width="256" height="60" rx="8" fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
+  <rect x="48" y="243" width="74" height="22" rx="6" fill="#fbefff" stroke="#8250df" stroke-opacity="0.4" stroke-width="1"/>
+  <text x="85" y="258" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="700" fill="#8250df">/clear</text>
+  <text x="132" y="258" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#1f2328">Context Reset</text>
+  <text x="48" y="280" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#59636e">Wiped conversation window</text>
+
+  <!-- Card: /compact -->
+  <rect x="36" y="302" width="256" height="60" rx="8" fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
+  <rect x="48" y="313" width="74" height="22" rx="6" fill="#fff8c5" stroke="#9a6700" stroke-opacity="0.4" stroke-width="1"/>
+  <text x="85" y="328" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="700" fill="#9a6700">/compact</text>
+  <text x="132" y="328" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#1f2328">Compacted Session</text>
+  <text x="48" y="350" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#59636e">Compressed conversation history</text>
+
+  <!-- Hook Matcher Strip -->
+  <rect x="36" y="374" width="256" height="54" rx="8" fill="#ffffff" stroke="#0969da" stroke-opacity="0.45" stroke-width="1"/>
+  <text x="48" y="395" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" fill="#59636e">SessionStart hook matcher</text>
+  <text x="48" y="415" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="11.5" font-weight="700" fill="#0969da">"startup|clear|compact"</text>
+
+  <!-- Center Column: SQLite WAL Ledger (x=428..774, w=346) -->
+  <rect x="428" y="106" width="346" height="338" rx="12" fill="#f6f8fa" stroke="#0969da" stroke-width="1.6"/>
+  <text x="444" y="129" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="700" letter-spacing="0.6" fill="#0969da">SQLITE WAL LEDGER</text>
+  <rect x="610" y="114" width="150" height="22" rx="11" fill="#ddf4ff" stroke="#0969da" stroke-opacity="0.4" stroke-width="1"/>
+  <text x="685" y="129" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="600" fill="#0969da">Single Source of Truth</text>
+
+  <!-- Sub-panel A: work_items -->
+  <rect x="442" y="148" width="318" height="154" rx="8" fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
+  <text x="454" y="168" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="700" fill="#1f2328">work_items</text>
+  <text x="534" y="168" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="10.5" fill="#6e7781">workdir: /srv/work/repo-wt</text>
+  <line x1="442" y1="179" x2="760" y2="179" stroke="#d8dee4" stroke-width="1"/>
+
+  <!-- Row 1: blocked -->
+  <circle cx="458" cy="204" r="4" fill="#cf222e"/>
+  <rect x="470" y="194" width="64" height="20" rx="5" fill="#ffebe9" stroke="#cf222e" stroke-opacity="0.4" stroke-width="1"/>
+  <text x="502" y="208" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="10" font-weight="700" fill="#cf222e">blocked</text>
+  <text x="544" y="208" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#1f2328">#12 Fix WAL lock contention test</text>
+
+  <!-- Row 2: active -->
+  <circle cx="458" cy="238" r="4" fill="#1a7f37"/>
+  <rect x="470" y="228" width="64" height="20" rx="5" fill="#dafbe1" stroke="#1a7f37" stroke-opacity="0.4" stroke-width="1"/>
+  <text x="502" y="242" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="10" font-weight="700" fill="#1a7f37">active</text>
+  <text x="544" y="242" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#1f2328">#14 Profile index scan query</text>
+
+  <!-- Row 3: waiting -->
+  <circle cx="458" cy="272" r="4" fill="#9a6700"/>
+  <rect x="470" y="262" width="64" height="20" rx="5" fill="#fff8c5" stroke="#9a6700" stroke-opacity="0.4" stroke-width="1"/>
+  <text x="502" y="276" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="10" font-weight="700" fill="#9a6700">waiting</text>
+  <text x="544" y="276" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#1f2328">#15 Company CI regression run</text>
+
+  <!-- Sub-panel B: history_entries -->
+  <rect x="442" y="312" width="318" height="96" rx="8" fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
+  <text x="454" y="332" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="700" fill="#1f2328">history_entries</text>
+  <text x="566" y="332" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" fill="#59636e">append-only · same txn</text>
+
+  <!-- Timeline pills -->
+  <rect x="454" y="346" width="56" height="24" rx="6" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+  <text x="482" y="362" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="10.5" fill="#1f2328">create</text>
+  <line x1="512" y1="358" x2="524" y2="358" stroke="#59636e" stroke-width="1.4" marker-end="url(#arrow-muted-light)"/>
+
+  <rect x="528" y="346" width="48" height="24" rx="6" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+  <text x="552" y="362" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="10.5" fill="#1f2328">note</text>
+  <line x1="578" y1="358" x2="590" y2="358" stroke="#59636e" stroke-width="1.4" marker-end="url(#arrow-muted-light)"/>
+
+  <rect x="594" y="346" width="56" height="24" rx="6" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+  <text x="622" y="362" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="10.5" fill="#1f2328">status</text>
+  <line x1="652" y1="358" x2="664" y2="358" stroke="#59636e" stroke-width="1.4" marker-end="url(#arrow-muted-light)"/>
+
+  <rect x="668" y="346" width="80" height="24" rx="6" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+  <text x="708" y="362" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="10.5" fill="#59636e">delete 60d</text>
+
+  <text x="454" y="394" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" fill="#6e7781">Idempotent status repeats emit zero history noise</text>
+
+  <text x="601" y="429" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="10" fill="#59636e">5s busy timeout · quick_check · WAL snapshots</text>
+
+  <!-- Right Column: Read & Resume Surfaces (x=892..1176, w=284) -->
+  <rect x="892" y="106" width="284" height="338" rx="12" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1.2"/>
+  <text x="906" y="129" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="700" letter-spacing="0.6" fill="#59636e">READ &amp; RESUME SURFACES</text>
+
+  <!-- Surface Card 1 -->
+  <rect x="904" y="150" width="260" height="86" rx="8" fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
+  <text x="918" y="174" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#1f2328">Resume Brief &amp; Hook</text>
+  <text x="918" y="196" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="10.5" font-weight="600" fill="#1a7f37">brief · hook session-start</text>
+  <text x="918" y="218" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" fill="#59636e">Exact pwd · attention order · exits 0</text>
+
+  <!-- Surface Card 2 -->
+  <rect x="904" y="246" width="260" height="86" rx="8" fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
+  <text x="918" y="270" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#1f2328">Structured CLI &amp; Views</text>
+  <text x="918" y="292" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="10.5" font-weight="600" fill="#0969da">list --here --compact --json</text>
+  <text x="918" y="314" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" fill="#59636e">today · todo --days N · search</text>
+
+  <!-- Surface Card 3 -->
+  <rect x="904" y="342" width="260" height="86" rx="8" fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
+  <text x="918" y="366" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#1f2328">Read-Only HTML Dashboard</text>
+  <text x="918" y="388" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="10.5" font-weight="600" fill="#8250df">serve (127.0.0.1:8787)</text>
+  <text x="918" y="410" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" fill="#59636e">SSH tunnel · loopback Host guard</text>
+
+  <!-- Connector 1: Left <-> Center (x=304..428, center=366) -->
+  <text x="366" y="195" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="700" fill="#0969da">CLI writes</text>
+  <line x1="310" y1="210" x2="418" y2="210" stroke="#0969da" stroke-width="2" marker-end="url(#arrow-blue-light)"/>
+  <text x="366" y="228" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="9.5" fill="#59636e">add · status · note</text>
+
+  <text x="366" y="331" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="700" fill="#1a7f37">hook / brief</text>
+  <line x1="422" y1="346" x2="314" y2="346" stroke="#1a7f37" stroke-width="2" marker-end="url(#arrow-green-light)"/>
+  <text x="366" y="364" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="9.5" fill="#59636e">&lt;= 9,000 chars</text>
+
+  <!-- Connector 2: Center -> Right (x=774..892) -->
+  <text x="811" y="275" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="9.5" fill="#59636e">read-only</text>
+  <line x1="775" y1="289" x2="848" y2="289" stroke="#59636e" stroke-width="1.8"/>
+  <line x1="848" y1="193" x2="848" y2="385" stroke="#59636e" stroke-width="1.8"/>
+  <line x1="848" y1="193" x2="884" y2="193" stroke="#59636e" stroke-width="1.8" marker-end="url(#arrow-muted-light)"/>
+  <line x1="848" y1="289" x2="884" y2="289" stroke="#59636e" stroke-width="1.8" marker-end="url(#arrow-muted-light)"/>
+  <line x1="848" y1="385" x2="884" y2="385" stroke="#59636e" stroke-width="1.8" marker-end="url(#arrow-muted-light)"/>
+
+  <!-- Bottom Guarantee Footer -->
+  <rect x="24" y="460" width="1152" height="40" rx="10" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+
+  <circle cx="52" cy="480" r="4" fill="#0969da"/>
+  <text x="64" y="484" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328">pwd-scoped Work Directory</text>
+
+  <circle cx="336" cy="480" r="4" fill="#1a7f37"/>
+  <text x="348" y="484" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328">Atomic transactional history</text>
+
+  <circle cx="628" cy="480" r="4" fill="#9a6700"/>
+  <text x="640" y="484" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328">60-day soft-delete retention</text>
+
+  <circle cx="916" cy="480" r="4" fill="#8250df"/>
+  <text x="928" y="484" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328">Verified SQLite WAL backups</text>
+</svg>
