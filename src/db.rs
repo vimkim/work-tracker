@@ -13,14 +13,15 @@ use rusqlite::{
 use serde_json::{Map, Value, json};
 
 use crate::domain::{
-    HistoryEntry, Priority, Schedule, ScheduleUpdate, Status, WorkItem, parse_date,
+    DependencyRef, HistoryEntry, Priority, Schedule, ScheduleUpdate, Status, WorkDependencies,
+    WorkItem, parse_date,
 };
 use crate::todo::{TodoView, TodoWindow};
 
 pub mod backup;
 
 const RETENTION_DAYS: i64 = 60;
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 const BUSY_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 
 /// SQL list of the statuses that make a Work Item actionable. Keep in sync with
@@ -44,10 +45,27 @@ const STATUS_PRIORITY_ORDER: &str = "CASE status
 pub enum ListFilter {
     /// Only Actionable Work Items: pending, active, waiting, or blocked.
     Actionable,
+    /// Only pending or active Work Items with zero unresolved blockers.
+    Ready,
     /// Every status, including done and cancelled.
     All,
     /// Exactly one status.
     Status(Status),
+}
+
+#[derive(Debug, Clone)]
+pub struct StatusTransition {
+    pub item: WorkItem,
+    pub unblocked: Vec<WorkItem>,
+    pub still_blocked: Vec<DependencyRef>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DependencyMutation {
+    pub item: WorkItem,
+    pub dependencies: WorkDependencies,
+    pub changed_blockers: Vec<i64>,
+    pub status_changed: Option<(Status, Status)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,12 +145,22 @@ impl Tracker {
                 changes_json  TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS work_dependencies (
+                blocked_id    INTEGER NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+                blocker_id    INTEGER NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+                created_at    TEXT NOT NULL,
+                PRIMARY KEY (blocked_id, blocker_id),
+                CHECK (blocked_id != blocker_id)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_work_items_status_updated
                 ON work_items(status, updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_work_items_purge_after
                 ON work_items(purge_after) WHERE status = 'deleted';
             CREATE INDEX IF NOT EXISTS idx_history_work_item
                 ON history_entries(work_item_id, id);
+            CREATE INDEX IF NOT EXISTS idx_work_dependencies_blocker
+                ON work_dependencies(blocker_id, blocked_id);
             ",
         )?;
 
@@ -211,6 +239,16 @@ impl Tracker {
         actor: &str,
         note: Option<&str>,
     ) -> Result<WorkItem> {
+        self.create_item_with_blockers(fields, &[], actor, note)
+    }
+
+    pub fn create_item_with_blockers(
+        &mut self,
+        fields: NewWorkItem<'_>,
+        blockers: &[i64],
+        actor: &str,
+        note: Option<&str>,
+    ) -> Result<WorkItem> {
         let NewWorkItem {
             title,
             description,
@@ -225,17 +263,37 @@ impl Tracker {
         if status == Status::Deleted {
             bail!("a work item cannot be created with deleted status");
         }
+        let blockers = normalize_blocker_ids(blockers);
+        if !blockers.is_empty() && matches!(status, Status::Done | Status::Cancelled) {
+            bail!("a {status} work item cannot be created with blockers");
+        }
         let description = normalized_optional(description);
         let now = Utc::now();
         let timestamp = timestamp(now);
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut has_unresolved = false;
+        for &blocker_id in &blockers {
+            let blocker = get_item_from_transaction(&transaction, blocker_id)?
+                .with_context(|| format!("work item {blocker_id} not found"))?;
+            if blocker.status == Status::Deleted {
+                bail!("work item {blocker_id} is deleted and cannot be used as a blocker");
+            }
+            if blocker.status != Status::Done {
+                has_unresolved = true;
+            }
+        }
+        let effective_status = if has_unresolved {
+            Status::Blocked
+        } else {
+            status
+        };
         transaction.execute(
             "INSERT INTO work_items
              (title, description, status, created_at, updated_at, deleted_at, purge_after, planned_date, due_date, priority, workdir)
              VALUES (?1, ?2, ?3, ?4, ?4, NULL, NULL, ?5, ?6, ?7, ?8)",
-            params![title, description, status.as_str(), timestamp,
+            params![title, description, effective_status.as_str(), timestamp,
                 schedule.planned_date.map(|d| d.to_string()), schedule.due_date.map(|d| d.to_string()), schedule.priority.as_str(), workdir],
         )?;
         let id = transaction.last_insert_rowid();
@@ -243,13 +301,31 @@ impl Tracker {
             &transaction,
             id,
             "created",
-            actor,
+            actor.clone(),
             normalized_optional(note),
             now,
-            &json!({"title": title, "description": description, "status": status,
+            &json!({"title": title, "description": description, "status": effective_status,
                 "planned_date": schedule.planned_date, "due_date": schedule.due_date, "priority": schedule.priority,
                 "workdir": workdir}),
         )?;
+        if !blockers.is_empty() {
+            for &blocker_id in &blockers {
+                transaction.execute(
+                    "INSERT INTO work_dependencies (blocked_id, blocker_id, created_at)
+                     VALUES (?1, ?2, ?3)",
+                    params![id, blocker_id, timestamp],
+                )?;
+            }
+            insert_history(
+                &transaction,
+                id,
+                "dependency_added",
+                actor,
+                None,
+                now,
+                &json!({"blocked_by_added": blockers}),
+            )?;
+        }
         transaction.commit()?;
         self.get(id)
     }
@@ -300,10 +376,11 @@ impl Tracker {
             WorkDirectoryFilter::Exact(path) => (Some(path), false),
             WorkDirectoryFilter::Unknown => (None, true),
         };
-        let (status, actionable_only) = match filter {
-            ListFilter::Actionable => (None, true),
-            ListFilter::All => (None, false),
-            ListFilter::Status(status) => (Some(status.as_str()), false),
+        let (status, actionable_only, ready_only) = match filter {
+            ListFilter::Actionable => (None, true, false),
+            ListFilter::Ready => (None, false, true),
+            ListFilter::All => (None, false, false),
+            ListFilter::Status(status) => (Some(status.as_str()), false, false),
         };
         let include_deleted = include_deleted || filter == ListFilter::Status(Status::Deleted);
         let mut statement = self.connection.prepare(&format!(
@@ -314,6 +391,16 @@ impl Tracker {
                AND (?3 OR status != 'deleted')
                AND (?5 IS NULL OR workdir = ?5)
                AND (NOT ?6 OR workdir IS NULL)
+               AND (NOT ?7 OR (
+                   status IN ('pending', 'active')
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM work_dependencies d
+                       JOIN work_items b ON b.id = d.blocker_id
+                       WHERE d.blocked_id = work_items.id
+                         AND b.status != 'done'
+                   )
+               ))
              ORDER BY {STATUS_PRIORITY_ORDER}
              LIMIT ?4"
         ))?;
@@ -324,7 +411,8 @@ impl Tracker {
                 include_deleted,
                 limit as i64,
                 workdir,
-                unknown_only
+                unknown_only,
+                ready_only
             ],
             row_to_item,
         )?;
@@ -517,6 +605,16 @@ impl Tracker {
         actor: &str,
         note: Option<&str>,
     ) -> Result<WorkItem> {
+        Ok(self.set_status_with_effects(id, status, actor, note)?.item)
+    }
+
+    pub fn set_status_with_effects(
+        &mut self,
+        id: i64,
+        status: Status,
+        actor: &str,
+        note: Option<&str>,
+    ) -> Result<StatusTransition> {
         let actor = normalized_required(actor, "actor")?;
         let transaction = self
             .connection
@@ -525,15 +623,20 @@ impl Tracker {
             .with_context(|| format!("work item {id} not found"))?;
         if current.status == status {
             transaction.commit()?;
-            return Ok(current);
+            return Ok(StatusTransition {
+                item: current,
+                unblocked: Vec::new(),
+                still_blocked: Vec::new(),
+            });
         }
         ensure_mutable(&current)?;
 
         let now = Utc::now();
+        let now_text = timestamp(now);
         let (deleted_at, purge_after, kind) = if status == Status::Deleted {
             let purge_after = now + Duration::days(RETENTION_DAYS);
             (
-                Some(timestamp(now)),
+                Some(now_text.clone()),
                 Some(timestamp(purge_after)),
                 "deleted",
             )
@@ -544,19 +647,293 @@ impl Tracker {
             "UPDATE work_items
              SET status = ?1, updated_at = ?2, deleted_at = ?3, purge_after = ?4
              WHERE id = ?5",
-            params![status.as_str(), timestamp(now), deleted_at, purge_after, id],
+            params![status.as_str(), now_text, deleted_at, purge_after, id],
         )?;
         insert_history(
             &transaction,
             id,
             kind,
-            actor,
+            actor.clone(),
             normalized_optional(note),
             now,
             &json!({"status": {"from": current.status, "to": status}}),
         )?;
+
+        let mut unblocked_ids = Vec::new();
+        let mut still_blocked = Vec::new();
+        if status == Status::Done {
+            let mut statement = transaction.prepare(
+                "SELECT w.id
+                 FROM work_dependencies d
+                 JOIN work_items w ON w.id = d.blocked_id
+                 WHERE d.blocker_id = ?1
+                   AND w.status = 'blocked'
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM work_dependencies d2
+                       JOIN work_items b ON b.id = d2.blocker_id
+                       WHERE d2.blocked_id = w.id
+                         AND b.status != 'done'
+                   )
+                 ORDER BY w.id ASC",
+            )?;
+            unblocked_ids = statement
+                .query_map(params![id], |row| row.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for &dependent_id in &unblocked_ids {
+                transaction.execute(
+                    "UPDATE work_items SET status = 'pending', updated_at = ?1 WHERE id = ?2",
+                    params![now_text, dependent_id],
+                )?;
+                insert_history(
+                    &transaction,
+                    dependent_id,
+                    "unblocked",
+                    actor.clone(),
+                    Some(format!("Unblocked: blocker #{id} done")),
+                    now,
+                    &json!({
+                        "status": {"from": Status::Blocked, "to": Status::Pending},
+                        "reason": "dependencies_resolved",
+                        "resolved_by": id,
+                    }),
+                )?;
+            }
+        } else if matches!(status, Status::Cancelled | Status::Deleted) {
+            still_blocked = load_actionable_dependents(&transaction, id)?;
+        }
+
+        let item = get_item_from_transaction(&transaction, id)?
+            .with_context(|| format!("work item {id} not found"))?;
+        let mut unblocked = Vec::with_capacity(unblocked_ids.len());
+        for dependent_id in unblocked_ids {
+            if let Some(dependent) = get_item_from_transaction(&transaction, dependent_id)? {
+                unblocked.push(dependent);
+            }
+        }
         transaction.commit()?;
-        self.get(id)
+        Ok(StatusTransition {
+            item,
+            unblocked,
+            still_blocked,
+        })
+    }
+
+    pub fn add_dependencies(
+        &mut self,
+        id: i64,
+        blockers: &[i64],
+        actor: &str,
+        note: Option<&str>,
+    ) -> Result<DependencyMutation> {
+        let blockers = normalize_blocker_ids(blockers);
+        if blockers.is_empty() {
+            bail!("at least one blocker ID is required");
+        }
+        let actor = normalized_required(actor, "actor")?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = get_item_from_transaction(&transaction, id)?
+            .with_context(|| format!("work item {id} not found"))?;
+        ensure_mutable(&current)?;
+        if matches!(current.status, Status::Done | Status::Cancelled) {
+            bail!(
+                "work item {id} is {} and cannot be blocked by dependencies",
+                current.status
+            );
+        }
+
+        let mut existing = existing_blocker_ids(&transaction, id)?;
+        let mut new_blockers = Vec::new();
+        let mut has_new_unresolved = false;
+        for &blocker_id in &blockers {
+            if blocker_id == id {
+                bail!("work item {id} cannot depend on itself");
+            }
+            let blocker = get_item_from_transaction(&transaction, blocker_id)?
+                .with_context(|| format!("work item {blocker_id} not found"))?;
+            if blocker.status == Status::Deleted {
+                bail!("work item {blocker_id} is deleted and cannot be used as a blocker");
+            }
+            if existing.insert(blocker_id) {
+                new_blockers.push(blocker_id);
+                if blocker.status != Status::Done {
+                    has_new_unresolved = true;
+                }
+            }
+        }
+
+        if new_blockers.is_empty() {
+            let dependencies = load_dependencies(&transaction, id, &current)?;
+            transaction.commit()?;
+            return Ok(DependencyMutation {
+                item: current,
+                dependencies,
+                changed_blockers: Vec::new(),
+                status_changed: None,
+            });
+        }
+
+        for &blocker_id in &new_blockers {
+            if has_dependency_path(&transaction, blocker_id, id)? {
+                bail!("dependency cycle: work item {id} already blocks {blocker_id}");
+            }
+        }
+
+        let now = Utc::now();
+        let now_text = timestamp(now);
+        for &blocker_id in &new_blockers {
+            transaction.execute(
+                "INSERT INTO work_dependencies (blocked_id, blocker_id, created_at)
+                 VALUES (?1, ?2, ?3)",
+                params![id, blocker_id, now_text],
+            )?;
+        }
+
+        let status_changed = if has_new_unresolved && current.status != Status::Blocked {
+            transaction.execute(
+                "UPDATE work_items SET status = 'blocked', updated_at = ?1 WHERE id = ?2",
+                params![now_text, id],
+            )?;
+            Some((current.status, Status::Blocked))
+        } else {
+            transaction.execute(
+                "UPDATE work_items SET updated_at = ?1 WHERE id = ?2",
+                params![now_text, id],
+            )?;
+            None
+        };
+
+        let mut changes = Map::new();
+        changes.insert("blocked_by_added".into(), json!(new_blockers));
+        if let Some((from, to)) = status_changed {
+            changes.insert("status".into(), json!({"from": from, "to": to}));
+        }
+        insert_history(
+            &transaction,
+            id,
+            "dependency_added",
+            actor,
+            normalized_optional(note),
+            now,
+            &Value::Object(changes),
+        )?;
+
+        let item = get_item_from_transaction(&transaction, id)?
+            .with_context(|| format!("work item {id} not found"))?;
+        let dependencies = load_dependencies(&transaction, id, &item)?;
+        transaction.commit()?;
+        Ok(DependencyMutation {
+            item,
+            dependencies,
+            changed_blockers: new_blockers,
+            status_changed,
+        })
+    }
+
+    pub fn remove_dependencies(
+        &mut self,
+        id: i64,
+        blockers: &[i64],
+        actor: &str,
+        note: Option<&str>,
+    ) -> Result<DependencyMutation> {
+        let blockers = normalize_blocker_ids(blockers);
+        if blockers.is_empty() {
+            bail!("at least one blocker ID is required");
+        }
+        let actor = normalized_required(actor, "actor")?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = get_item_from_transaction(&transaction, id)?
+            .with_context(|| format!("work item {id} not found"))?;
+        ensure_mutable(&current)?;
+
+        let existing = existing_blocker_ids(&transaction, id)?;
+        let removed_blockers: Vec<i64> = blockers
+            .into_iter()
+            .filter(|blocker_id| existing.contains(blocker_id))
+            .collect();
+        if removed_blockers.is_empty() {
+            let dependencies = load_dependencies(&transaction, id, &current)?;
+            transaction.commit()?;
+            return Ok(DependencyMutation {
+                item: current,
+                dependencies,
+                changed_blockers: Vec::new(),
+                status_changed: None,
+            });
+        }
+
+        let unresolved_before = count_unresolved_blockers(&transaction, id)?;
+        for &blocker_id in &removed_blockers {
+            transaction.execute(
+                "DELETE FROM work_dependencies WHERE blocked_id = ?1 AND blocker_id = ?2",
+                params![id, blocker_id],
+            )?;
+        }
+        let unresolved_after = count_unresolved_blockers(&transaction, id)?;
+
+        let now = Utc::now();
+        let now_text = timestamp(now);
+        insert_history(
+            &transaction,
+            id,
+            "dependency_removed",
+            actor.clone(),
+            normalized_optional(note),
+            now,
+            &json!({"blocked_by_removed": removed_blockers}),
+        )?;
+
+        let status_changed = if current.status == Status::Blocked
+            && unresolved_before > 0
+            && unresolved_after == 0
+        {
+            transaction.execute(
+                "UPDATE work_items SET status = 'pending', updated_at = ?1 WHERE id = ?2",
+                params![now_text, id],
+            )?;
+            let unblock_note = format_removed_unblock_note(&removed_blockers);
+            insert_history(
+                &transaction,
+                id,
+                "unblocked",
+                actor,
+                Some(unblock_note),
+                now,
+                &json!({
+                    "status": {"from": Status::Blocked, "to": Status::Pending},
+                    "reason": "dependencies_resolved",
+                    "removed_blockers": removed_blockers,
+                }),
+            )?;
+            Some((Status::Blocked, Status::Pending))
+        } else {
+            transaction.execute(
+                "UPDATE work_items SET updated_at = ?1 WHERE id = ?2",
+                params![now_text, id],
+            )?;
+            None
+        };
+
+        let item = get_item_from_transaction(&transaction, id)?
+            .with_context(|| format!("work item {id} not found"))?;
+        let dependencies = load_dependencies(&transaction, id, &item)?;
+        transaction.commit()?;
+        Ok(DependencyMutation {
+            item,
+            dependencies,
+            changed_blockers: removed_blockers,
+            status_changed,
+        })
+    }
+
+    pub fn dependencies(&self, id: i64) -> Result<WorkDependencies> {
+        let item = self.get(id)?;
+        load_dependencies(&self.connection, id, &item)
     }
 
     pub fn add_note(&mut self, id: i64, message: &str, actor: &str) -> Result<HistoryEntry> {
@@ -712,6 +1089,145 @@ impl Tracker {
                 params![timestamp(now)],
             )
             .map_err(Into::into)
+    }
+}
+
+fn normalize_blocker_ids(blockers: &[i64]) -> Vec<i64> {
+    blockers
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn existing_blocker_ids(transaction: &Transaction<'_>, id: i64) -> Result<BTreeSet<i64>> {
+    let mut statement =
+        transaction.prepare("SELECT blocker_id FROM work_dependencies WHERE blocked_id = ?1")?;
+    let rows = statement.query_map(params![id], |row| row.get::<_, i64>(0))?;
+    rows.collect::<rusqlite::Result<BTreeSet<_>>>()
+        .map_err(Into::into)
+}
+
+fn count_unresolved_blockers(transaction: &Transaction<'_>, id: i64) -> Result<usize> {
+    let count: i64 = transaction.query_row(
+        "SELECT count(*)
+         FROM work_dependencies d
+         JOIN work_items b ON b.id = d.blocker_id
+         WHERE d.blocked_id = ?1
+           AND b.status != 'done'",
+        params![id],
+        |row| row.get(0),
+    )?;
+    Ok(count as usize)
+}
+
+fn has_dependency_path(
+    transaction: &Transaction<'_>,
+    start_blocked: i64,
+    target_blocker: i64,
+) -> Result<bool> {
+    let exists: bool = transaction.query_row(
+        "WITH RECURSIVE chain(node_id) AS (
+             SELECT ?1
+             UNION
+             SELECT d.blocker_id
+             FROM work_dependencies d
+             JOIN chain c ON d.blocked_id = c.node_id
+         )
+         SELECT EXISTS(SELECT 1 FROM chain WHERE node_id = ?2)",
+        params![start_blocked, target_blocker],
+        |row| row.get(0),
+    )?;
+    Ok(exists)
+}
+
+fn load_actionable_dependents(
+    transaction: &Transaction<'_>,
+    blocker_id: i64,
+) -> Result<Vec<DependencyRef>> {
+    load_dependency_refs(
+        transaction,
+        &format!(
+            "SELECT w.id, w.status, w.title
+             FROM work_dependencies d
+             JOIN work_items w ON w.id = d.blocked_id
+             WHERE d.blocker_id = ?1
+               AND w.status IN {ACTIONABLE_STATUSES}
+             ORDER BY w.id ASC"
+        ),
+        blocker_id,
+    )
+}
+
+fn load_dependencies(
+    connection: &Connection,
+    id: i64,
+    item: &WorkItem,
+) -> Result<WorkDependencies> {
+    let blocked_by = load_dependency_refs(
+        connection,
+        "SELECT w.id, w.status, w.title
+         FROM work_dependencies d
+         JOIN work_items w ON w.id = d.blocker_id
+         WHERE d.blocked_id = ?1
+         ORDER BY w.id ASC",
+        id,
+    )?;
+    let blocks = load_dependency_refs(
+        connection,
+        "SELECT w.id, w.status, w.title
+         FROM work_dependencies d
+         JOIN work_items w ON w.id = d.blocked_id
+         WHERE d.blocker_id = ?1
+         ORDER BY w.id ASC",
+        id,
+    )?;
+    let unresolved_blockers = blocked_by
+        .iter()
+        .filter(|dep| dep.status != Status::Done)
+        .count();
+    let ready = matches!(item.status, Status::Pending | Status::Active) && unresolved_blockers == 0;
+    Ok(WorkDependencies {
+        work_item_id: id,
+        status: item.status,
+        ready,
+        unresolved_blockers,
+        blocked_by,
+        blocks,
+    })
+}
+
+fn load_dependency_refs(connection: &Connection, sql: &str, id: i64) -> Result<Vec<DependencyRef>> {
+    let mut statement = connection.prepare(sql)?;
+    let rows = statement.query_map(params![id], row_to_dependency_ref)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+fn row_to_dependency_ref(row: &Row<'_>) -> rusqlite::Result<DependencyRef> {
+    let status: String = row.get(1)?;
+    Ok(DependencyRef {
+        id: row.get(0)?,
+        status: Status::from_str(&status).map_err(|error| {
+            conversion_error(
+                1,
+                std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()),
+            )
+        })?,
+        title: row.get(2)?,
+    })
+}
+
+fn format_removed_unblock_note(removed_blockers: &[i64]) -> String {
+    let ids: Vec<String> = removed_blockers
+        .iter()
+        .map(|blocker| format!("#{blocker}"))
+        .collect();
+    if ids.len() == 1 {
+        format!("Unblocked: removed blocker {}", ids[0])
+    } else {
+        format!("Unblocked: removed blockers {}", ids.join(", "))
     }
 }
 

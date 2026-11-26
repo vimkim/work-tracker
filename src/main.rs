@@ -11,7 +11,7 @@ use clap::Parser;
 use serde_json::json;
 use work_tracker::{
     brief::{self, Brief, BriefItem},
-    cli::{self, Cli, Command, HookEvent, ListArgs},
+    cli::{self, Cli, Command, DepCommand, HookEvent, ListArgs},
     db::{ListFilter, NewWorkItem, Tracker, WorkDirectoryFilter, WorkItemUpdate, backup},
     domain::Status,
     output,
@@ -108,7 +108,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Add(args) => {
             let workdir =
                 cli::work_directory(args.workdir.as_deref().unwrap_or(std::path::Path::new(".")))?;
-            let item = tracker.create_item(
+            let item = tracker.create_item_with_blockers(
                 NewWorkItem {
                     title: &args.title,
                     description: args.description.as_deref(),
@@ -116,14 +116,26 @@ async fn run(cli: Cli) -> Result<()> {
                     schedule: args.schedule.for_creation(),
                     workdir: Some(&workdir),
                 },
+                &args.blocked_by,
                 &args.actor.resolved(),
                 args.note.as_deref(),
             )?;
-            show_item(&item, cli.json, colors)
+            if cli.json {
+                show_item(&item, true, colors)
+            } else {
+                let deps = tracker.dependencies(item.id)?;
+                output::print_item_with_deps(&item, &deps, colors)
+            }
         }
         Command::Show(args) => {
             tracker.check_work_item_output_fields(output::item_field_names())?;
-            show_item(&tracker.get(args.id)?, cli.json, colors)
+            let item = tracker.get(args.id)?;
+            if cli.json {
+                show_item(&item, true, colors)
+            } else {
+                let deps = tracker.dependencies(args.id)?;
+                output::print_item_with_deps(&item, &deps, colors)
+            }
         }
         Command::List(args) => {
             if cli.json || args.details {
@@ -151,9 +163,18 @@ async fn run(cli: Cli) -> Result<()> {
                 }
                 output::print_json(&items)
             } else if args.details {
-                output::print_item_details(&items, filter == ListFilter::Actionable, colors)
+                let detailed = items
+                    .into_iter()
+                    .map(|item| {
+                        let deps = tracker.dependencies(item.id)?;
+                        Ok((item, deps))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                output::print_item_details_with_deps(&detailed, filter, colors)
             } else if filter == ListFilter::Actionable {
                 output::print_actionable_items(&items, colors)
+            } else if filter == ListFilter::Ready {
+                output::print_ready_items(&items, colors)
             } else {
                 output::print_items(&items, colors)
             }
@@ -209,14 +230,43 @@ async fn run(cli: Cli) -> Result<()> {
             show_item(&item, cli.json, colors)
         }
         Command::Status(args) => {
-            let item = tracker.set_status(
+            let transition = tracker.set_status_with_effects(
                 args.id,
                 args.status,
                 &args.actor.resolved(),
                 args.note.as_deref(),
             )?;
-            show_item(&item, cli.json, colors)
+            if cli.json {
+                show_item(&transition.item, true, colors)
+            } else {
+                let deps = tracker.dependencies(transition.item.id)?;
+                output::print_status_transition(&transition, &deps, colors)
+            }
         }
+        Command::Dep(args) => match args.command {
+            DepCommand::Add(edit) => {
+                let mutation = tracker.add_dependencies(
+                    edit.id,
+                    &edit.blocked_by,
+                    &edit.actor.resolved(),
+                    edit.note.as_deref(),
+                )?;
+                output::print_dependency_mutation(&mutation, "added", cli.json, colors)
+            }
+            DepCommand::Remove(edit) => {
+                let mutation = tracker.remove_dependencies(
+                    edit.id,
+                    &edit.blocked_by,
+                    &edit.actor.resolved(),
+                    edit.note.as_deref(),
+                )?;
+                output::print_dependency_mutation(&mutation, "removed", cli.json, colors)
+            }
+            DepCommand::List(id_args) => {
+                let deps = tracker.dependencies(id_args.id)?;
+                output::print_dependencies(&deps, cli.json, colors)
+            }
+        },
         Command::Note(args) => {
             let entry = tracker.add_note(args.id, &args.message, &args.actor.resolved())?;
             if cli.json {
@@ -226,13 +276,18 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Delete(args) => {
-            let item = tracker.set_status(
+            let transition = tracker.set_status_with_effects(
                 args.id,
                 Status::Deleted,
                 &args.actor.resolved(),
                 args.note.as_deref(),
             )?;
-            show_item(&item, cli.json, colors)
+            if cli.json {
+                show_item(&transition.item, true, colors)
+            } else {
+                let deps = tracker.dependencies(transition.item.id)?;
+                output::print_status_transition(&transition, &deps, colors)
+            }
         }
         Command::History(args) => {
             let mut entries = tracker.history(args.id)?;
@@ -297,7 +352,17 @@ fn build_brief(tracker: &Tracker, path: &Path, max_chars: usize) -> Result<Brief
         .into_iter()
         .map(|item| {
             let latest_note = tracker.latest_note(item.id)?;
-            Ok(BriefItem { item, latest_note })
+            let unresolved_blockers = tracker
+                .dependencies(item.id)?
+                .blocked_by
+                .into_iter()
+                .filter(|dep| dep.status != Status::Done)
+                .collect();
+            Ok(BriefItem {
+                item,
+                latest_note,
+                unresolved_blockers,
+            })
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(brief::render(&workdir, &items, max_chars))
@@ -346,10 +411,11 @@ fn session_start_context(database: Option<PathBuf>) -> Result<String> {
 }
 
 fn list_filter(args: &ListArgs) -> ListFilter {
-    match (args.all, args.status) {
-        (_, Some(status)) => ListFilter::Status(status),
-        (true, None) => ListFilter::All,
-        (false, None) => ListFilter::Actionable,
+    match (args.all, args.ready, args.status) {
+        (_, _, Some(status)) => ListFilter::Status(status),
+        (true, _, None) => ListFilter::All,
+        (false, true, None) => ListFilter::Ready,
+        (false, false, None) => ListFilter::Actionable,
     }
 }
 

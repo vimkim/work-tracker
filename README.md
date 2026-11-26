@@ -132,13 +132,14 @@ The default budget stays below the 10,000 characters at which Claude Code replac
 
 | Command | Purpose |
 |---|---|
-| `add` | Create a Work Item and capture its Work Directory; initially `pending` unless selected otherwise |
+| `add` | Create a Work Item and capture its Work Directory; initially `pending` unless selected otherwise (`--blocked-by` sets `blocked`) |
 | `show ID` | Show one item, including a soft-deleted item |
-| `list` | List actionable items; `--all` adds done and cancelled, `--status` selects one status |
+| `list` | List actionable items; `--ready` filters to unblocked `pending`/`active`, `--all` adds done and cancelled, `--status` selects one status |
 | `today` | Show items updated today plus all actionable items |
 | `todo [today]` / `todo --days N` | Show commitments through N calendar days, including today |
 | `update ID` | Change title, description, planned/due dates, priority, or Work Directory |
-| `status ID STATUS` | Apply an idempotent status transition |
+| `status ID STATUS` | Apply an idempotent status transition (auto-unblocks downstream `blocked` items when `done`) |
+| `dep add\|rm\|ls` | Add, remove, or inspect Work Item dependencies (`--blocked-by`) |
 | `note ID MESSAGE` | Preserve context without changing status |
 | `delete ID` | Soft-delete an item for 60 days |
 | `history ID` | Show the complete immutable history; `--limit N` keeps the newest N |
@@ -210,6 +211,24 @@ Removing a worktree preserves its saved association. `list --workdir` accepts th
 The directory migration upgrades SQLite's schema version to 3 while preserving existing fields and history. Version-2 binaries reject an upgraded ledger; all clients of that ledger need the new binary. Older field-specific writes that permit access preserve the additional column.
 
 </details>
+
+### Dependencies and automatic unblock
+
+Work Items can declare directed acyclic blocking relationships without running a background daemon:
+
+```bash
+work-tracker add "Deploy release" --blocked-by 3,4
+work-tracker dep add 1 --blocked-by 3 --blocked-by 4 --note "Needs build and QA"
+work-tracker dep list 1 --json
+work-tracker list --ready --json
+work-tracker dep remove 1 --blocked-by 4
+```
+
+- Adding an unresolved blocker (`status != done`) automatically transitions an actionable Work Item to `blocked`. Self-dependencies and cycles are rejected.
+- Only `done` satisfies a blocker. When the last unresolved blocker becomes `done` (or is removed via `dep remove`), a `blocked` item automatically transitions to `pending` and records a structured `unblocked` History Entry (`reason: "dependencies_resolved"`).
+- Cancelling or deleting a blocker keeps downstream items `blocked` and surfaces them in human status output so an agent or human can decide explicitly.
+- `list --ready` returns only `pending` or `active` Work Items that have zero unresolved blockers, allowing polling or reconnecting agents to discover runnable work without maintaining in-memory wait loops.
+- `show`, `brief`, and the read-only HTML dashboard display `Blocked by` and `Blocks` relationships while keeping `WorkItem` JSON fields unchanged.
 
 ### Agent and script usage
 

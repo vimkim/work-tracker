@@ -49,6 +49,9 @@ pub enum Command {
     Update(UpdateArgs),
     /// Transition a work item's status.
     Status(StatusArgs),
+    /// Manage blocking dependencies between work items.
+    #[command(visible_alias = "deps")]
+    Dep(DepArgs),
     /// Add a context note without changing status.
     Note(NoteArgs),
     /// Soft-delete a work item for the 60-day retention window.
@@ -128,6 +131,10 @@ pub struct AddArgs {
     /// Initial status.
     #[arg(long, value_enum, default_value_t = Status::Pending)]
     pub status: Status,
+
+    /// Work item IDs that block this item (repeatable or comma-separated).
+    #[arg(long = "blocked-by", value_delimiter = ',', value_name = "ID")]
+    pub blocked_by: Vec<i64>,
 
     /// Optional creation context stored in history.
     #[arg(long)]
@@ -257,6 +264,10 @@ pub struct ListArgs {
     #[arg(long, conflicts_with = "status")]
     pub all: bool,
 
+    /// Show only pending or active work items with zero unresolved blockers.
+    #[arg(long, conflicts_with_all = ["all", "status"])]
+    pub ready: bool,
+
     /// Show only this exact status instead of the actionable default.
     #[arg(long, value_enum)]
     pub status: Option<Status>,
@@ -344,6 +355,45 @@ pub struct StatusArgs {
     pub status: Status,
 
     /// Optional transition reason stored in history.
+    #[arg(long)]
+    pub note: Option<String>,
+
+    #[command(flatten)]
+    pub actor: ActorArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct DepArgs {
+    #[command(subcommand)]
+    pub command: DepCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DepCommand {
+    /// Add one or more blockers to a work item.
+    Add(DepEditArgs),
+    /// Remove one or more blockers from a work item.
+    #[command(visible_alias = "rm")]
+    Remove(DepEditArgs),
+    /// List dependencies for a work item.
+    #[command(visible_alias = "ls")]
+    List(IdArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct DepEditArgs {
+    pub id: i64,
+
+    /// Blocker work item IDs (repeatable or comma-separated).
+    #[arg(
+        long = "blocked-by",
+        required = true,
+        value_delimiter = ',',
+        value_name = "ID"
+    )]
+    pub blocked_by: Vec<i64>,
+
+    /// Optional reason stored in history.
     #[arg(long)]
     pub note: Option<String>,
 

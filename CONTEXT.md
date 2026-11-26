@@ -68,3 +68,15 @@ _Avoid_: Overdue work
 **Overdue Work**:
 Unfinished work whose Due Date has passed.
 _Avoid_: Carried-over work, blocked work
+
+**Dependency**:
+A directed acyclic link stating that one Work Item cannot proceed until a Blocker Work Item is `done`.
+_Avoid_: Parent/child, subtask
+
+**Blocker**:
+The upstream Work Item in a Dependency that must reach `done` before the downstream Work Item can be unblocked.
+_Avoid_: Prerequisite task, parent
+
+**Unresolved Blocker**:
+A Blocker whose Status is anything other than `done`.
+_Avoid_: Open parent, active dependency

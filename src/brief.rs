@@ -2,7 +2,7 @@ use std::fmt::Write as _;
 
 use serde::Serialize;
 
-use crate::domain::{Priority, WorkItem};
+use crate::domain::{DependencyRef, Priority, WorkItem};
 
 /// Claude Code replaces hook output over 10,000 characters with a file stub,
 /// so the default leaves room below that limit.
@@ -12,6 +12,7 @@ const NOTE_CHARS: usize = 400;
 pub struct BriefItem {
     pub item: WorkItem,
     pub latest_note: Option<String>,
+    pub unresolved_blockers: Vec<DependencyRef>,
 }
 
 #[derive(Debug, Serialize)]
@@ -84,6 +85,14 @@ fn block(entry: &BriefItem, with_note: bool) -> String {
         write!(text, " (due {due})").unwrap();
     }
     text.push('\n');
+    if !entry.unresolved_blockers.is_empty() {
+        let blockers: Vec<String> = entry
+            .unresolved_blockers
+            .iter()
+            .map(|dep| format!("#{} [{}] {}", dep.id, dep.status, one_line(&dep.title)))
+            .collect();
+        writeln!(text, "  Blocked by: {}", blockers.join(", ")).unwrap();
+    }
     if let Some(note) = entry.latest_note.as_deref().filter(|_| with_note) {
         let note = one_line(note);
         let mut shortened: String = note.chars().take(NOTE_CHARS).collect();
@@ -129,6 +138,7 @@ mod tests {
                 schedule: Schedule::default(),
             },
             latest_note: note.map(str::to_owned),
+            unresolved_blockers: Vec::new(),
         }
     }
 
@@ -181,6 +191,31 @@ mod tests {
         assert_eq!(
             (brief.context.as_str(), brief.shown, brief.omitted),
             ("", 0, 1)
+        );
+    }
+
+    #[test]
+    fn includes_unresolved_blockers_when_present() {
+        let mut item = entry(5, Some("waiting on upstream"));
+        item.unresolved_blockers = vec![
+            DependencyRef {
+                id: 2,
+                status: Status::Active,
+                title: "Build engine".into(),
+            },
+            DependencyRef {
+                id: 3,
+                status: Status::Waiting,
+                title: "Run CI".into(),
+            },
+        ];
+        let brief = render("/work", &[item], 9_000);
+        assert!(
+            brief
+                .context
+                .contains("  Blocked by: #2 [active] Build engine, #3 [waiting] Run CI\n"),
+            "{}",
+            brief.context
         );
     }
 }

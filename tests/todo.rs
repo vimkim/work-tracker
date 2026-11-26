@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
 use work_tracker::{
-    db::{ListFilter, Tracker},
+    db::{ListFilter, SCHEMA_VERSION, Tracker},
     domain::{Priority, Schedule, ScheduleUpdate, Status, parse_date},
     output::format_todo,
     todo::TodoWindow,
@@ -358,7 +358,7 @@ fn v1_migration_preserves_history_and_survives_legacy_opens() -> Result<()> {
         assert_eq!(serde_json::to_value(db.history(42)?)?[0], history[0]);
         assert_eq!(db.get(43)?.schedule, Schedule::default());
     }
-    legacy.pragma_update(None, "user_version", 4)?;
+    legacy.pragma_update(None, "user_version", SCHEMA_VERSION + 1)?;
     assert!(Tracker::open(&path).is_err());
     Ok(())
 }

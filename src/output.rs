@@ -10,9 +10,9 @@ use chrono::{DateTime, Local};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::db::SearchHit;
+use crate::db::{DependencyMutation, ListFilter, SearchHit, StatusTransition};
 use crate::doctor::{Check, CheckStatus};
-use crate::domain::{HistoryEntry, Priority, Status, WorkItem};
+use crate::domain::{DependencyRef, HistoryEntry, Priority, Status, WorkDependencies, WorkItem};
 use crate::todo::{TodoView, seoul_offset};
 
 #[derive(Debug, Default, Clone, Copy, clap::ValueEnum)]
@@ -256,8 +256,100 @@ pub fn format_item(item: &WorkItem, colors: Colors) -> Result<String> {
     Ok(text)
 }
 
+pub fn format_item_with_deps(
+    item: &WorkItem,
+    deps: &WorkDependencies,
+    colors: Colors,
+) -> Result<String> {
+    let mut text = format_item(item, colors)?;
+    if !deps.blocked_by.is_empty() {
+        writeln!(
+            text,
+            "{:<12} {}",
+            "Blocked by:",
+            format_dep_refs(&deps.blocked_by, colors)
+        )
+        .unwrap();
+    }
+    if !deps.blocks.is_empty() {
+        writeln!(
+            text,
+            "{:<12} {}",
+            "Blocks:",
+            format_dep_refs(&deps.blocks, colors)
+        )
+        .unwrap();
+    }
+    Ok(text)
+}
+
+fn format_dep_refs(refs: &[DependencyRef], colors: Colors) -> String {
+    refs.iter()
+        .map(|dep| {
+            format!(
+                "#{} [{}] {}",
+                dep.id,
+                colors.status(dep.status, 0),
+                dep.title
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 pub fn print_item(item: &WorkItem, colors: Colors) -> Result<()> {
     write!(io::stdout(), "{}", format_item(item, colors)?)?;
+    Ok(())
+}
+
+pub fn print_item_with_deps(
+    item: &WorkItem,
+    deps: &WorkDependencies,
+    colors: Colors,
+) -> Result<()> {
+    write!(
+        io::stdout(),
+        "{}",
+        format_item_with_deps(item, deps, colors)?
+    )?;
+    Ok(())
+}
+
+pub fn print_item_details_with_deps(
+    items: &[(WorkItem, WorkDependencies)],
+    filter: ListFilter,
+    colors: Colors,
+) -> Result<()> {
+    if items.is_empty() {
+        return match filter {
+            ListFilter::Actionable => print_actionable_items(&[], colors),
+            ListFilter::Ready => print_ready_items(&[], colors),
+            ListFilter::All | ListFilter::Status(_) => print_items(&[], colors),
+        };
+    }
+    // Format every item before writing, so validation errors cannot leave partial output.
+    let details = items
+        .iter()
+        .map(|(item, deps)| format_item_with_deps(item, deps, colors))
+        .collect::<Result<Vec<_>>>()?;
+    write!(io::stdout(), "{}", details.join("\n"))?;
+    match filter {
+        ListFilter::Actionable => {
+            writeln!(
+                io::stdout(),
+                "{}",
+                colors.paint(actionable_footer(items.len()), "2")
+            )?;
+        }
+        ListFilter::Ready => {
+            writeln!(
+                io::stdout(),
+                "{}",
+                colors.paint(ready_footer(items.len()), "2")
+            )?;
+        }
+        ListFilter::All | ListFilter::Status(_) => {}
+    }
     Ok(())
 }
 
@@ -314,6 +406,157 @@ pub fn print_actionable_items(items: &[WorkItem], colors: Colors) -> Result<()> 
 fn actionable_footer(count: usize) -> String {
     let noun = if count == 1 { "item" } else { "items" };
     format!("Showing {count} actionable work {noun}. Use --all to include done and cancelled.")
+}
+
+pub fn print_ready_items(items: &[WorkItem], colors: Colors) -> Result<()> {
+    if items.is_empty() {
+        writeln!(
+            io::stdout(),
+            "No ready work items. Use --all to include blocked, waiting, done, and cancelled."
+        )?;
+        return Ok(());
+    }
+    print_table(items, colors)?;
+    writeln!(
+        io::stdout(),
+        "{}",
+        colors.paint(ready_footer(items.len()), "2")
+    )?;
+    Ok(())
+}
+
+fn ready_footer(count: usize) -> String {
+    let noun = if count == 1 { "item" } else { "items" };
+    format!(
+        "Showing {count} ready work {noun}. Use --all to include blocked, waiting, done, and cancelled."
+    )
+}
+
+pub fn print_status_transition(
+    transition: &StatusTransition,
+    deps: &WorkDependencies,
+    colors: Colors,
+) -> Result<()> {
+    print_item_with_deps(&transition.item, deps, colors)?;
+    if !transition.unblocked.is_empty() {
+        writeln!(io::stdout(), "\nUnblocked:")?;
+        for dependent in &transition.unblocked {
+            writeln!(
+                io::stdout(),
+                "  #{} [{}] {}",
+                dependent.id,
+                colors.status(dependent.status, 0),
+                dependent.title
+            )?;
+        }
+    }
+    if !transition.still_blocked.is_empty() {
+        writeln!(io::stdout(), "\nStill blocked by #{}:", transition.item.id)?;
+        for dependent in &transition.still_blocked {
+            writeln!(
+                io::stdout(),
+                "  #{} [{}] {}",
+                dependent.id,
+                colors.status(dependent.status, 0),
+                dependent.title
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub fn print_dependencies(deps: &WorkDependencies, json: bool, colors: Colors) -> Result<()> {
+    if json {
+        return print_json(deps);
+    }
+    writeln!(
+        io::stdout(),
+        "#{} [{}] ready: {}",
+        deps.work_item_id,
+        colors.status(deps.status, 0),
+        if deps.ready { "yes" } else { "no" }
+    )?;
+    if deps.blocked_by.is_empty() {
+        writeln!(io::stdout(), "Blocked by:  -")?;
+    } else {
+        writeln!(
+            io::stdout(),
+            "Blocked by:  {}",
+            format_dep_refs(&deps.blocked_by, colors)
+        )?;
+    }
+    if deps.blocks.is_empty() {
+        writeln!(io::stdout(), "Blocks:      -")?;
+    } else {
+        writeln!(
+            io::stdout(),
+            "Blocks:      {}",
+            format_dep_refs(&deps.blocks, colors)
+        )?;
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct DependencyMutationJson<'a> {
+    item: &'a WorkItem,
+    dependencies: &'a WorkDependencies,
+    action: &'a str,
+    changed_blockers: &'a [i64],
+    status_changed: Option<StatusDelta>,
+}
+
+#[derive(Serialize)]
+struct StatusDelta {
+    from: Status,
+    to: Status,
+}
+
+pub fn print_dependency_mutation(
+    mutation: &DependencyMutation,
+    action: &str,
+    json: bool,
+    colors: Colors,
+) -> Result<()> {
+    if json {
+        return print_json(&DependencyMutationJson {
+            item: &mutation.item,
+            dependencies: &mutation.dependencies,
+            action,
+            changed_blockers: &mutation.changed_blockers,
+            status_changed: mutation
+                .status_changed
+                .map(|(from, to)| StatusDelta { from, to }),
+        });
+    }
+    if mutation.changed_blockers.is_empty() {
+        writeln!(
+            io::stdout(),
+            "Dependencies unchanged for #{}.",
+            mutation.item.id
+        )?;
+    } else {
+        let ids = mutation
+            .changed_blockers
+            .iter()
+            .map(|id| format!("#{id}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(
+            io::stdout(),
+            "Dependencies {action} for #{}: {ids}",
+            mutation.item.id
+        )?;
+    }
+    if let Some((from, to)) = mutation.status_changed {
+        writeln!(
+            io::stdout(),
+            "Status: {} -> {}",
+            colors.status(from, 0),
+            colors.status(to, 0)
+        )?;
+    }
+    print_dependencies(&mutation.dependencies, false, colors)
 }
 
 fn print_table(items: &[WorkItem], colors: Colors) -> Result<()> {

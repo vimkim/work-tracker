@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde_json::json;
 use work_tracker::{
-    db::{NewWorkItem, Tracker, WorkItemUpdate},
+    db::{NewWorkItem, SCHEMA_VERSION, Tracker, WorkItemUpdate},
     domain::{Schedule, Status},
 };
 
@@ -207,11 +207,15 @@ fn migration_preserves_both_earlier_schemas_and_legacy_field_writes() -> Result<
             assert_eq!(after[0], history[0]);
             assert_eq!(after.as_array().unwrap().len(), 2);
         }
-        legacy.pragma_update(None, "user_version", 4)?;
+        legacy.pragma_update(None, "user_version", SCHEMA_VERSION + 1)?;
         let Err(error) = Tracker::open(&path) else {
             panic!("future schema version was accepted");
         };
-        assert!(error.to_string().contains("newer than supported version 3"));
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("newer than supported version {SCHEMA_VERSION}"))
+        );
     }
     Ok(())
 }

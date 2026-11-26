@@ -15,7 +15,10 @@ use axum::{
 };
 use chrono::Local;
 
-use crate::{db::Tracker, domain::WorkItem};
+use crate::{
+    db::Tracker,
+    domain::{DependencyRef, WorkDependencies, WorkItem},
+};
 
 #[derive(Clone)]
 struct AppState {
@@ -103,7 +106,14 @@ async fn index(State(state): State<AppState>) -> WebResult {
     let cards = if items.is_empty() {
         "<p class=\"empty\">No work items in the daily view.</p>".to_owned()
     } else {
-        items.iter().map(item_card).collect::<Vec<_>>().join("\n")
+        items
+            .iter()
+            .map(|item| {
+                let deps = tracker.dependencies(item.id).map_err(internal_error)?;
+                Ok(item_card(item, deps.unresolved_blockers))
+            })
+            .collect::<Result<Vec<_>, (StatusCode, Html<String>)>>()?
+            .join("\n")
     };
     Ok(Html(page(
         "Daily view",
@@ -128,6 +138,7 @@ async fn show_item(State(state): State<AppState>, Path(id): Path<i64>) -> WebRes
             ));
         }
     };
+    let deps = tracker.dependencies(id).map_err(internal_error)?;
     let history = tracker.history(id).map_err(internal_error)?;
     let workdir = work_directory_html(&item);
     let description = item
@@ -135,6 +146,7 @@ async fn show_item(State(state): State<AppState>, Path(id): Path<i64>) -> WebRes
         .as_deref()
         .map(|value| format!("<p class=\"description\">{}</p>", escape(value)))
         .unwrap_or_default();
+    let deps_html = dependencies_html(&deps);
     let history_html = history
         .iter()
         .rev()
@@ -157,7 +169,7 @@ async fn show_item(State(state): State<AppState>, Path(id): Path<i64>) -> WebRes
         .collect::<Vec<_>>()
         .join("\n");
     let body = format!(
-        "<main><a class=\"back\" href=\"/\">← Daily view</a><article class=\"detail\"><div class=\"meta\"><span class=\"status status-{}\">{}</span><span>#{} · updated {}</span></div><h1>{}</h1>{workdir}{description}</article><section class=\"history\"><h2>History</h2><ol>{history_html}</ol></section></main>",
+        "<main><a class=\"back\" href=\"/\">← Daily view</a><article class=\"detail\"><div class=\"meta\"><span class=\"status status-{}\">{}</span><span>#{} · updated {}</span></div><h1>{}</h1>{workdir}{description}</article>{deps_html}<section class=\"history\"><h2>History</h2><ol>{history_html}</ol></section></main>",
         item.status,
         item.status,
         item.id,
@@ -169,15 +181,20 @@ async fn show_item(State(state): State<AppState>, Path(id): Path<i64>) -> WebRes
     Ok(Html(page(&item.title, &body)))
 }
 
-fn item_card(item: &WorkItem) -> String {
+fn item_card(item: &WorkItem, unresolved_blockers: usize) -> String {
     let workdir = work_directory_html(item);
+    let blocker_badge = if unresolved_blockers > 0 {
+        format!("<span class=\"dep-badge\">blocked by {unresolved_blockers}</span>")
+    } else {
+        String::new()
+    };
     let description = item
         .description
         .as_deref()
         .map(|value| format!("<p>{}</p>", escape(value)))
         .unwrap_or_default();
     format!(
-        "<a class=\"card\" href=\"/items/{}\"><div class=\"meta\"><span class=\"status status-{}\">{}</span><span>#{}</span></div><h2>{}</h2>{workdir}{description}<time>Updated {}</time></a>",
+        "<a class=\"card\" href=\"/items/{}\"><div class=\"meta\"><span class=\"status status-{}\">{}</span><span>#{}</span>{blocker_badge}</div><h2>{}</h2>{workdir}{description}<time>Updated {}</time></a>",
         item.id,
         item.status,
         item.status,
@@ -187,6 +204,38 @@ fn item_card(item: &WorkItem) -> String {
             .with_timezone(&Local)
             .format("%Y-%m-%d %H:%M")
     )
+}
+
+fn dependencies_html(deps: &WorkDependencies) -> String {
+    if deps.blocked_by.is_empty() && deps.blocks.is_empty() {
+        return String::new();
+    }
+    let mut sections = String::new();
+    if !deps.blocked_by.is_empty() {
+        sections.push_str(&dependency_list_html("Blocked by", &deps.blocked_by));
+    }
+    if !deps.blocks.is_empty() {
+        sections.push_str(&dependency_list_html("Blocks", &deps.blocks));
+    }
+    format!("<section class=\"dependencies\"><h2>Dependencies</h2>{sections}</section>")
+}
+
+fn dependency_list_html(heading: &str, refs: &[DependencyRef]) -> String {
+    let items = refs
+        .iter()
+        .map(|dep| {
+            format!(
+                "<li><a href=\"/items/{}\"><span class=\"status status-{}\">{}</span><span>#{}</span><span>{}</span></a></li>",
+                dep.id,
+                dep.status,
+                dep.status,
+                dep.id,
+                escape(&dep.title),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("<h3>{}</h3><ul>{items}</ul>", escape(heading))
 }
 
 fn work_directory_html(item: &WorkItem) -> String {
@@ -226,6 +275,13 @@ fn escape(value: &str) -> String {
 
 const CSS: &str = r#"
 .workdir{overflow-wrap:anywhere;font-size:.85rem}
+.dep-badge{padding:.18rem .5rem;border-radius:999px;border:1px solid var(--line);font-size:.7rem;color:var(--muted)}
+.dependencies{background:color-mix(in srgb,var(--panel) 94%,transparent);border:1px solid var(--line);border-radius:14px;margin:1rem 0;padding:1.5rem}
+.dependencies h3{margin:1rem 0 .5rem;font-size:.9rem;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+.dependencies ul{list-style:none;padding:0;margin:0}
+.dependencies li{border-top:1px solid var(--line);padding:.65rem 0}
+.dependencies li a{display:flex;align-items:center;gap:.7rem;color:inherit;text-decoration:none}
+.dependencies li a:hover{color:var(--accent)}
 :root{color-scheme:dark;--bg:#10130f;--panel:#191e18;--line:#30382e;--text:#edf3e9;--muted:#9da99a;--accent:#b7f071}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 15% 0,#243020 0,transparent 32rem),var(--bg);color:var(--text);font:16px/1.5 ui-sans-serif,system-ui,sans-serif}header,main{width:min(1100px,calc(100% - 2rem));margin:auto}header{display:flex;justify-content:space-between;align-items:end;padding:4rem 0 2rem;border-bottom:1px solid var(--line)}h1,h2,p{margin-top:0}h1{font-size:clamp(2.2rem,6vw,4.5rem);line-height:1;letter-spacing:-.04em;margin-bottom:.8rem}header p{color:var(--muted)}.eyebrow{color:var(--accent);font-size:.75rem;letter-spacing:.18em;font-weight:800}.date{color:var(--muted);padding-bottom:1rem}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:1rem;padding:2rem 0 5rem}.card,.detail,.history{background:color-mix(in srgb,var(--panel) 94%,transparent);border:1px solid var(--line);border-radius:14px}.card{display:block;min-height:220px;padding:1.35rem;color:inherit;text-decoration:none;transition:.15s transform,.15s border-color}.card:hover{transform:translateY(-3px);border-color:var(--accent)}.card h2{margin:2rem 0 .7rem;line-height:1.2}.card p,.description{color:#c5cec1}.card time{display:block;color:var(--muted);font-size:.8rem;margin-top:1.5rem}.meta{display:flex;align-items:center;gap:.7rem;color:var(--muted);font-size:.8rem}.status{display:inline-block;padding:.22rem .55rem;border-radius:999px;background:#30382e;color:#dce7d8;font-weight:750;text-transform:uppercase;font-size:.66rem;letter-spacing:.06em}.status-active{background:#325f2c;color:#d8ffd0}.status-blocked{background:#6b302d;color:#ffd7d4}.status-waiting{background:#5b4c24;color:#fff0b5}.status-done{background:#234d55;color:#c9f5ff}.status-deleted,.status-cancelled{background:#3a3a3a;color:#ccc}.back{display:inline-block;margin:2rem 0;color:var(--accent);text-decoration:none}.detail{padding:clamp(1.5rem,5vw,4rem)}.detail h1{margin:1.5rem 0;font-size:clamp(2rem,5vw,4rem)}.history{margin:1rem 0 5rem;padding:1.5rem}.history ol{list-style:none;padding:0;margin:0}.history li{border-top:1px solid var(--line);padding:1rem 0}.history li div{display:flex;gap:.5rem}.history li span,.history time{color:var(--muted);font-size:.85rem}.history li time{display:block}.history li p{margin:.55rem 0 0}.empty{padding:3rem 0;color:var(--muted)}@media(max-width:600px){header{align-items:start;flex-direction:column}.date{padding:0}}
 "#;
 

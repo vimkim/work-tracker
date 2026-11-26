@@ -164,6 +164,23 @@ pub struct WorkItem {
     pub schedule: Schedule,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DependencyRef {
+    pub id: i64,
+    pub status: Status,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkDependencies {
+    pub work_item_id: i64,
+    pub status: Status,
+    pub ready: bool,
+    pub unresolved_blockers: usize,
+    pub blocked_by: Vec<DependencyRef>,
+    pub blocks: Vec<DependencyRef>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryEntry {
     pub id: i64,

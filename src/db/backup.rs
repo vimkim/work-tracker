@@ -174,6 +174,12 @@ fn verify(connection: &Connection) -> Result<DatabaseContents> {
         "SELECT id, work_item_id, kind, actor, note, occurred_at, changes_json
          FROM history_entries LIMIT 0",
     )?;
+    if schema_version >= 4 {
+        connection.prepare(
+            "SELECT blocked_id, blocker_id, created_at
+             FROM work_dependencies LIMIT 0",
+        )?;
+    }
     Ok(DatabaseContents {
         work_items: connection
             .query_row("SELECT count(*) FROM work_items", [], |row| row.get(0))?,
